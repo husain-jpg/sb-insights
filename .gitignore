@@ -1,0 +1,35 @@
+# Database files — your real business data, never in Git
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Backups
+backups/
+
+# Imports — incoming data files (your business data)
+imports/
+
+# Python compiled cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables / secrets
+.env
+.env.local
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE/editor junk
+.vscode/
+.idea/
+*.swp
+*~
+
+# Temp files
+*.tmp
+*.log
