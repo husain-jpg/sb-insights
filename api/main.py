@@ -27,14 +27,21 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File, Form, Cookie, Request, Response as FastAPIResponse, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse, RedirectResponse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jobs.reorder_engine import (
     compute_all_reorders, compute_mix_multipliers,
     CEILING_DAYS_DEFAULT, MIN_VELOCITY_DEFAULT,
+)
+from jobs.auth import (
+    hash_password, verify_password,
+    create_session, get_session_user, delete_session, delete_user_sessions,
+    prune_expired_sessions,
+    encrypt_secret, decrypt_secret,
+    SESSION_COOKIE_NAME, SESSION_LIFETIME_DAYS,
 )
 from api.excel_export import build_workbook
 
@@ -44,8 +51,14 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 app = FastAPI(title="SB Insights", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
+    # Allow same-origin (browser visiting the dashboard) + localhost in dev.
+    # In production, this should be the actual domain (sbinsights.ca).
+    allow_origins=[
+        "http://127.0.0.1:8000", "http://localhost:8000",
+        "https://sbinsights.ca", "https://www.sbinsights.ca",
+    ],
+    allow_credentials=True,  # required to send cookies
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -117,8 +130,28 @@ def _start_backup_thread():
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard_page():
+def dashboard_page(request: Request):
+    # If users exist and you're not logged in → bounce to login
+    if os.path.exists(DB_PATH):
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM users WHERE is_active = 1 LIMIT 1")
+                has_users = cur.fetchone() is not None
+                if has_users:
+                    token = request.cookies.get(SESSION_COOKIE_NAME)
+                    user = get_session_user(conn, token) if token else None
+                    if not user:
+                        return RedirectResponse(url="/login", status_code=302)
+        except sqlite3.OperationalError:
+            # users table doesn't exist yet (first run); fall through to dashboard
+            pass
     return FileResponse(os.path.join(STATIC_DIR, "dashboard.html"))
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return FileResponse(os.path.join(STATIC_DIR, "login.html"))
 
 
 @contextmanager
@@ -133,6 +166,288 @@ def db():
         yield conn
     finally:
         conn.close()
+
+
+# ============================================================================
+# Auth dependencies
+# ============================================================================
+# require_user: enforces "you must be logged in" for protected endpoints.
+# require_admin: enforces "you must be an admin" for sensitive endpoints.
+#
+# Day-1 behavior: if no users exist yet (fresh system), all endpoints work
+# without auth so you can do initial setup. Once at least one admin exists,
+# auth becomes mandatory. This avoids a chicken-and-egg lockout.
+
+def _has_any_users(conn) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM users WHERE is_active = 1 LIMIT 1")
+    return cur.fetchone() is not None
+
+
+def get_current_user(request: Request) -> dict | None:
+    """Look up the logged-in user from the session cookie. Returns None if
+    not logged in or session expired. Does NOT raise — caller decides."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    with db() as conn:
+        return get_session_user(conn, token)
+
+
+def require_user(request: Request) -> dict:
+    """FastAPI dependency. Raises 401 if not logged in. Use on user-only routes."""
+    with db() as conn:
+        if not _has_any_users(conn):
+            # Bootstrap mode — no auth required yet
+            return {"id": 0, "email": "bootstrap", "name": "Bootstrap", "role": "admin",
+                    "must_change_password": False}
+        user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+def require_admin(request: Request) -> dict:
+    """FastAPI dependency. Raises 403 if not an admin."""
+    user = require_user(request)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+
+# ============================================================================
+# Auth endpoints
+# ============================================================================
+
+@app.post("/api/auth/login")
+def login(payload: dict = Body(...), request: Request = None) -> dict:
+    """Email + password login. Sets a session cookie on success.
+
+    Payload:
+      email (required)
+      password (required)
+    """
+    email = (payload.get("email") or "").strip().lower()
+    password = payload.get("password") or ""
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password required")
+
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, password_hash, role, is_active, must_change_password, name
+            FROM users WHERE LOWER(email) = ?
+        """, (email,))
+        row = cur.fetchone()
+        # Same error for missing user vs wrong password — don't leak which is wrong
+        if not row:
+            # Slight timing protection: still hash a dummy password to even out
+            # response time. Not perfect but discourages timing attacks.
+            verify_password(password, "$2b$12$abcdefghijklmnopqrstuv")
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        user_id, password_hash, role, is_active, must_change, name = row
+        if not is_active:
+            raise HTTPException(status_code=401, detail="Account disabled")
+        if not verify_password(password, password_hash):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        # Create session
+        ua = request.headers.get("user-agent") if request else None
+        token, expires_at = create_session(conn, user_id, user_agent=ua)
+        # Update last_login_at
+        cur.execute("UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id,))
+        conn.commit()
+
+    response = FastAPIResponse(
+        content=f'{{"ok": true, "must_change_password": {str(bool(must_change)).lower()}, "email": "{email}", "name": "{name or ""}", "role": "{role}"}}',
+        media_type="application/json",
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_LIFETIME_DAYS * 86400,
+        httponly=True,         # JS can't read it (XSS protection)
+        secure=False,          # CHANGE TO TRUE FOR PRODUCTION (HTTPS)
+        samesite="lax",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request) -> dict:
+    """End the current session."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        with db() as conn:
+            delete_session(conn, token)
+    response = FastAPIResponse(content='{"ok": true}', media_type="application/json")
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
+@app.get("/api/auth/me")
+def get_me(request: Request) -> dict:
+    """Return the current user, or {logged_in: false} if not logged in.
+    Used by the dashboard to know who's logged in and what role they have."""
+    with db() as conn:
+        bootstrap = not _has_any_users(conn)
+    if bootstrap:
+        return {
+            "logged_in": True, "bootstrap_mode": True,
+            "email": "bootstrap", "name": "Bootstrap", "role": "admin",
+            "must_change_password": False,
+        }
+    user = get_current_user(request)
+    if not user:
+        return {"logged_in": False}
+    return {"logged_in": True, "bootstrap_mode": False, **user}
+
+
+@app.post("/api/auth/change-password")
+def change_password(payload: dict = Body(...), request: Request = None) -> dict:
+    """Change your own password. Requires current password unless must_change
+    flag is set (i.e., admin gave you a temp password)."""
+    user = require_user(request)
+    if user["id"] == 0:
+        raise HTTPException(status_code=400, detail="Bootstrap user cannot change password — create a real admin first")
+
+    current_password = payload.get("current_password") or ""
+    new_password = payload.get("new_password") or ""
+    if not new_password or len(new_password) < 12:
+        raise HTTPException(status_code=400, detail="New password must be at least 12 characters")
+
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash, must_change_password FROM users WHERE id = ?", (user["id"],))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        password_hash, must_change = row
+
+        # If must_change is set, skip current-password check (admin set a temp)
+        if not must_change:
+            if not current_password:
+                raise HTTPException(status_code=400, detail="Current password required")
+            if not verify_password(current_password, password_hash):
+                raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+        new_hash = hash_password(new_password)
+        cur.execute("""
+            UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?
+        """, (new_hash, user["id"]))
+        # Invalidate ALL their other sessions (force re-login elsewhere)
+        cur.execute("DELETE FROM user_sessions WHERE user_id = ? AND session_token != ?",
+                    (user["id"], request.cookies.get(SESSION_COOKIE_NAME, "")))
+        conn.commit()
+
+    return {"ok": True}
+
+
+# ============================================================================
+# User management endpoints — admin-only
+# ============================================================================
+
+@app.get("/api/users")
+def list_users(request: Request) -> dict:
+    """List all users (admin only)."""
+    user = require_admin(request)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, email, name, role, is_active, must_change_password,
+                   created_at, created_by, last_login_at
+            FROM users ORDER BY created_at DESC
+        """)
+        cols = [d[0] for d in cur.description]
+        items = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/users")
+def create_user(payload: dict = Body(...), request: Request = None) -> dict:
+    """Create a new user (admin only). Sets must_change_password=1 so they
+    have to change the temp password on first login."""
+    actor = require_admin(request)
+    email = (payload.get("email") or "").strip().lower()
+    name = (payload.get("name") or "").strip() or None
+    temp_password = payload.get("temp_password") or ""
+    role = (payload.get("role") or "regular").strip()
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email required")
+    if len(temp_password) < 12:
+        raise HTTPException(status_code=400, detail="Temp password must be at least 12 characters")
+    if role not in ("admin", "regular"):
+        raise HTTPException(status_code=400, detail="Role must be admin or regular")
+
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE LOWER(email) = ?", (email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail="User with that email already exists")
+        password_hash = hash_password(temp_password)
+        cur.execute("""
+            INSERT INTO users (email, name, password_hash, role, must_change_password, created_by)
+            VALUES (?, ?, ?, ?, 1, ?)
+        """, (email, name, password_hash, role, actor.get("email")))
+        conn.commit()
+        new_id = cur.lastrowid
+
+    return {"ok": True, "id": new_id, "email": email,
+            "instructions": "Share the email + temp password with the user. They'll be forced to change the password on first login."}
+
+
+@app.post("/api/users/{user_id}/reset-password")
+def reset_user_password(user_id: int, payload: dict = Body(...), request: Request = None) -> dict:
+    """Admin resets a user's password to a temp value. Forces change on next login.
+    Also invalidates all their existing sessions."""
+    require_admin(request)
+    temp_password = payload.get("temp_password") or ""
+    if len(temp_password) < 12:
+        raise HTTPException(status_code=400, detail="Temp password must be at least 12 characters")
+
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+        new_hash = hash_password(temp_password)
+        cur.execute("""
+            UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?
+        """, (new_hash, user_id))
+        # Kill all their existing sessions
+        delete_user_sessions(conn, user_id)
+        conn.commit()
+    return {"ok": True, "instructions": "Share the new temp password with the user."}
+
+
+@app.post("/api/users/{user_id}/deactivate")
+def deactivate_user(user_id: int, request: Request = None) -> dict:
+    """Deactivate a user (admin only). Kills their sessions and disables login."""
+    actor = require_admin(request)
+    if actor["id"] == user_id:
+        raise HTTPException(status_code=400, detail="Can't deactivate yourself")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET is_active = 0 WHERE id = ?", (user_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        delete_user_sessions(conn, user_id)
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/users/{user_id}/reactivate")
+def reactivate_user(user_id: int, request: Request = None) -> dict:
+    """Re-enable a previously-deactivated user (admin only)."""
+    require_admin(request)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET is_active = 1 WHERE id = ?", (user_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        conn.commit()
+    return {"ok": True}
 
 
 def get_latest_sale_date(conn) -> date:
@@ -5318,6 +5633,131 @@ def create_lp_lto(lp_id: int, payload: dict = Body(...)) -> dict:
                             [(lto_id, s) for s in skus])
         conn.commit()
     return {"id": lto_id, "applicable_skus": skus}
+
+
+# ============================================================================
+# Email scraper — auto-import Cova exports from a dedicated inbox
+# ============================================================================
+# Polls IMAP inboxes, recognizes Cova attachments, drops them into imports/
+# for the existing auto-importer to pick up. See jobs/email_scraper.py.
+#
+# Foundation features (this version):
+#   - Configure 1+ accounts via UI
+#   - Manual "Poll now" button per account
+#   - View recent processing log
+# Not yet:
+#   - Background scheduler running on a timer
+#   - OAuth2 (uses app passwords only for now)
+#   - OCS-specific routing
+
+@app.get("/api/email-scraper/accounts")
+def list_email_accounts(request: Request) -> dict:
+    """List all configured email accounts. Admin-only."""
+    require_admin(request)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, label, provider, host, port, username, folder,
+                   is_active, poll_interval_min, last_polled_at, last_error,
+                   created_at
+            FROM email_scraper_accounts ORDER BY created_at DESC
+        """)
+        cols = [d[0] for d in cur.description]
+        items = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/email-scraper/accounts")
+def create_email_account(payload: dict = Body(...), request: Request = None) -> dict:
+    """Create a new email scraper account. Admin-only.
+
+    Payload:
+      label (required) — e.g. 'Cova exports'
+      host (required) — e.g. 'imap.gmail.com'
+      port — default 993
+      username (required) — usually the email address
+      password (required) — app password from the email provider
+      folder — default 'INBOX'
+    """
+    require_admin(request)
+    label = (payload.get("label") or "").strip()
+    host = (payload.get("host") or "").strip()
+    port = int(payload.get("port") or 993)
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    folder = (payload.get("folder") or "INBOX").strip()
+    poll_interval = int(payload.get("poll_interval_min") or 5)
+
+    if not all([label, host, username, password]):
+        raise HTTPException(status_code=400, detail="label, host, username, password are required")
+
+    password_enc = encrypt_secret(password)
+
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO email_scraper_accounts
+                (label, host, port, username, password_enc, folder,
+                 poll_interval_min, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+        """, (label, host, port, username, password_enc, folder, poll_interval))
+        conn.commit()
+        new_id = cur.lastrowid
+
+    return {"ok": True, "id": new_id}
+
+
+@app.delete("/api/email-scraper/accounts/{account_id}")
+def delete_email_account(account_id: int, request: Request) -> dict:
+    """Remove an email scraper account. Doesn't delete the log."""
+    require_admin(request)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM email_scraper_accounts WHERE id = ?", (account_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Account not found")
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/email-scraper/accounts/{account_id}/poll")
+def poll_email_account(account_id: int, request: Request) -> dict:
+    """Trigger a manual poll for one account. Returns summary of what
+    happened (messages checked, imported, errors)."""
+    require_admin(request)
+    from jobs.email_scraper import poll_account
+    with db() as conn:
+        result = poll_account(conn, account_id)
+    return result
+
+
+@app.get("/api/email-scraper/log")
+def get_email_log(
+    account_id: int | None = None, limit: int = 50,
+    request: Request = None,
+) -> dict:
+    """Recent processing log entries. Admin-only."""
+    require_admin(request)
+    with db() as conn:
+        cur = conn.cursor()
+        sql = """
+            SELECT esl.id, esl.account_id, esa.label AS account_label,
+                   esl.message_uid, esl.received_at, esl.processed_at,
+                   esl.sender, esl.subject, esl.attachment_count,
+                   esl.action, esl.detail
+            FROM email_scraper_log esl
+            LEFT JOIN email_scraper_accounts esa ON esa.id = esl.account_id
+        """
+        params: list = []
+        if account_id:
+            sql += " WHERE esl.account_id = ?"
+            params.append(account_id)
+        sql += " ORDER BY esl.processed_at DESC LIMIT ?"
+        params.append(min(500, max(1, int(limit))))
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        items = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return {"count": len(items), "items": items}
 
 
 # ============================================================================

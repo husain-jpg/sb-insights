@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login — SB Insights</title>
+<style>
+  :root {
+    --bg: #0f0f10;
+    --bg-elev: #1a1a1c;
+    --bg-elev-2: #232326;
+    --text: #e8e8ea;
+    --text-dim: #a0a0a8;
+    --text-faint: #707078;
+    --border: #2d2d32;
+    --accent: #c89b32;
+    --critical: #d66464;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .login-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 40px;
+    width: 100%;
+    max-width: 400px;
+  }
+  .brand {
+    text-align: center;
+    margin-bottom: 32px;
+  }
+  .brand-name {
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+  }
+  .brand-subtitle {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-top: 4px;
+  }
+  .form-group {
+    margin-bottom: 16px;
+  }
+  label {
+    display: block;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+  }
+  input[type="email"], input[type="password"] {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg-elev-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  button.btn-primary {
+    width: 100%;
+    padding: 12px;
+    background: var(--accent);
+    color: #0f0f10;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    cursor: pointer;
+    margin-top: 8px;
+  }
+  button.btn-primary:hover { background: #d4a942; }
+  button.btn-primary:disabled {
+    background: #555;
+    color: #aaa;
+    cursor: not-allowed;
+  }
+  .error-msg {
+    background: rgba(214, 100, 100, 0.15);
+    border: 1px solid rgba(214, 100, 100, 0.3);
+    color: var(--critical);
+    padding: 10px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    margin-bottom: 16px;
+    display: none;
+  }
+  .error-msg.visible { display: block; }
+  .footer-note {
+    font-size: 11px;
+    color: var(--text-faint);
+    text-align: center;
+    margin-top: 24px;
+  }
+  .change-password-section {
+    display: none;
+  }
+  .change-password-section.visible {
+    display: block;
+  }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="brand">
+    <div class="brand-name">SB INSIGHTS</div>
+    <div class="brand-subtitle">Retail Operations Dashboard</div>
+  </div>
+
+  <div class="error-msg" id="error-msg"></div>
+
+  <form id="login-form">
+    <div class="form-group">
+      <label for="email">Email</label>
+      <input type="email" id="email" required autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" id="password" required autocomplete="current-password">
+    </div>
+    <button type="submit" class="btn-primary" id="login-btn">Sign in</button>
+  </form>
+
+  <div class="change-password-section" id="change-password-section">
+    <div class="error-msg visible" style="background: rgba(200, 155, 50, 0.15); border-color: rgba(200, 155, 50, 0.3); color: var(--accent);">
+      Your password must be changed before you can continue.
+    </div>
+    <div class="form-group">
+      <label for="new-password">New password (min 12 chars)</label>
+      <input type="password" id="new-password" autocomplete="new-password">
+    </div>
+    <div class="form-group">
+      <label for="confirm-password">Confirm new password</label>
+      <input type="password" id="confirm-password" autocomplete="new-password">
+    </div>
+    <button type="button" class="btn-primary" id="change-password-btn">Change password</button>
+  </div>
+
+  <div class="footer-note">
+    Forgot password? Contact your administrator.
+  </div>
+</div>
+
+<script>
+const errorEl = document.getElementById("error-msg");
+const loginForm = document.getElementById("login-form");
+const loginBtn = document.getElementById("login-btn");
+const changeSection = document.getElementById("change-password-section");
+const changeBtn = document.getElementById("change-password-btn");
+
+function showError(msg) {
+  errorEl.textContent = msg;
+  errorEl.classList.add("visible");
+}
+function hideError() {
+  errorEl.classList.remove("visible");
+}
+
+loginForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  hideError();
+  loginBtn.disabled = true;
+  loginBtn.textContent = "Signing in...";
+
+  const email = document.getElementById("email").value.trim();
+  const password = document.getElementById("password").value;
+
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showError(data.detail || "Login failed");
+      loginBtn.disabled = false;
+      loginBtn.textContent = "Sign in";
+      return;
+    }
+    if (data.must_change_password) {
+      // Hide login, show change password
+      loginForm.style.display = "none";
+      changeSection.classList.add("visible");
+      return;
+    }
+    // Success — redirect to dashboard
+    window.location.href = "/";
+  } catch (err) {
+    showError("Network error: " + err.message);
+    loginBtn.disabled = false;
+    loginBtn.textContent = "Sign in";
+  }
+});
+
+changeBtn.addEventListener("click", async () => {
+  hideError();
+  const newPw = document.getElementById("new-password").value;
+  const confirmPw = document.getElementById("confirm-password").value;
+  if (newPw.length < 12) { showError("Password must be at least 12 characters"); return; }
+  if (newPw !== confirmPw) { showError("Passwords don't match"); return; }
+  changeBtn.disabled = true;
+  changeBtn.textContent = "Changing...";
+  try {
+    const res = await fetch("/api/auth/change-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ new_password: newPw }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showError(data.detail || "Could not change password");
+      changeBtn.disabled = false;
+      changeBtn.textContent = "Change password";
+      return;
+    }
+    window.location.href = "/";
+  } catch (err) {
+    showError("Network error: " + err.message);
+    changeBtn.disabled = false;
+    changeBtn.textContent = "Change password";
+  }
+});
+</script>
+</body>
+</html>

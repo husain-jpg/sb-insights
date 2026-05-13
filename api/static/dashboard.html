@@ -378,6 +378,8 @@
         <button data-page="data-partners">▸ Data Partners</button>
         <button data-page="monthly-reports">▸ Monthly Reports</button>
         <button data-page="settings">▸ Settings</button>
+        <button data-page="users">▸ Users</button>
+        <button data-page="email-scraper">▸ Email Scraper</button>
         <button data-page="system-health">▸ System Health</button>
       </div>
     </div>
@@ -386,6 +388,9 @@
     <div><span class="status-dot status-ok"></span>Local database</div>
     <div><span class="status-dot status-warn"></span>Cova API (pending)</div>
     <div id="status-info" style="margin-top: 8px;"></div>
+  </div>
+  <div id="user-pane" style="border-top: 1px solid var(--border); padding: 10px 14px; font-size: 11px; color: var(--text-dim);">
+    <div id="user-pane-content">Loading user...</div>
   </div>
 </aside>
 
@@ -436,7 +441,12 @@ function rebateBadgeHtml(r) {
 }
 
 async function api(path) {
-  const r = await fetch(API + path);
+  const r = await fetch(API + path, { credentials: "include" });
+  if (r.status === 401) {
+    // Session expired or never logged in — bounce to login
+    window.location.href = "/login";
+    throw new Error("Not authenticated");
+  }
   if (!r.ok) {
     const t = await r.text();
     throw new Error(`${r.status}: ${t}`);
@@ -4576,7 +4586,7 @@ async function renderMonthlyReports() {
 
       <div class="card" style="padding: 16px; margin-bottom: 14px;">
         <div style="font-size: 13px; line-height: 1.6;">
-          <strong>How this works:</strong>
+          <strong>How this works today (manual):</strong>
         </div>
         <ol style="font-size: 12px; color: var(--text-dim); margin: 8px 0 0 0; padding-left: 24px;">
           <li>Each month, download Cova's <em>Diagnostic Report</em> + <em>Sales by Product</em> for each store.</li>
@@ -4586,6 +4596,9 @@ async function renderMonthlyReports() {
           <li>Pick the month + collective below, click Package.</li>
           <li>Download the zip and email it to the collective.</li>
         </ol>
+        <div style="font-size: 11px; color: var(--text-faint); margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);">
+          <strong>Coming with cloud launch:</strong> an email scraper will deposit Cova reports automatically when they arrive in a dedicated inbox. You'll skip steps 1–2 and just click Package. Not built yet.
+        </div>
       </div>
 
       ${data.months.length === 0 ? `
@@ -4774,7 +4787,9 @@ async function renderMarketIntel() {
         <br><br>
         <strong>Recommended cadence:</strong> import bi-weekly using a <strong>trailing 30-day window</strong> in OCS. This balances signal stability with freshness — the 30-day window captures enough sales-days to make peer velocities meaningful, and bi-weekly imports overlap by ~16 days to smooth out week-to-week noise. Stale warnings fire after 21 days.
         <br><br>
-        Drop new exports into <code style="background: var(--bg-elev-2); padding: 1px 6px; border-radius: 3px;">imports/market_intelligence/{YYYY-MM-DD}/{StoreName}/</code> then click Imports → Import all.
+        <strong>How this works today (manual):</strong> Download both files for each store from OCS portal. Drop into <code style="background: var(--bg-elev-2); padding: 1px 6px; border-radius: 3px;">imports/market_intelligence/{YYYY-MM-DD}/{StoreName}/</code> then click Imports → Import all.
+        <br><br>
+        <strong>Possible automation:</strong> if OCS offers an API or scheduled email exports (TBC with your OCS account manager), an automated importer will replace the manual workflow at cloud launch. Not built yet.
         <br><br>
         <span style="color: var(--text-dim);">⚠ Top regional sellers ≠ guaranteed winners for your customers. Use this as a hypothesis generator, not a directive. Adding SKUs commits real shelf space + capital.</span>
       </div>
@@ -5092,6 +5107,294 @@ async function loadMiImportsView() {
   } catch (e) {
     container.innerHTML = `<div class="error" style="padding: 16px;">${escapeHtml(e.message)}</div>`;
   }
+}
+
+// ========================================================================
+// User identity pane (sidebar footer) + logout
+// ========================================================================
+let _currentUser = null;
+
+async function loadCurrentUser() {
+  try {
+    const res = await fetch("/api/auth/me", { credentials: "include" });
+    const data = await res.json();
+    _currentUser = data;
+    renderUserPane(data);
+  } catch (e) {
+    document.getElementById("user-pane-content").innerHTML = '<span style="color: var(--critical);">Auth error</span>';
+  }
+}
+
+function renderUserPane(data) {
+  const pane = document.getElementById("user-pane-content");
+  if (!pane) return;
+  if (data.bootstrap_mode) {
+    pane.innerHTML = `
+      <div style="font-size: 11px;">
+        <strong style="color: var(--accent);">⚠ Bootstrap mode</strong>
+        <div style="color: var(--text-dim); margin-top: 4px;">
+          No users yet. Run<br><code style="background: var(--bg-elev-2); padding: 1px 6px;">py create_admin.py</code><br>to set up first admin.
+        </div>
+      </div>
+    `;
+    return;
+  }
+  if (!data.logged_in) {
+    pane.innerHTML = `<a href="/login" style="color: var(--accent);">Sign in</a>`;
+    return;
+  }
+  pane.innerHTML = `
+    <div style="font-weight: 600; color: var(--text);">${escapeHtml(data.name || data.email)}</div>
+    <div style="font-size: 10px;">${escapeHtml(data.email)} · ${escapeHtml(data.role)}</div>
+    <button id="logout-btn" style="margin-top: 6px; background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 0; font-size: 10px; text-decoration: underline;">Sign out</button>
+  `;
+  document.getElementById("logout-btn").addEventListener("click", async () => {
+    await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+    window.location.href = "/login";
+  });
+}
+
+// ========================================================================
+// Users — admin user management
+// ========================================================================
+async function renderUsers() {
+  const main = document.getElementById("main");
+  main.innerHTML = `<div class="loading">LOADING USERS...</div>`;
+  try {
+    const data = await api("/api/users");
+    main.innerHTML = `
+      <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline;">
+          <div>
+            <div class="kicker">Admin · Authentication</div>
+            <h2 style="white-space: nowrap;">Users</h2>
+          </div>
+          <button class="btn btn-primary" id="users-add-btn">+ Add user</button>
+        </div>
+      </div>
+
+      <div class="hint-box" style="margin-bottom: 14px;">
+        <strong>Adding users:</strong> set a temporary password (min 12 chars). The user will be forced to change it on first login. Share the email + temp password with them through a secure channel (in person, encrypted message). Don't email passwords.
+      </div>
+
+      <div class="card">
+        <table style="font-size: 12px; margin: 0;">
+          <thead>
+            <tr><th>Email</th><th>Name</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr>
+          </thead>
+          <tbody>
+            ${data.items.map(u => `
+              <tr>
+                <td><strong>${escapeHtml(u.email)}</strong></td>
+                <td>${escapeHtml(u.name || '—')}</td>
+                <td><span class="tag" style="font-size: 9px;">${escapeHtml(u.role)}</span></td>
+                <td>${u.is_active ? '<span style="color: #6dab84;">Active</span>' : '<span style="color: var(--text-faint);">Disabled</span>'}${u.must_change_password ? ' · <span style="color: var(--accent);">must change pw</span>' : ''}</td>
+                <td style="font-size: 11px; color: var(--text-dim);">${u.last_login_at || 'Never'}</td>
+                <td>
+                  <button class="btn-link user-reset-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px;">Reset pw</button>
+                  ${u.is_active ? `<button class="btn-link user-deactivate-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px; color: var(--critical);">Disable</button>` : `<button class="btn-link user-reactivate-btn" data-id="${u.id}" style="font-size: 10px; color: #6dab84;">Re-enable</button>`}
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+
+    document.getElementById("users-add-btn").addEventListener("click", async () => {
+      const email = prompt("Email for new user:");
+      if (!email) return;
+      const name = prompt("Display name (optional):") || "";
+      const role = prompt("Role (admin or regular)?", "regular") || "regular";
+      const tempPw = prompt("Temp password (min 12 chars). User will be forced to change on first login:");
+      if (!tempPw || tempPw.length < 12) { alert("Password too short"); return; }
+      try {
+        const res = await fetch("/api/users", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ email, name, role, temp_password: tempPw }),
+        });
+        const result = await res.json();
+        if (!res.ok) { alert("Failed: " + (result.detail || "unknown")); return; }
+        alert(`User created. Share these with them:\n\nEmail: ${email}\nTemp password: ${tempPw}\n\nThey'll change it on first login.`);
+        renderUsers();
+      } catch (e) { alert("Error: " + e.message); }
+    });
+
+    document.querySelectorAll(".user-reset-btn").forEach(b => {
+      b.addEventListener("click", async () => {
+        const tempPw = prompt(`Reset password for ${b.dataset.email}. Enter new temp password (min 12 chars):`);
+        if (!tempPw || tempPw.length < 12) { alert("Password too short"); return; }
+        const res = await fetch(`/api/users/${b.dataset.id}/reset-password`, {
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ temp_password: tempPw }),
+        });
+        if (res.ok) {
+          alert(`Password reset. Share this with the user:\n\nEmail: ${b.dataset.email}\nTemp password: ${tempPw}`);
+          renderUsers();
+        } else { alert("Failed"); }
+      });
+    });
+
+    document.querySelectorAll(".user-deactivate-btn").forEach(b => {
+      b.addEventListener("click", async () => {
+        if (!confirm(`Disable ${b.dataset.email}? Their sessions will end immediately.`)) return;
+        const res = await fetch(`/api/users/${b.dataset.id}/deactivate`, {
+          method: "POST", credentials: "include",
+        });
+        if (res.ok) renderUsers(); else alert("Failed");
+      });
+    });
+
+    document.querySelectorAll(".user-reactivate-btn").forEach(b => {
+      b.addEventListener("click", async () => {
+        const res = await fetch(`/api/users/${b.dataset.id}/reactivate`, {
+          method: "POST", credentials: "include",
+        });
+        if (res.ok) renderUsers(); else alert("Failed");
+      });
+    });
+  } catch (e) { showError(e); }
+}
+
+// ========================================================================
+// Email Scraper — configure auto-import accounts
+// ========================================================================
+async function renderEmailScraper() {
+  const main = document.getElementById("main");
+  main.innerHTML = `<div class="loading">LOADING EMAIL SCRAPER...</div>`;
+  try {
+    const [accts, logs] = await Promise.all([
+      api("/api/email-scraper/accounts"),
+      api("/api/email-scraper/log?limit=30"),
+    ]);
+
+    main.innerHTML = `
+      <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline;">
+          <div>
+            <div class="kicker">Admin · Auto-import</div>
+            <h2 style="white-space: nowrap;">Email Scraper</h2>
+          </div>
+          <button class="btn btn-primary" id="es-add-btn">+ Add account</button>
+        </div>
+      </div>
+
+      <div class="hint-box" style="margin-bottom: 14px;">
+        <strong>What this does:</strong> polls the inbox for emails from <code style="background: var(--bg-elev-2); padding: 1px 6px;">noreply@covasoft.com</code>, extracts the Cova download link from each email's body, downloads the file, and drops it into <code style="background: var(--bg-elev-2); padding: 1px 6px;">imports/</code> for auto-importing.
+        <br><br>
+        <strong>Foundation only:</strong> manual "Poll now" per account. Background scheduler (auto-poll every 5 min) comes with cloud launch.
+        <br><br>
+        <strong>For Gmail:</strong> use <a href="https://support.google.com/accounts/answer/185833" target="_blank" style="color: var(--accent);">App Passwords</a> (you'll need 2FA enabled on the Gmail account first). Don't use your regular Gmail password — it won't work for IMAP and storing it would be insecure.
+        <br><br>
+        <strong>Cova links expire ~7 days after sending.</strong> Polling at least weekly catches everything. Daily is recommended.
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);">
+          <strong>Configured accounts</strong>
+        </div>
+        ${accts.items.length === 0 ? `
+          <div style="padding: 16px; color: var(--text-dim); font-size: 12px;">No accounts configured yet.</div>
+        ` : `
+          <table style="font-size: 12px; margin: 0;">
+            <thead><tr><th>Label</th><th>Host</th><th>Username</th><th>Folder</th><th>Last polled</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody>
+              ${accts.items.map(a => `
+                <tr>
+                  <td><strong>${escapeHtml(a.label)}</strong></td>
+                  <td>${escapeHtml(a.host)}:${a.port}</td>
+                  <td>${escapeHtml(a.username)}</td>
+                  <td>${escapeHtml(a.folder)}</td>
+                  <td style="font-size: 11px; color: var(--text-dim);">${a.last_polled_at || 'Never'}</td>
+                  <td>${a.last_error ? `<span style="color: var(--critical); font-size: 10px;" title="${escapeHtml(a.last_error)}">ERROR</span>` : '<span style="color: #6dab84;">OK</span>'}</td>
+                  <td>
+                    <button class="btn-link es-poll-btn" data-id="${a.id}" style="font-size: 10px;">Poll now</button>
+                    <button class="btn-link es-delete-btn" data-id="${a.id}" data-label="${escapeHtml(a.label)}" style="font-size: 10px; color: var(--critical);">Delete</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `}
+      </div>
+
+      <div class="card">
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);">
+          <strong>Recent activity</strong>
+          <span style="font-size: 11px; color: var(--text-dim); margin-left: 8px;">Last 30 messages processed</span>
+        </div>
+        ${logs.items.length === 0 ? `
+          <div style="padding: 16px; color: var(--text-dim); font-size: 12px;">No activity yet. Click "Poll now" on an account above to test.</div>
+        ` : `
+          <table style="font-size: 11px; margin: 0;">
+            <thead><tr><th>When</th><th>Account</th><th>From</th><th>Subject</th><th>Action</th><th>Detail</th></tr></thead>
+            <tbody>
+              ${logs.items.map(l => `
+                <tr>
+                  <td style="color: var(--text-dim);">${l.processed_at}</td>
+                  <td>${escapeHtml(l.account_label || '?')}</td>
+                  <td>${escapeHtml((l.sender || '').slice(0, 40))}</td>
+                  <td>${escapeHtml((l.subject || '').slice(0, 50))}</td>
+                  <td><span class="tag" style="font-size: 9px; ${l.action === 'imported' ? 'color: #6dab84;' : (l.action === 'error' ? 'color: var(--critical);' : 'color: var(--text-dim);')}">${escapeHtml(l.action)}</span></td>
+                  <td style="font-size: 10px;">${escapeHtml(l.detail || '')}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `}
+      </div>
+    `;
+
+    document.getElementById("es-add-btn").addEventListener("click", async () => {
+      const label = prompt("Label for this account (e.g. 'Cova exports'):");
+      if (!label) return;
+      const host = prompt("IMAP host (Gmail: imap.gmail.com, Outlook: outlook.office365.com):", "imap.gmail.com");
+      if (!host) return;
+      const username = prompt("Email address:");
+      if (!username) return;
+      const password = prompt("App password (NOT your regular email password — see hint box for Gmail instructions):");
+      if (!password) return;
+      try {
+        const res = await fetch("/api/email-scraper/accounts", {
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label, host, port: 993, username, password, folder: "INBOX" }),
+        });
+        if (res.ok) renderEmailScraper(); else { const e = await res.json(); alert("Failed: " + (e.detail || "unknown")); }
+      } catch (e) { alert("Error: " + e.message); }
+    });
+
+    document.querySelectorAll(".es-poll-btn").forEach(b => {
+      b.addEventListener("click", async () => {
+        b.disabled = true; b.textContent = "Polling...";
+        try {
+          const res = await fetch(`/api/email-scraper/accounts/${b.dataset.id}/poll`, {
+            method: "POST", credentials: "include",
+          });
+          const data = await res.json();
+          if (data.ok) {
+            alert(`Poll complete:\n\nChecked: ${data.messages_checked}\nImported: ${data.imported}\nSkipped: ${data.skipped}\nErrors: ${data.errors}${data.files_saved && data.files_saved.length ? '\n\nFiles saved:\n' + data.files_saved.join('\n') : ''}`);
+          } else {
+            alert("Poll failed: " + (data.error || "unknown"));
+          }
+          renderEmailScraper();
+        } catch (e) { alert("Error: " + e.message); }
+      });
+    });
+
+    document.querySelectorAll(".es-delete-btn").forEach(b => {
+      b.addEventListener("click", async () => {
+        if (!confirm(`Delete account "${b.dataset.label}"? This doesn't delete past log entries.`)) return;
+        const res = await fetch(`/api/email-scraper/accounts/${b.dataset.id}`, {
+          method: "DELETE", credentials: "include",
+        });
+        if (res.ok) renderEmailScraper(); else alert("Delete failed");
+      });
+    });
+  } catch (e) { showError(e); }
 }
 
 // ========================================================================
@@ -5592,6 +5895,8 @@ const routes = {
   "data-partners": renderDataPartners,
   "monthly-reports": renderMonthlyReports,
   settings: renderSettings,
+  users: renderUsers,
+  "email-scraper": renderEmailScraper,
   "system-health": renderSystemHealth,
 };
 
@@ -5634,6 +5939,7 @@ document.querySelectorAll(".nav-group[data-group]").forEach(group => {
 
 updateStatus();
 ensureStoreNames().then(() => renderOverview());
+loadCurrentUser();
 </script>
 </body>
 </html>

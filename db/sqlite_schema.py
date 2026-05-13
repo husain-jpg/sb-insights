@@ -364,6 +364,85 @@ CREATE TABLE IF NOT EXISTS gap_suggestions_status (
 CREATE INDEX IF NOT EXISTS ix_gap_status_snooze ON gap_suggestions_status (location_id, status, snoozed_until);
 
 -- ============================================================================
+-- Authentication & user management
+-- ============================================================================
+-- Day-1 design:
+--   - Email + bcrypt password
+--   - Two roles: 'admin' (can manage users) and 'regular' (can use dashboard)
+--   - 30-day sessions stored as signed cookies; rows kept here for revocation
+--   - First admin bootstrapped via create_admin.py CLI command
+--   - No self-signup — admins create accounts
+--   - Force password change flag for temp passwords set by admins
+
+CREATE TABLE IF NOT EXISTS users (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    email               TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name                TEXT,
+    password_hash       TEXT NOT NULL,           -- bcrypt hash, never the raw password
+    role                TEXT NOT NULL DEFAULT 'regular',  -- 'admin' | 'regular'
+    must_change_password INTEGER NOT NULL DEFAULT 0,      -- 1 = force change on next login
+    is_active           INTEGER NOT NULL DEFAULT 1,
+    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by          TEXT,                    -- email of admin who created them
+    last_login_at       TEXT
+);
+
+-- Session table: each login creates a row. Cookie carries the session_token.
+-- Deleting a row instantly logs that session out (revocation).
+CREATE TABLE IF NOT EXISTS user_sessions (
+    session_token       TEXT PRIMARY KEY,        -- random 32-byte hex, lives in the cookie
+    user_id             INTEGER NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at          TEXT NOT NULL,
+    last_seen_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    user_agent          TEXT,                    -- for the "logged in on" display
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS ix_sessions_user ON user_sessions (user_id);
+CREATE INDEX IF NOT EXISTS ix_sessions_expires ON user_sessions (expires_at);
+
+-- ============================================================================
+-- Email scraper configuration & log
+-- ============================================================================
+-- The scraper polls an IMAP inbox for Cova auto-exports and drops attachments
+-- into the relevant imports/ folder. Foundation supports IMAP w/ app-password;
+-- OAuth2 to come later. Configuration is per-account (you might have one
+-- inbox for Cova, another for OCS, etc).
+
+CREATE TABLE IF NOT EXISTS email_scraper_accounts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    label           TEXT NOT NULL,           -- 'Cova exports', 'OCS reports', etc.
+    provider        TEXT NOT NULL DEFAULT 'imap',  -- 'imap' for now
+    host            TEXT NOT NULL,           -- 'imap.gmail.com' etc.
+    port            INTEGER NOT NULL DEFAULT 993,
+    username        TEXT NOT NULL,           -- usually the email address
+    password_enc    TEXT NOT NULL,           -- app password, encrypted at rest
+    folder          TEXT NOT NULL DEFAULT 'INBOX',
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    poll_interval_min INTEGER NOT NULL DEFAULT 5,
+    last_polled_at  TEXT,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Log of every email processed (or skipped). Lets you debug "where's my file?"
+CREATE TABLE IF NOT EXISTS email_scraper_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      INTEGER NOT NULL,
+    message_uid     TEXT NOT NULL,           -- IMAP UID for dedupe
+    received_at     TEXT,                    -- when email was received
+    processed_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    sender          TEXT,
+    subject         TEXT,
+    attachment_count INTEGER NOT NULL DEFAULT 0,
+    action          TEXT NOT NULL,           -- 'imported' | 'skipped' | 'error'
+    detail          TEXT,                    -- summary for UI display
+    FOREIGN KEY (account_id) REFERENCES email_scraper_accounts(id)
+);
+CREATE INDEX IF NOT EXISTS ix_email_log_account ON email_scraper_log (account_id, processed_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_email_log_uid ON email_scraper_log (account_id, message_uid);
+
+-- ============================================================================
 -- OCS Order Fill template — the per-order-cycle catalog OCS sends out
 -- ============================================================================
 -- The Order Fill is the single source of truth for what OCS will deliver
@@ -643,6 +722,22 @@ def init_schema(conn) -> None:
     # user-modified values, only fills in rows that don't exist yet.
     _seed_default_settings(conn)
 
+    # ONE-TIME MIGRATION: pack_size_min_fraction was originally stored as a
+    # 0-1 fraction (0.5 = 50%) but the UI displays it as a percent and the
+    # confusion was real. Convert any value ≤ 1.0 to its percent equivalent
+    # so users see "50" instead of "0.5". Safe to run repeatedly — if the
+    # value is already 50 or higher, this no-ops.
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE app_settings
+        SET value = value * 100,
+            default_value = CASE WHEN default_value <= 1.0 THEN default_value * 100 ELSE default_value END,
+            min_value = CASE WHEN min_value <= 1.0 THEN min_value * 100 ELSE min_value END,
+            max_value = CASE WHEN max_value <= 1.0 THEN max_value * 100 ELSE max_value END
+        WHERE key = 'reorder.pack_size_min_fraction' AND value <= 1.0
+    """)
+    conn.commit()
+
 
 # ----------------------------------------------------------------------------
 # Default settings: the canonical list of tunable engine parameters.
@@ -672,7 +767,7 @@ _DEFAULT_SETTINGS = [
      "Velocity floor (units/day)",
      "Minimum daily velocity to be reorderable. Set to 0.0 to rely entirely on the trigger + pack-size filter (recommended). Heroes always skip this floor.",
      10),
-    ("reorder.pack_size_min_fraction", 0.5, 0.0, 1.0, "percent", "Reorder Engine — Filtering",
+    ("reorder.pack_size_min_fraction", 50, 0, 100, "percent", "Reorder Engine — Filtering",
      "Pack-size threshold (%)",
      "Minimum % of a case the math must want before we order one. Below this, the SKU is skipped. 50% means we won't order 1 unit of a 4-pack to satisfy 1 unit of demand.",
      20),
