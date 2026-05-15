@@ -738,6 +738,34 @@ def init_schema(conn) -> None:
     """)
     conn.commit()
 
+    # ONE-TIME MIGRATION: ceiling-flip (May 2026).
+    # Original logic: Hero 7d, Regular 10d (Heroes had tighter cover, opposite
+    # of what most retailers want). New logic: Hero 14d, Regular 7d (more cushion
+    # on best-sellers, less capital tied up in slow movers).
+    #
+    # We update the DEFAULT VALUE always (so the "reset to default" button
+    # uses the new number). We update the CURRENT VALUE only if it still
+    # matches the OLD default — i.e., the user hasn't customized it.
+    # If the user has set Hero to e.g. 8 or 12, we don't touch it.
+
+    # Hero: old default was 7. Update default_value to 14 always.
+    # Update value to 14 only if currently 7 (untouched from old default).
+    cur.execute("""
+        UPDATE app_settings
+        SET default_value = 14,
+            value = CASE WHEN value = 7 THEN 14 ELSE value END
+        WHERE key = 'reorder.hero_ceiling_days' AND default_value = 7
+    """)
+    # Regular: old default was 10. Update default_value to 7 always.
+    # Update value to 7 only if currently 10 (untouched from old default).
+    cur.execute("""
+        UPDATE app_settings
+        SET default_value = 7,
+            value = CASE WHEN value = 10 THEN 7 ELSE value END
+        WHERE key = 'reorder.regular_ceiling_days' AND default_value = 10
+    """)
+    conn.commit()
+
 
 # ----------------------------------------------------------------------------
 # Default settings: the canonical list of tunable engine parameters.
@@ -753,13 +781,13 @@ _DEFAULT_SETTINGS = [
      "Lead time (days)",
      "Days from placing an OCS order to product arriving in store. Used to compute the reorder trigger.",
      20),
-    ("reorder.hero_ceiling_days", 7, 3, 30, "days", "Reorder Engine — Coverage",
+    ("reorder.hero_ceiling_days", 14, 3, 30, "days", "Reorder Engine — Coverage",
      "Hero ceiling (days)",
-     "Days of supply target for Hero SKUs. Lower = tighter, more risk of brief stockouts. Higher = more inventory held. Mix-aware multipliers do NOT inflate this.",
+     "Days of supply target for Hero (top-velocity) SKUs. Heroes get MORE cushion because stockouts on best-sellers cost real money in lost sales. 14 days = ~2 weeks of cover, survives a missed reorder cycle or a delayed delivery. Mix-aware multipliers do NOT inflate this.",
      30),
-    ("reorder.regular_ceiling_days", 10, 3, 30, "days", "Reorder Engine — Coverage",
+    ("reorder.regular_ceiling_days", 7, 3, 30, "days", "Reorder Engine — Coverage",
      "Regular ceiling (days)",
-     "Days of supply target for non-Hero SKUs. Mix-aware multipliers can adjust this up or down by category.",
+     "Days of supply target for non-Hero SKUs. Lower (vs Hero) because we don't want capital tied up in slow movers. Slow SKUs naturally filter out via the pack-size threshold (50%). Mix-aware multipliers can adjust this up or down by category.",
      40),
 
     # Reorder Engine — Filtering

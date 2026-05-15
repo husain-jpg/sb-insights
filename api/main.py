@@ -528,6 +528,25 @@ def list_locations() -> list[dict]:
 # /api/reorder
 # ---------------------------------------------------------------------------
 
+@app.get("/api/reorder/diagnose")
+def diagnose_reorder_sku(sku: str, location_id: str) -> dict:
+    """Diagnostic — explain why a SKU is or isn't on the reorder report.
+
+    Returns a structured trace of every filter the engine evaluates, in order.
+    The FIRST failing check is what caused exclusion. If all checks pass, the
+    SKU should be in the report.
+
+    Query params:
+      sku — the Cova SKU
+      location_id — store id (e.g. 'S3' for Bradford)
+    """
+    from jobs.reorder_diagnose import diagnose_sku
+    with db() as conn:
+        as_of = get_latest_sale_date(conn)
+        result = diagnose_sku(conn, sku, location_id, as_of=as_of)
+    return result
+
+
 @app.get("/api/reorder")
 def get_reorder(
     store: str | None = None,
@@ -583,6 +602,51 @@ def get_reorder(
         from jobs.import_order_fill import get_latest_order_fill_skus
         order_fill_map = get_latest_order_fill_skus(conn)
 
+        # Sale flags — uses discount_lines to identify SKUs currently on sale
+        # or with recently ended sales. Pure visibility — no math change.
+        from jobs.sale_flags import compute_sale_flags
+        sale_flag_map = compute_sale_flags(conn, as_of=as_of)
+
+        # Ratings + comments — show alongside each rec so managers can see
+        # peer feedback without leaving the Reorder Report.
+        rating_map: dict[str, dict] = {}
+        cur = conn.cursor()
+        # Aggregate ratings by SKU (across all stores — ratings are
+        # store-agnostic in our data model).
+        try:
+            cur.execute("""
+                SELECT sku,
+                       AVG(rating) AS avg_rating,
+                       COUNT(*) AS rating_count
+                FROM product_ratings
+                GROUP BY sku
+            """)
+            for sku, avg_r, cnt in cur.fetchall():
+                rating_map[sku] = {
+                    "avg_rating": round(float(avg_r), 1) if avg_r is not None else None,
+                    "rating_count": int(cnt or 0),
+                    "comment_count": 0,
+                }
+        except sqlite3.OperationalError:
+            pass  # table missing on fresh install
+
+        # Comment counts per SKU
+        try:
+            cur.execute("""
+                SELECT sku, COUNT(*) FROM product_comments GROUP BY sku
+            """)
+            for sku, cnt in cur.fetchall():
+                if sku in rating_map:
+                    rating_map[sku]["comment_count"] = int(cnt or 0)
+                else:
+                    rating_map[sku] = {
+                        "avg_rating": None,
+                        "rating_count": 0,
+                        "comment_count": int(cnt or 0),
+                    }
+        except sqlite3.OperationalError:
+            pass
+
     recs = filter_by_top_level(recs, tl, default_exclude_other=True)
 
     payload = []
@@ -634,6 +698,29 @@ def get_reorder(
             d["order_fill_available_qty"] = None
             d["order_fill_price_change"] = None
             d["order_fill_price_change_pct"] = None
+
+        # Sale flag — visual only, no math change. Tells the manager that
+        # the velocity number they're looking at may be inflated by a current
+        # or recently-ended promotion.
+        sf = sale_flag_map.get((r.location_id, r.sku))
+        if sf:
+            d["sale_flag"] = sf["status"]  # 'active' | 'recent'
+            d["sale_flag_detail"] = {
+                "active_days_in_7": sf["active_days_in_7"],
+                "days_in_30": sf["days_in_30"],
+                "avg_discount_pct": sf["avg_discount_pct"],
+                "last_promo_date": sf["last_promo_date"],
+                "days_since_last_promo": sf["days_since_last_promo"],
+            }
+        else:
+            d["sale_flag"] = None
+            d["sale_flag_detail"] = None
+
+        # Ratings + comments from manager feedback (synced from OCS Catalogue tab)
+        rinfo = rating_map.get(r.sku) or {"avg_rating": None, "rating_count": 0, "comment_count": 0}
+        d["avg_rating"] = rinfo["avg_rating"]
+        d["rating_count"] = rinfo["rating_count"]
+        d["comment_count"] = rinfo["comment_count"]
 
         payload.append(d)
 
@@ -771,7 +858,8 @@ def inventory_summary(store: str | None = None) -> dict:
         retail_value = float(retail_value or 0)
         cost_value = float(cost_value or 0)
 
-        # Breakdown by top level
+        # Breakdown by top level — now includes cost_value too so the
+        # Overview can show "Cost of Cannabis Inventory" alongside retail.
         cur.execute(f"""
             WITH latest AS (
                 SELECT sku, location_id, on_hand FROM (
@@ -783,19 +871,53 @@ def inventory_summary(store: str | None = None) -> dict:
             SELECT
                 COALESCE(p.top_level, 'Unknown') AS top_level,
                 SUM(CASE WHEN l.on_hand > 0 THEN 1 ELSE 0 END) AS skus_in_stock,
-                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand * COALESCE(pr.regular_price, 0) ELSE 0 END) AS retail_value
+                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand * COALESCE(pr.regular_price, 0) ELSE 0 END) AS retail_value,
+                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand *
+                    COALESCE(oc.unit_price, pr.regular_price * 0.60, 0)
+                ELSE 0 END) AS cost_value
             FROM latest l
             LEFT JOIN products p ON p.sku = l.sku
             LEFT JOIN prices pr ON pr.sku = l.sku AND pr.location_id = l.location_id
+            LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
             WHERE COALESCE(p.top_level, '') != 'Other' {store_clause}
             GROUP BY top_level
         """, params)
         by_top = {}
-        for top, skus, rev in cur.fetchall():
+        for top, skus, rev, cost in cur.fetchall():
             by_top[top or "Unknown"] = {
                 "skus_in_stock": skus or 0,
                 "retail_value": round(float(rev or 0), 2),
+                "cost_value": round(float(cost or 0), 2),
             }
+
+        # Weeks of inventory: total_units ÷ avg weekly units sold over last 30d
+        # Honest caveat: this is an aggregate across all SKUs. Hides the
+        # distribution (you might be 2 weeks on Heroes and 80 weeks on slow
+        # movers, averaging to ~14 weeks which hides both extremes).
+        # The Reorder Report's per-SKU days-of-cover is the diagnostic version;
+        # this is a single number for the Overview KPI.
+        from datetime import datetime, timedelta as _td
+        win_end = datetime.now().date()
+        win_start = win_end - _td(days=30)
+        woi_store_clause = " AND s.location_id = ?" if store else ""
+        woi_params = [win_start.isoformat(), win_end.isoformat()]
+        if store:
+            woi_params.append(store)
+        cur.execute(f"""
+            SELECT COALESCE(SUM(s.units_sold), 0) AS units_30d
+            FROM sales_daily s
+            LEFT JOIN products p ON p.sku = s.sku
+            WHERE s.sale_date >= ? AND s.sale_date <= ?
+              AND COALESCE(p.top_level, '') != 'Other'
+              {woi_store_clause}
+        """, woi_params)
+        units_30d_row = cur.fetchone()
+        units_30d = float(units_30d_row[0] or 0)
+        # Convert to weekly rate, compute weeks of cover
+        weekly_units = units_30d / (30.0 / 7.0)  # = units_30d × 7/30
+        weeks_of_inventory = None
+        if weekly_units > 0 and total_units:
+            weeks_of_inventory = round(total_units / weekly_units, 1)
 
     return {
         "total_skus": total_skus or 0,
@@ -804,6 +926,8 @@ def inventory_summary(store: str | None = None) -> dict:
         "total_stock_value_retail": round(retail_value, 2),
         "total_stock_value_cost": round(cost_value, 2),
         "by_top_level": by_top,
+        "weeks_of_inventory": weeks_of_inventory,
+        "units_sold_30d": int(units_30d),
     }
 
 
@@ -1779,6 +1903,7 @@ def get_suggested_promos(
             "days_since_last_received": days_since_last_received,
             "days_since_last_sold": days_since_last_sold,
             "regular_price": retail,
+            "unit_cost": round(cost, 2) if cost else None,  # per-unit cost — needed for margin math in UI
             "cost_tied_up": tied_up,
             "retail_value": retail_value,
             "suggested_discount_pct": suggested["discount_pct"] if suggested else None,

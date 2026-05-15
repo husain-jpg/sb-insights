@@ -258,6 +258,43 @@
   }
   tbody td.muted { color: var(--text-dim); }
   tbody tr:hover td { background: var(--bg-elev-2); }
+
+  /* Sticky-column support: wrap a table in <div class="sticky-cols-1"> etc.
+     The first N columns will freeze when horizontal-scrolling. Background
+     overrides standard td bg to ensure scrolling content doesn't bleed
+     through. Each sticky-cols-X class freezes the first X columns. */
+  .sticky-cols-1 thead th:first-child,
+  .sticky-cols-1 tbody td:first-child {
+    position: sticky; left: 0; z-index: 4;
+    background: var(--bg-elev);
+  }
+  .sticky-cols-1 thead th:first-child {
+    z-index: 6; background: var(--bg-elev-2);
+  }
+  .sticky-cols-1 tbody tr:hover td:first-child { background: var(--bg-elev-2); }
+
+  .sticky-cols-4 thead th:nth-child(-n+4),
+  .sticky-cols-4 tbody td:nth-child(-n+4) {
+    position: sticky; z-index: 4; background: var(--bg-elev);
+  }
+  .sticky-cols-4 thead th:nth-child(-n+4) {
+    z-index: 6; background: var(--bg-elev-2);
+  }
+  .sticky-cols-4 tbody tr:hover td:nth-child(-n+4) { background: var(--bg-elev-2); }
+  /* Each sticky col needs its own `left` offset. JS sets these via inline
+     styles after table render based on actual column widths. Fallback values
+     here cover typical column widths so it works even without JS adjustments. */
+  .sticky-cols-4 thead th:nth-child(1),
+  .sticky-cols-4 tbody td:nth-child(1) { left: 0; }
+  .sticky-cols-4 thead th:nth-child(2),
+  .sticky-cols-4 tbody td:nth-child(2) { left: 220px; }
+  .sticky-cols-4 thead th:nth-child(3),
+  .sticky-cols-4 tbody td:nth-child(3) { left: 320px; }
+  .sticky-cols-4 thead th:nth-child(4),
+  .sticky-cols-4 tbody td:nth-child(4) { left: 400px; }
+
+  /* Tables in sticky-col mode need horizontal scroll on their wrapper. */
+  .table-scroll { overflow-x: auto; }
   .sku {
     font-family: ui-monospace, Menlo, monospace;
     font-size: 10px; color: var(--text-faint); margin-top: 3px;
@@ -674,17 +711,17 @@ async function renderOverview() {
           <div class="kpi-value">${fmtN(inv.skus_in_stock)}</div>
           <div class="kpi-detail">of ${fmtN(inv.total_skus)} carried</div>
         </div>
-        <div class="kpi-card purple" data-clickable data-goto="inventory">
-          <div class="kpi-label"><span>Total Units</span><span class="kpi-link-arrow">→</span></div>
-          <div class="kpi-value">${fmtN(inv.total_units)}</div>
-          <div class="kpi-detail">Across all SKUs</div>
+        <div class="kpi-card purple" data-clickable data-goto="inventory" title="Estimated weeks of cover at the chain (or store) level: total units on hand ÷ avg weekly units sold over the last 30 days. Aggregate metric — hides the per-SKU distribution.">
+          <div class="kpi-label"><span>Weeks of Inventory</span><span class="kpi-link-arrow">→</span></div>
+          <div class="kpi-value">${inv.weeks_of_inventory != null ? inv.weeks_of_inventory.toFixed(1) : '—'}</div>
+          <div class="kpi-detail">Based on last 30 days of sales</div>
         </div>
       </div>
 
       ${(() => {
         const byTop = inv.by_top_level || {};
-        const cannabis = byTop["Cannabis"] || {skus_in_stock: 0, retail_value: 0};
-        const accessories = byTop["Accessories"] || {skus_in_stock: 0, retail_value: 0};
+        const cannabis = byTop["Cannabis"] || {skus_in_stock: 0, retail_value: 0, cost_value: 0};
+        const accessories = byTop["Accessories"] || {skus_in_stock: 0, retail_value: 0, cost_value: 0};
         if (!cannabis.skus_in_stock && !accessories.skus_in_stock) return '';
         return `
           <div class="kicker" style="margin: 24px 0 12px">Inventory by Type</div>
@@ -692,12 +729,12 @@ async function renderOverview() {
             <div class="kpi-card green" data-clickable data-goto="inventory">
               <div class="kpi-label"><span>Cannabis</span><span class="kpi-link-arrow">→</span></div>
               <div class="kpi-value">${fmt$(cannabis.retail_value)}</div>
-              <div class="kpi-detail">${fmtN(cannabis.skus_in_stock)} SKUs in stock · retail value</div>
+              <div class="kpi-detail">${fmtN(cannabis.skus_in_stock)} SKUs · ${fmt$(cannabis.cost_value)} at cost</div>
             </div>
             <div class="kpi-card blue" data-clickable data-goto="inventory">
               <div class="kpi-label"><span>Accessories</span><span class="kpi-link-arrow">→</span></div>
               <div class="kpi-value">${fmt$(accessories.retail_value)}</div>
-              <div class="kpi-detail">${fmtN(accessories.skus_in_stock)} SKUs in stock · retail value</div>
+              <div class="kpi-detail">${fmtN(accessories.skus_in_stock)} SKUs · ${fmt$(accessories.cost_value)} at cost</div>
             </div>
           </div>
         `;
@@ -945,6 +982,187 @@ function renderSuggestedTable(items, locationId) {
   });
 }
 
+// ========================================================================
+// Reorder Report — Tag Legend modal
+// ========================================================================
+// One place to look up "what does this tag mean?" — opened from the Legend
+// button in the Reorder Report header.
+function showReorderLegend() {
+  // Reusable styling helpers
+  const row = (badgeHtml, name, desc) => `
+    <tr>
+      <td style="padding: 8px 10px; vertical-align: top; white-space: nowrap;">${badgeHtml}</td>
+      <td style="padding: 8px 10px; vertical-align: top;"><strong>${name}</strong></td>
+      <td style="padding: 8px 10px; vertical-align: top; color: var(--text-dim); font-size: 12px;">${desc}</td>
+    </tr>
+  `;
+  const tag = (style, text) => `<span class="tag" style="${style} font-size: 9px; padding: 1px 5px; vertical-align: middle;">${text}</span>`;
+
+  const overlay = document.createElement("div");
+  overlay.id = "legend-overlay";
+  overlay.style.cssText = "position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;";
+  overlay.innerHTML = `
+    <div style="background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; max-width: 720px; width: 100%; max-height: 90vh; overflow: auto;">
+      <div style="padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline;">
+        <h3 style="margin: 0;">Reorder Report — Tag Legend</h3>
+        <button id="legend-close" class="btn" style="font-size: 11px;">Close</button>
+      </div>
+      <div style="padding: 16px 20px;">
+        <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Urgency</h4>
+        <table style="font-size: 13px; margin-bottom: 20px;">
+          ${row(tag("background: rgba(214, 100, 100, 0.18); color: #d66464; border-color: rgba(220, 110, 110, 0.4);", "stockout"), "Stockout", "On-hand is zero. Every day at zero is lost sales.")}
+          ${row(tag("background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4);", "critical"), "Critical", "Days of cover is less than lead time. Will hit stockout before next delivery.")}
+          ${row(tag("background: rgba(214, 180, 70, 0.15); color: #c89b32; border-color: rgba(220, 190, 80, 0.4);", "high"), "High", "Days of cover is less than lead time + safety buffer. Could stock out before the next order cycle.")}
+          ${row(tag("background: rgba(106, 166, 214, 0.15); color: #6aa6d6; border-color: rgba(116, 176, 224, 0.4);", "medium"), "Medium", "Will need a reorder soon but not urgently.")}
+        </table>
+
+        <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Sale Status</h4>
+        <table style="font-size: 13px; margin-bottom: 20px;">
+          ${row(tag("background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45);", "🏷️ Active Sale"), "Active Sale", "Currently discounted. Recent velocity may be inflated by the promotion — consider ordering more conservatively than the raw number suggests.")}
+          ${row(tag("background: rgba(150, 150, 150, 0.15); color: #999; border-color: rgba(160, 160, 160, 0.4);", "↘️ Recently Ended Sale"), "Recently Ended Sale", "A promotion ended in the last 30 days. 30-day velocity reflects sale conditions; future demand may revert lower.")}
+        </table>
+
+        <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">SKU Type</h4>
+        <table style="font-size: 13px; margin-bottom: 20px;">
+          ${row(tag("background: rgba(180, 140, 40, 0.15); color: #c89b32; border-color: rgba(200, 155, 50, 0.4);", "★ HERO"), "Hero SKU", "Top-velocity within its (category, size) bucket. Gets MORE coverage cushion (Hero ceiling, e.g., 14 days) than regular SKUs since stockouts here cost real revenue.")}
+        </table>
+
+        <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Data Revenue Deals</h4>
+        <table style="font-size: 13px; margin-bottom: 20px;">
+          ${row(tag("background: rgba(70, 140, 90, 0.15); color: #6dab84; border-color: rgba(80, 160, 100, 0.4);", "IRCC: 10% WS"), "Collective deal", "This SKU has an active data revenue deal with a collective (IRCC, CC, or Seeker). Rate shown is % paid back to you on WS (wholesale cost) or RT (retail sales). Rebate-aware sort promotes these in Medium/High urgency tiers.")}
+          ${row(tag("background: rgba(140, 100, 180, 0.15); color: #a78bd9; border-color: rgba(160, 110, 200, 0.4);", "DIRECT"), "Direct deal", "Direct deal between you and the brand or LP. SKU is excluded from collective rebate programs.")}
+        </table>
+
+        <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">OCS Order Fill</h4>
+        <table style="font-size: 13px; margin-bottom: 20px;">
+          ${row(tag("background: rgba(80, 180, 100, 0.18); color: #6fcf85; border-color: rgba(90, 200, 110, 0.45);", "BACK IN STOCK"), "Back in stock", "Back in stock at OCS as of the latest Order Fill template.")}
+          ${row(tag("background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45);", "NEW"), "New arrival", "Newly listed in OCS's latest Order Fill.")}
+          ${row(tag("background: rgba(106, 166, 214, 0.15); color: #6aa6d6; border-color: rgba(116, 176, 224, 0.4);", "CTB"), "Click-to-Buy", "Ships directly from OCS warehouse. Shortest lead time (~5 days).")}
+          ${row(tag("background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4);", "FT-EXP"), "Flow Through Expedited", "Cova-managed Flow Through, expedited tier. Mid lead time (~12 days).")}
+          ${row(tag("background: rgba(180, 130, 100, 0.15); color: #c08560; border-color: rgba(190, 140, 110, 0.4);", "FT-STD"), "Flow Through Standard", "Cova-managed Flow Through, standard tier. Longest lead time (~19 days).")}
+        </table>
+
+        <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Mix Multiplier</h4>
+        <table style="font-size: 13px;">
+          ${row('<span style="color: var(--accent); font-family: Georgia, serif;">×1.15 mix</span>', "Boosted by mix", "Category is underweight at this store relative to chain average. Order qty boosted up to +25%. Hero SKUs are exempt.")}
+          ${row('<span style="color: var(--warning); font-family: Georgia, serif;">×0.85 mix</span>', "Reduced by mix", "Category is overweight at this store. Order qty reduced up to -30%. Hero SKUs are exempt.")}
+        </table>
+
+        <p style="font-size: 11px; color: var(--text-faint); margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);">
+          Tip: hover over any tag in the report to see SKU-specific details.
+        </p>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById("legend-close").addEventListener("click", () => overlay.remove());
+  overlay.addEventListener("click", e => { if (e.target === overlay) overlay.remove(); });
+}
+
+// ========================================================================
+// Reorder Report — SKU Diagnose modal
+// ========================================================================
+// Asks the user for a SKU + store, then calls /api/reorder/diagnose to show
+// every filter check the engine applied and the verdict.
+async function showReorderDiagnose() {
+  const sku = prompt("Enter a SKU to diagnose (e.g., the Cova SKU shown under product names):");
+  if (!sku || !sku.trim()) return;
+  let locId = "";
+  try {
+    const sf = document.getElementById("store-filter");
+    if (sf && sf.value) locId = sf.value;
+  } catch (e) { /* ignore */ }
+  if (!locId) {
+    locId = prompt("Enter the store ID (S1, S2, S3, ..., S8):") || "";
+  }
+  if (!locId.trim()) return;
+
+  const overlay = document.createElement("div");
+  overlay.id = "diagnose-overlay";
+  overlay.style.cssText = "position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;";
+  overlay.innerHTML = `
+    <div style="background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; max-width: 800px; width: 100%; max-height: 90vh; overflow: auto;">
+      <div style="padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline;">
+        <h3 style="margin: 0;">SKU Diagnostic</h3>
+        <button id="diagnose-close" class="btn" style="font-size: 11px;">Close</button>
+      </div>
+      <div id="diagnose-body" style="padding: 16px 20px;">
+        <div class="loading">Diagnosing...</div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById("diagnose-close").addEventListener("click", () => overlay.remove());
+  overlay.addEventListener("click", e => { if (e.target === overlay) overlay.remove(); });
+
+  try {
+    const data = await api(`/api/reorder/diagnose?sku=${encodeURIComponent(sku.trim())}&location_id=${encodeURIComponent(locId.trim())}`);
+    const body = document.getElementById("diagnose-body");
+
+    if (!data.found) {
+      body.innerHTML = `<div class="error" style="padding: 16px;">${escapeHtml(data.excluded_reason || 'SKU not found')}</div>`;
+      return;
+    }
+
+    const verdictBadge = data.verdict === "included"
+      ? '<span class="tag" style="background: rgba(80, 180, 100, 0.18); color: #6fcf85; padding: 2px 8px;">INCLUDED</span>'
+      : '<span class="tag" style="background: rgba(214, 100, 100, 0.18); color: #d66464; padding: 2px 8px;">EXCLUDED</span>';
+
+    const inp = data.inputs;
+    const inputsHtml = `
+      <table style="font-size: 12px; width: 100%;">
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Product</td><td><strong>${escapeHtml(inp.name || '?')}</strong></td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Brand / LP</td><td>${escapeHtml(inp.brand || '?')} · ${escapeHtml(inp.lp || '?')}</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Category</td><td>${escapeHtml(inp.category || '?')} → ${escapeHtml(inp.subcategory || '?')}</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Top-level</td><td>${escapeHtml(inp.top_level_classification || '?')}</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">On hand</td><td>${inp.on_hand} units (as of ${inp.inventory_as_of || '?'})</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Velocity</td><td>${inp.velocity_per_day} units/day (${inp.units_sold_30d} units over last 30 days)</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Days of cover</td><td>${inp.days_of_cover}</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Pack size</td><td>${inp.pack_size}</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">OCS stock</td><td>${escapeHtml(inp.ocs_stock_status || '?')} · price ${inp.ocs_unit_price ? '$' + inp.ocs_unit_price.toFixed(2) : '?'}</td></tr>
+        ${inp.min_qty_anchor != null || inp.max_qty_anchor != null ? `<tr><td style="padding: 4px 8px; color: var(--text-dim);">Min/Max override</td><td>min: ${inp.min_qty_anchor ?? '—'}, max: ${inp.max_qty_anchor ?? '—'}</td></tr>` : ''}
+      </table>
+    `;
+
+    const checksHtml = data.checks.map(c => `
+      <tr>
+        <td style="padding: 8px 10px; vertical-align: top; white-space: nowrap; font-size: 18px;">${c.passed ? '<span style="color: #6fcf85;">✓</span>' : '<span style="color: #d66464;">✗</span>'}</td>
+        <td style="padding: 8px 10px; vertical-align: top;">
+          <strong>${escapeHtml(c.name)}</strong>
+          <div style="color: var(--text-dim); font-size: 12px; margin-top: 2px;">${escapeHtml(c.explanation)}</div>
+        </td>
+      </tr>
+    `).join('');
+
+    body.innerHTML = `
+      <div style="margin-bottom: 16px;">
+        <div style="font-size: 14px; margin-bottom: 6px;">
+          <strong>${escapeHtml(data.sku)}</strong> at <strong>${escapeHtml(data.location_id)}</strong>
+        </div>
+        <div>Verdict: ${verdictBadge}</div>
+        ${data.excluded_reason ? `<div style="margin-top: 8px; font-size: 12px; color: #d66464;">${escapeHtml(data.excluded_reason)}</div>` : ''}
+      </div>
+
+      <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Inputs the engine sees</h4>
+      <div class="card" style="padding: 8px; margin-bottom: 20px;">${inputsHtml}</div>
+
+      <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Filter checks (in engine order)</h4>
+      <div class="card"><table style="font-size: 13px; width: 100%;">${checksHtml}</table></div>
+
+      <p style="font-size: 11px; color: var(--text-faint); margin-top: 16px;">
+        Settings applied:
+        Hero ceiling ${inp.settings_applied.hero_ceiling_days}d ·
+        Regular ceiling ${inp.settings_applied.regular_ceiling_days}d ·
+        Min velocity ${inp.settings_applied.min_velocity}/day ·
+        Pack threshold ${inp.settings_applied.pack_size_min_pct}% ·
+        Overstock ${inp.settings_applied.overstock_days}d
+      </p>
+    `;
+  } catch (e) {
+    document.getElementById("diagnose-body").innerHTML = `<div class="error" style="padding: 16px;">${escapeHtml(e.message)}</div>`;
+  }
+}
+
 async function renderReorder() {
   const main = document.getElementById("main");
   main.innerHTML = `<div class="loading">LOADING REORDER QUEUE...</div>`;
@@ -1000,15 +1218,21 @@ async function renderReorder() {
             <input type="checkbox" id="anchors-only" style="margin: 0;">
             Heroes only
           </label>
-          <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Show only SKUs with an active data revenue deal (Canna Collective etc.). Useful for prioritizing margin-boosting purchases.">
+          <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Show only SKUs with an active data revenue deal — collective rebate (IRCC/CC/Seeker) or direct brand/LP deal.">
             <input type="checkbox" id="data-fees-only" style="margin: 0;">
-            Data fees only
+            Rebate qualified only
+          </label>
+          <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Show only SKUs currently flagged as on sale (active LTO / heuristic-detected promo activity).">
+            <input type="checkbox" id="sale-flagged-only" style="margin: 0;">
+            On sale only
           </label>
           <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Show items you've excluded from this week's order. Exclusions persist in this browser.">
             <input type="checkbox" id="show-excluded" style="margin: 0;">
             Show excluded
           </label>
           <button id="clear-excluded-btn" class="btn" style="font-size: 11px; height: 28px; padding: 0 10px; display: none;" title="Remove all exclusion marks for this store">Clear exclusions (<span id="excluded-count">0</span>)</button>
+          <button id="reorder-legend-btn" class="btn" style="font-size: 11px; height: 28px; padding: 0 10px; margin-left: auto;" title="What do all these tags mean?">? Legend</button>
+          <button id="reorder-diagnose-btn" class="btn" style="font-size: 11px; height: 28px; padding: 0 10px;" title="Look up why a specific SKU is or isn't on the report">🔍 Diagnose SKU</button>
         </div>
       </div>
 
@@ -1126,7 +1350,22 @@ async function renderReorder() {
             }
             return out.join('');
           })();
-          return `${anchor}${dataFee}${ofBadges}${escapeHtml(r.product_name)}<div class="sku">${r.sku} · ${r.category || "—"}</div>`;
+          // Sale flags — currently/recently discounted SKUs may have inflated velocity
+          const saleTag = (() => {
+            if (r.sale_flag === 'active') {
+              const d = r.sale_flag_detail || {};
+              const tip = `Active Sale: ${d.active_days_in_7 || '?'} of last 7 days had >30% of units discounted (avg ${d.avg_discount_pct || '?'}% off). Velocity may be inflated — be cautious about ordering as if this rate is steady-state.`;
+              return `<span class="tag" style="background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="${tip}">🏷️ Active Sale</span>`;
+            }
+            if (r.sale_flag === 'recent') {
+              const d = r.sale_flag_detail || {};
+              const since = d.days_since_last_promo != null ? `${d.days_since_last_promo}d ago` : 'recent';
+              const tip = `Recently Ended Sale: last promo ${since}. Velocity over the past 30 days reflects sale conditions and may revert downward.`;
+              return `<span class="tag" style="background: rgba(150, 150, 150, 0.15); color: #999; border-color: rgba(160, 160, 160, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="${tip}">↘️ Recently Ended Sale</span>`;
+            }
+            return '';
+          })();
+          return `${anchor}${dataFee}${ofBadges}${saleTag}${escapeHtml(r.product_name)}<div class="sku">${r.sku} · ${r.category || "—"}</div>`;
         } },
       { key: 'location_id', label: 'Store', render: r => storeLabel(r.location_id) },
       { key: 'on_hand', label: 'On hand', type: 'number', align: 'right',
@@ -1136,7 +1375,10 @@ async function renderReorder() {
       { key: 'days_supply', label: 'Days', type: 'number', align: 'right',
         render: r => r.days_supply == null ? '—' : `<span style="${r.days_supply < 4 ? 'color: var(--critical)' : ''}">${r.days_supply.toFixed(1)}</span>` },
       { key: 'ocs_pack_size', label: 'Case Size', type: 'number', align: 'right',
-        render: r => r.ocs_pack_size || '—' },
+        tooltip: "Case/pack size from OCS catalog. Blank or '—' means the SKU isn't currently in OCS catalog (discontinued or accessory).",
+        render: r => r.ocs_pack_size != null && r.ocs_pack_size > 0
+          ? r.ocs_pack_size
+          : '<span class="muted" title="SKU not in current OCS catalog">—</span>' },
       { key: 'reorder_qty', label: 'Order qty', type: 'number', align: 'right',
         render: r => {
           const casesText = r.reorder_cases ? `<div class="sku">${r.reorder_cases} case${r.reorder_cases === 1 ? '' : 's'}</div>` : '';
@@ -1151,11 +1393,20 @@ async function renderReorder() {
       { key: 'line_total', label: 'Est. $', type: 'number', align: 'right',
         render: r => r.line_total ? fmt$(r.line_total) : '—' },
       { key: 'ocs_stock_status', label: 'OCS In-Stock', align: 'right',
+        tooltip: "Whether OCS has this SKU available to order. 'Yes' = in stock, 'No' = out at OCS, '—' = SKU not in current OCS catalog (likely discontinued or an accessory).",
         render: r => {
           if (r.ocs_stock_status === 'YES') return '<span class="tag tag-accent">Yes</span>';
           if (r.ocs_stock_status === 'NO') return '<span class="tag tag-critical" style="font-weight: 600;">No</span>';
-          return '<span class="tag">—</span>';
+          return '<span class="muted" title="Not in current OCS catalog">—</span>';
         } },
+      { key: 'avg_rating', label: 'Rating', type: 'number', align: 'right',
+        tooltip: 'Average rating across all managers (1-10). Synced from OCS Catalogue tab.',
+        render: r => (typeof ratingDisplay === 'function')
+          ? ratingDisplay(r.avg_rating, r.rating_count)
+          : (r.avg_rating != null ? `${r.avg_rating.toFixed(1)} (${r.rating_count})` : '—') },
+      { key: 'comment_count', label: 'Comments', type: 'number', align: 'right',
+        tooltip: 'Number of manager comments on this SKU.',
+        render: r => r.comment_count || '' },
     ];
 
     let currentData = data.recommendations;
@@ -1217,6 +1468,7 @@ async function renderReorder() {
       const q = search.value.trim().toLowerCase();
       const anchorsOnly = anchorsOnlyToggle.checked;
       const dataFeesOnly = document.getElementById("data-fees-only").checked;
+      const saleFlaggedOnly = document.getElementById("sale-flagged-only").checked;
       const categoryFilter = document.getElementById("category-filter").value;
       const showExcluded = document.getElementById("show-excluded").checked;
       let filtered = currentData;
@@ -1224,7 +1476,11 @@ async function renderReorder() {
         filtered = filtered.filter(r => r.is_top_sku);
       }
       if (dataFeesOnly) {
-        filtered = filtered.filter(r => r.data_fee_pct);
+        // "Rebate qualified" — has either a collective deal OR a direct deal
+        filtered = filtered.filter(r => r.data_fee_pct || r.data_fee_is_direct);
+      }
+      if (saleFlaggedOnly) {
+        filtered = filtered.filter(r => r.sale_flag === 'active' || r.sale_flag === 'recent');
       }
       if (categoryFilter) {
         filtered = filtered.filter(r => r.category === categoryFilter);
@@ -1240,11 +1496,13 @@ async function renderReorder() {
       }
       renderTable('reorder-table', filtered, columns, { defaultSort: 'urgency' });
       const anchorCount = filtered.filter(r => r.is_top_sku).length;
-      const dataFeeCount = filtered.filter(r => r.data_fee_pct).length;
+      const dataFeeCount = filtered.filter(r => r.data_fee_pct || r.data_fee_is_direct).length;
+      const saleCount = filtered.filter(r => r.sale_flag === 'active' || r.sale_flag === 'recent').length;
       const excludedCount = currentData.filter(r => excludedSkus.has(excludeKey(r))).length;
       const badges = [];
       if (anchorCount > 0 && !anchorsOnly) badges.push(`<span style="color: #c89b32; font-size: 10px;">(${anchorCount} Hero)</span>`);
-      if (dataFeeCount > 0 && !dataFeesOnly) badges.push(`<span style="color: #6dab84; font-size: 10px;">(${dataFeeCount} data fee)</span>`);
+      if (dataFeeCount > 0 && !dataFeesOnly) badges.push(`<span style="color: #6dab84; font-size: 10px;">(${dataFeeCount} rebate)</span>`);
+      if (saleCount > 0 && !saleFlaggedOnly) badges.push(`<span style="color: #d6b446; font-size: 10px;">(${saleCount} on sale)</span>`);
       if (excludedCount > 0 && !showExcluded) badges.push(`<span style="color: var(--text-dim); font-size: 10px;">(${excludedCount} excluded hidden)</span>`);
       document.getElementById("reorder-summary").innerHTML = `
         <div>SKUs<strong>${filtered.length}</strong> ${badges.join(' ')}</div>
@@ -1283,6 +1541,8 @@ async function renderReorder() {
     ocsOutToggle.addEventListener("change", refetch);
     mixAwareToggle.addEventListener("change", refetch);
     anchorsOnlyToggle.addEventListener("change", applyTextFilter);
+    document.getElementById("data-fees-only").addEventListener("change", applyTextFilter);
+    document.getElementById("sale-flagged-only").addEventListener("change", applyTextFilter);
     document.getElementById("category-filter").addEventListener("change", applyTextFilter);
     document.getElementById("show-excluded").addEventListener("change", applyTextFilter);
 
@@ -1325,6 +1585,11 @@ async function renderReorder() {
       updateExcludedUI();
       applyTextFilter();
     });
+
+    // Legend button — shows what every tag means
+    document.getElementById("reorder-legend-btn").addEventListener("click", showReorderLegend);
+    // Diagnose button — open a modal to look up why a specific SKU is/isn't on the report
+    document.getElementById("reorder-diagnose-btn").addEventListener("click", showReorderDiagnose);
 
     // Populate category filter from initial data and keep it in sync
     populateCategoryFilter();
@@ -1797,7 +2062,7 @@ async function renderDeadStock() {
           Dead: <strong style="color: var(--critical);">${fmt$(data.totals.dead_value)}</strong> ·
           Overstock: <strong style="color: var(--warning);">${fmt$(data.totals.overstock_value)}</strong>
         </div>
-        <div id="ds-table"></div>
+        <div class="table-scroll sticky-cols-4" id="ds-table"></div>
       </div>
     `;
 
@@ -2050,7 +2315,7 @@ async function renderInventory() {
       <div class="section-header">
         <div>
           <div class="kicker">Full Inventory</div>
-          <h2>All on-hand stock</h2>
+          <h2 style="white-space: nowrap;">Inventory on Hand</h2>
         </div>
         <div class="controls-row">
           <input type="search" id="inv-search" placeholder="Search product or SKU...">
@@ -2074,7 +2339,7 @@ async function renderInventory() {
 
       <div class="card">
         <div class="summary-bar" id="inv-summary"></div>
-        <div id="inv-table"></div>
+        <div class="table-scroll sticky-cols-1" id="inv-table"></div>
       </div>
     `;
 
@@ -2157,7 +2422,7 @@ async function renderInventory() {
         <div>Total units<strong>${fmtN(totalUnits)}</strong></div>
         <div>Total cost<strong>${fmt$(totalCost)}</strong></div>
         <div>Retail value<strong>${fmt$(totalRetail)}</strong></div>
-        <div>Implied margin<strong>${marginPct.toFixed(1)}%</strong></div>
+        <div title="Implied margin = (Retail value − Total cost) ÷ Retail value. THEORETICAL margin if all on-hand units sold at full regular retail price. Does not reflect actual realized margin (which depends on discounts and actual sale prices). Cost uses OCS catalog wholesale price; will switch to Cova average cost once that column is wired in.">Implied margin<strong>${marginPct.toFixed(1)}%</strong></div>
       `;
     }
 
@@ -3987,10 +4252,10 @@ async function renderCrossStore() {
     }
 
     main.innerHTML = `
-      <div class="section-header">
+      <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
         <div>
           <div class="kicker">Cross-Store Opportunities · Idea Generator</div>
-          <h2>SKUs selling well elsewhere but missing at <span id="cs-target-name">all stores</span></h2>
+          <h2 style="white-space: nowrap;">SKUs selling well elsewhere but missing at <span id="cs-target-name">all stores</span></h2>
         </div>
         <div class="controls-row">
           <select id="cs-target-store" title="Target store: where you want to find new product opportunities.">
@@ -4006,6 +4271,13 @@ async function renderCrossStore() {
             <option value="1" selected>≥1 other store</option>
             <option value="2">≥2 other stores</option>
             <option value="3">≥3 other stores</option>
+          </select>
+          <select id="cs-min-velocity" title="Minimum daily velocity at peer stores to count as 'selling well'. Higher = stricter filter.">
+            <option value="0.3">≥0.3 units/day</option>
+            <option value="0.5" selected>≥0.5 units/day</option>
+            <option value="1.0">≥1.0 units/day</option>
+            <option value="2.0">≥2.0 units/day</option>
+            <option value="5.0">≥5.0 units/day (Hero-level)</option>
           </select>
           <select id="cs-type-filter">
             <option value="">Cannabis + Accessories</option>
@@ -4029,10 +4301,12 @@ async function renderCrossStore() {
 
     const fmtDate = d => d ? d : 'never';
     const otherStoresDetail = (detail) => {
-      // Compact summary of where it's selling
-      return detail.slice(0, 4).map(p =>
-        `${storeLabel(p.store_id)} <span class="sku">${p.units}u · ${p.velocity}/d</span>`
-      ).join(' · ');
+      // One store per line for legibility — managers asked for this so they
+      // can quickly see each store's signal at a glance.
+      if (!detail || !detail.length) return '<span class="muted">—</span>';
+      return detail.slice(0, 8).map(p =>
+        `<div style="white-space: nowrap;">${storeLabel(p.store_id)} <span class="sku">${p.units}u · ${p.velocity}/d</span></div>`
+      ).join('');
     };
 
     const columns = [
@@ -4072,10 +4346,12 @@ async function renderCrossStore() {
       _csTargetStore = document.getElementById("cs-target-store").value;
       _csWindow = document.getElementById("cs-window").value;
       _csMinStores = document.getElementById("cs-min-stores").value;
+      const minVel = document.getElementById("cs-min-velocity").value;
       const type = document.getElementById("cs-type-filter").value;
       if (_csTargetStore) params.set("target_store", _csTargetStore);
       if (_csWindow) params.set("window_days", _csWindow);
       if (_csMinStores) params.set("min_other_stores", _csMinStores);
+      if (minVel) params.set("min_velocity_other", minVel);
       if (type) params.set("top_level", type);
       const data = await api(`/api/cross-store-opportunities?${params.toString()}`);
       currentData = data.items;
@@ -4088,7 +4364,7 @@ async function renderCrossStore() {
     };
 
     document.getElementById("cs-search").addEventListener("input", redraw);
-    ["cs-target-store","cs-window","cs-min-stores","cs-type-filter"].forEach(
+    ["cs-target-store","cs-window","cs-min-stores","cs-min-velocity","cs-type-filter"].forEach(
       id => document.getElementById(id).addEventListener("change", refetch));
 
     await refetch();
@@ -4117,10 +4393,10 @@ async function renderPromos() {
     const locs = await api("/api/locations");
 
     main.innerHTML = `
-      <div class="section-header">
+      <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
         <div>
           <div class="kicker">Suggested Promos · Aging slow-movers</div>
-          <h2>Discount tiers by shelf age</h2>
+          <h2 style="white-space: nowrap;">Discount tiers by shelf age</h2>
         </div>
         <div class="controls-row">
           <select id="promos-store-filter">
@@ -4144,13 +4420,18 @@ async function renderPromos() {
             <option value="0.3" selected>≤0.3/day (slow)</option>
             <option value="0.5">≤0.5/day (moderate)</option>
           </select>
+          <select id="promos-rebate-filter" title="Filter by whether SKU has an active data revenue rebate.">
+            <option value="">All SKUs</option>
+            <option value="yes">Rebate qualified only</option>
+            <option value="no">No rebate only</option>
+          </select>
           <input type="search" id="promos-search" placeholder="Search...">
           <span class="tag tag-warning" id="promos-summary">…</span>
         </div>
       </div>
 
       <div class="card">
-        <div id="promos-table"></div>
+        <div class="table-scroll sticky-cols-4" id="promos-table"></div>
       </div>
 
       <div class="hint-box">
@@ -4159,7 +4440,7 @@ async function renderPromos() {
         <span class="tag" style="background: rgba(220, 150, 90, 0.2); color: #dc965a; font-size: 9px; padding: 1px 5px;">4MO</span> → 10% off &nbsp;·&nbsp;
         <span class="tag" style="background: rgba(232, 130, 70, 0.2); color: #e88246; font-size: 9px; padding: 1px 5px;">5MO</span> → 15% off &nbsp;·&nbsp;
         <span class="tag tag-critical" style="font-size: 9px; padding: 1px 5px;">6MO+</span> → 20% off<br>
-        Cascade based on <strong>days since last received</strong> (shelf-life proxy). Use first-received and last-sold columns to override based on context. Sort by Retail value $ to surface biggest financial exposure first.
+        Cascade based on <strong>days since last received</strong> (shelf-life proxy). <strong>Gross margin</strong> columns assume the suggested discount is applied. <strong>Margin w/ rebates</strong> additionally adds back any active collective/data partner rebate $ per unit.
       </div>
     `;
 
@@ -4174,8 +4455,41 @@ async function renderPromos() {
     const fmtDays = d => d == null ? '—' : `${d}d`;
     const fmtDate = d => d ? d : '—';
 
+    // Per-unit margin helpers
+    const discountedPrice = (r) => {
+      if (!r.regular_price || r.suggested_discount_pct == null) return null;
+      return r.regular_price * (1 - r.suggested_discount_pct / 100.0);
+    };
+    const grossMarginAfterDiscount = (r) => {
+      const disc = discountedPrice(r);
+      if (disc == null || !r.unit_cost) return null;
+      // (discounted_price - cost) / discounted_price
+      return disc > 0 ? ((disc - r.unit_cost) / disc) : null;
+    };
+    const rebatePerUnit = (r) => {
+      // Convert the active deal's percentage to $/unit. Basis matters:
+      //   retail_sales → rebate $ = retail × pct/100
+      //   wholesale_cost → rebate $ = cost × pct/100
+      // For "DIRECT" deals (is_direct=true) we don't have a clean rate, so treat as 0
+      // (the user will set actual ongoing-agreement rates in the new Data Partners tab).
+      if (!r.data_fee_pct || r.data_fee_is_direct) return 0;
+      const basis = r.data_fee_basis || 'retail_sales';
+      const pct = r.data_fee_pct / 100.0;
+      if (basis === 'wholesale_cost') return (r.unit_cost || 0) * pct;
+      // default: retail_sales — apply to the DISCOUNTED price since that's what the customer pays
+      const disc = discountedPrice(r);
+      return (disc || 0) * pct;
+    };
+    const grossMarginAfterDiscountAndRebates = (r) => {
+      const disc = discountedPrice(r);
+      if (disc == null || !r.unit_cost) return null;
+      const rebate = rebatePerUnit(r);
+      // Effective margin: discounted price - cost + rebate per unit, divided by discounted price
+      return disc > 0 ? ((disc - r.unit_cost + rebate) / disc) : null;
+    };
+
     const columns = [
-      { key: 'suggested_discount_pct', label: 'Tier',
+      { key: 'suggested_discount_pct', label: 'Suggested Discount Tier',
         tooltip: 'Recommended discount based on days since last received.',
         render: r => tierTag(r.suggested_discount_pct, r.suggested_tier_label) },
       { key: 'product_name', label: 'Product',
@@ -4183,6 +4497,30 @@ async function renderPromos() {
       { key: 'location_id', label: 'Store', render: r => storeLabel(r.location_id) },
       { key: 'category', label: 'Category', render: r => r.category || '—' },
       { key: 'on_hand', label: 'On hand', type: 'number', align: 'right' },
+      { key: 'regular_price', label: 'Current Price', type: 'number', align: 'right',
+        tooltip: 'Current regular retail price at this store.',
+        render: r => r.regular_price ? fmt$2(r.regular_price) : '—' },
+      { key: 'suggested_discount_price', label: 'Suggested Discount Price', type: 'number', align: 'right',
+        tooltip: 'Current price × (1 − suggested discount %).',
+        render: r => {
+          const p = discountedPrice(r);
+          return p == null ? '—' : fmt$2(p);
+        },
+        sortValue: r => discountedPrice(r) || 0 },
+      { key: 'gross_margin_after_discount', label: 'Margin after Discount', type: 'number', align: 'right',
+        tooltip: '(Discounted price − unit cost) ÷ discounted price. Excludes any rebates.',
+        render: r => {
+          const m = grossMarginAfterDiscount(r);
+          return m == null ? '—' : `${(m * 100).toFixed(1)}%`;
+        },
+        sortValue: r => grossMarginAfterDiscount(r) ?? -999 },
+      { key: 'gross_margin_after_discount_and_rebates', label: 'Margin w/ Rebates', type: 'number', align: 'right',
+        tooltip: 'Includes rebate $ per unit from the active deal (collective or future Data Partner). Direct-deal SKUs show without rebate since rates live elsewhere — will fill in once Data Partners agreements are added.',
+        render: r => {
+          const m = grossMarginAfterDiscountAndRebates(r);
+          return m == null ? '—' : `${(m * 100).toFixed(1)}%`;
+        },
+        sortValue: r => grossMarginAfterDiscountAndRebates(r) ?? -999 },
       { key: 'days_since_last_received', label: 'Since received', type: 'number', align: 'right',
         tooltip: 'Days since most recent receive at this store (from Cova). Drives the tier cascade.',
         render: r => fmtDays(r.days_since_last_received) },
@@ -4205,9 +4543,15 @@ async function renderPromos() {
     let currentData = [];
     const redraw = () => {
       const q = document.getElementById("promos-search").value.trim().toLowerCase();
-      const filtered = q
+      const rebateMode = document.getElementById("promos-rebate-filter").value;
+      let filtered = q
         ? currentData.filter(r => (r.product_name || '').toLowerCase().includes(q) || (r.sku || '').toLowerCase().includes(q))
         : currentData;
+      if (rebateMode === 'yes') {
+        filtered = filtered.filter(r => r.data_fee_pct || r.data_fee_is_direct);
+      } else if (rebateMode === 'no') {
+        filtered = filtered.filter(r => !r.data_fee_pct && !r.data_fee_is_direct);
+      }
       renderTable('promos-table', filtered, columns, { defaultSort: 'retail_value', defaultDir: 'desc' });
     };
 
@@ -4231,6 +4575,8 @@ async function renderPromos() {
     };
 
     document.getElementById("promos-search").addEventListener("input", redraw);
+    // Rebate filter only affects local filtering, not refetch
+    document.getElementById("promos-rebate-filter").addEventListener("change", redraw);
     ["promos-store-filter","promos-type-filter","promos-age-filter","promos-velocity-filter"].forEach(
       id => document.getElementById(id).addEventListener("change", refetch));
 
@@ -4336,7 +4682,7 @@ async function renderOcsCatalogue() {
       <div style="display: grid; grid-template-columns: 1fr 380px; gap: 14px;">
         <div class="card">
           <div id="ocs-count" style="font-size: 11px; color: var(--text-dim); padding: 4px 16px 12px;">${data.count} SKUs</div>
-          <div id="ocs-table"></div>
+          <div class="table-scroll sticky-cols-1" id="ocs-table"></div>
         </div>
         <div class="card" id="ocs-detail" style="padding: 16px; max-height: 80vh; overflow-y: auto;">
           <div style="color: var(--text-faint); font-size: 11px; text-align: center; padding: 32px;">
@@ -4361,11 +4707,12 @@ async function renderOcsCatalogue() {
       { key: 'thc_min', label: 'THC%', type: 'number', align: 'right',
         render: r => fmtThc(r.thc_min, r.thc_max),
         sortValue: r => r.thc_max || r.thc_min || 0 },
-      { key: 'unit_price', label: 'Wholesale', type: 'number', align: 'right',
+      { key: 'unit_price', label: 'Wholesale Cost', type: 'number', align: 'right',
         render: r => r.unit_price ? fmt$2(r.unit_price) : '—' },
-      { key: 'pack_size', label: 'Case', type: 'number', align: 'right',
+      { key: 'pack_size', label: 'Case Size', type: 'number', align: 'right',
         render: r => r.pack_size || '—' },
-      { key: 'stock_status', label: 'OCS', align: 'right',
+      { key: 'stock_status', label: 'OCS In Stock', align: 'right',
+        tooltip: "Whether OCS currently has this SKU available to order. 'Yes' = in stock, 'No' = OCS is out, '?' = unknown / SKU not currently in OCS catalog.",
         render: r => r.stock_status === 'YES'
           ? '<span class="tag tag-accent">Yes</span>'
           : (r.stock_status === 'NO' ? '<span class="tag tag-critical" style="font-weight:600;">No</span>' : '<span class="tag">?</span>') },
@@ -4746,16 +5093,21 @@ async function renderMarketIntel() {
     // Defensive: handle either shape just in case.
     const locsRaw = await api("/api/locations").catch(() => []);
     const stores = { locations: Array.isArray(locsRaw) ? locsRaw : (locsRaw.locations || []) };
-    const folders = await api("/api/market-intelligence/folders");
+    const folders = await api("/api/market-intelligence/folders").catch(() => ({ folders: [] }));
 
     // Group imports by location to find latest per store
     const importsByStore = {};
-    for (const imp of data.items) {
+    for (const imp of (data.items || [])) {
       if (!importsByStore[imp.location_id]) importsByStore[imp.location_id] = [];
       importsByStore[imp.location_id].push(imp);
     }
 
-    if (!_miCurrentStore && data.items.length > 0) {
+    // Pick a default store if none chosen yet — prefer a store with data
+    if (!_miCurrentStore && data.items && data.items.length > 0) {
+      _miCurrentStore = data.items[0].location_id;
+    }
+    // Fallback: if our selected store has no data, switch to one that does
+    if (_miCurrentStore && !importsByStore[_miCurrentStore] && data.items && data.items.length > 0) {
       _miCurrentStore = data.items[0].location_id;
     }
 
@@ -4782,16 +5134,22 @@ async function renderMarketIntel() {
         </div>
       </div>
 
-      <div class="hint-box" style="margin-bottom: 14px;">
-        <strong>About this data:</strong> OCS provides per-store sales benchmarks vs. other stores in your municipality. Updated every ~48 hours on the OCS portal.
-        <br><br>
-        <strong>Recommended cadence:</strong> import bi-weekly using a <strong>trailing 30-day window</strong> in OCS. This balances signal stability with freshness — the 30-day window captures enough sales-days to make peer velocities meaningful, and bi-weekly imports overlap by ~16 days to smooth out week-to-week noise. Stale warnings fire after 21 days.
-        <br><br>
-        <strong>How this works today (manual):</strong> Download both files for each store from OCS portal. Drop into <code style="background: var(--bg-elev-2); padding: 1px 6px; border-radius: 3px;">imports/market_intelligence/{YYYY-MM-DD}/{StoreName}/</code> then click Imports → Import all.
-        <br><br>
-        <strong>Possible automation:</strong> if OCS offers an API or scheduled email exports (TBC with your OCS account manager), an automated importer will replace the manual workflow at cloud launch. Not built yet.
-        <br><br>
-        <span style="color: var(--text-dim);">⚠ Top regional sellers ≠ guaranteed winners for your customers. Use this as a hypothesis generator, not a directive. Adding SKUs commits real shelf space + capital.</span>
+      <div class="card" style="padding: 14px 16px; margin-bottom: 14px; font-size: 12px; line-height: 1.6;">
+        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; font-weight: 600;">About this data</div>
+        <div style="color: var(--text-dim);">OCS provides per-store sales benchmarks vs. other stores in your municipality. Updated every ~48 hours on the OCS portal.</div>
+
+        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Recommended cadence</div>
+        <div style="color: var(--text-dim);">Import bi-weekly using a <strong style="color: var(--text);">trailing 30-day window</strong> in OCS. Balances signal stability with freshness — 30-day captures enough sales-days to make peer velocities meaningful, and bi-weekly imports overlap by ~16 days to smooth week-to-week noise. Stale warnings fire after 21 days.</div>
+
+        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Today's workflow (manual)</div>
+        <div style="color: var(--text-dim);">Download both files for each store from the OCS portal. Drop into <code style="background: var(--bg-elev-2); padding: 1px 6px; border-radius: 3px;">imports/market_intelligence/{YYYY-MM-DD}/{StoreName}/</code> then click <strong style="color: var(--text);">Imports</strong> → Import all.</div>
+
+        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Automation status</div>
+        <div style="color: var(--text-dim);">OCS confirmed no API or scheduled email export available (May 2026). Manual import remains the permanent workflow.</div>
+
+        <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 11px;">
+          ⚠ Top regional sellers ≠ guaranteed winners for your customers. Use as a hypothesis generator, not a directive. Adding SKUs commits real shelf space + capital.
+        </div>
       </div>
 
       <div id="mi-content"></div>
@@ -4808,7 +5166,10 @@ async function renderMarketIntel() {
       });
     });
 
-    if (data.items.length === 0 && folders.folders.length === 0) {
+    // Handle empty-data case after we've rendered the chrome
+    const hasImports = data.items && data.items.length > 0;
+    const hasFolders = folders.folders && folders.folders.length > 0;
+    if (!hasImports && !hasFolders) {
       document.getElementById("mi-content").innerHTML = `
         <div class="card" style="padding: 32px; text-align: center;">
           <div style="font-size: 14px; margin-bottom: 8px;">No market intelligence data yet</div>

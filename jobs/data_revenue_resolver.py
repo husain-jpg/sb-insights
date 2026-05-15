@@ -75,21 +75,34 @@ def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = No
     # 2) Get the brand and LP for each SKU we care about.
     # Match products via Cova SKU OR OCS variant number (deals use OCS variant
     # in sku_filter, but inventory/sales use Cova SKU; products is the bridge).
-    placeholders = ",".join(["?"] * len(sku_set))
-    cur.execute(f"""
-        SELECT sku, ocs_variant_number, brand, lp
-        FROM products
-        WHERE sku IN ({placeholders}) OR ocs_variant_number IN ({placeholders})
-    """, list(sku_set) + list(sku_set))
+    #
+    # SQLite has a hard limit of 999 parameters per query (sometimes 32K on
+    # newer builds). With thousands of SKUs in the inventory endpoint, naive
+    # IN (?, ?, ..., ?) blows past that. We chunk into batches of 400 (×2 for
+    # the OR-on-ocs_variant doubles param count → max 800 < 999 floor).
+    CHUNK_SIZE = 400
+    sku_list = list(sku_set)
+
+    def _chunked(seq, n):
+        for i in range(0, len(seq), n):
+            yield seq[i:i + n]
 
     # Build dual lookup: cova_sku → (brand, lp), ocs_var → (brand, lp)
     by_cova: dict[str, tuple[str|None, str|None]] = {}
     by_ocs: dict[str, tuple[str|None, str|None]] = {}
-    for cova_sku, ocs_var, brand, lp in cur.fetchall():
-        if cova_sku and cova_sku in sku_set:
-            by_cova[cova_sku] = (brand, lp)
-        if ocs_var and ocs_var in sku_set:
-            by_ocs[ocs_var] = (brand, lp)
+
+    for batch in _chunked(sku_list, CHUNK_SIZE):
+        placeholders = ",".join(["?"] * len(batch))
+        cur.execute(f"""
+            SELECT sku, ocs_variant_number, brand, lp
+            FROM products
+            WHERE sku IN ({placeholders}) OR ocs_variant_number IN ({placeholders})
+        """, list(batch) + list(batch))
+        for cova_sku, ocs_var, brand, lp in cur.fetchall():
+            if cova_sku and cova_sku in sku_set:
+                by_cova[cova_sku] = (brand, lp)
+            if ocs_var and ocs_var in sku_set:
+                by_ocs[ocs_var] = (brand, lp)
 
     # 3) For each SKU, check direct deal exclusion FIRST
     direct_excluded: dict[str, dict] = {}  # sku → "we have a direct deal, no collective applies"
@@ -114,34 +127,37 @@ def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = No
                 "source_brand": lp,
             }
 
-    # 4) Get all active collective deals matching our SKUs in one query
-    # Sort by partner priority + insert order so first match wins
-    cur.execute(f"""
-        SELECT d.sku_filter, b.brand_name, d.percentage, d.basis
-        FROM data_revenue_deals d
-        JOIN brand_partners b ON b.id = d.brand_id
-        WHERE d.start_date <= ?
-          AND (d.end_date IS NULL OR d.end_date >= ?)
-          AND d.sku_filter IS NOT NULL AND d.sku_filter != ''
-          AND (d.sku_filter IN ({placeholders}) OR d.sku_filter IN ({placeholders}))
-    """, [today_iso, today_iso] + list(sku_set) + list(sku_set))
-
-    # Bucket deals by SKU; pick highest-priority collective per SKU
+    # 4) Get all active collective deals matching our SKUs.
+    # Same chunking strategy — split SKU list into batches to stay under
+    # SQLite's parameter limit.
     deals_by_sku: dict[str, dict] = {}
-    for sku_filter, partner_name, pct, basis in cur.fetchall():
-        sku_key = sku_filter.strip()
-        # Score by priority — lower is better (1 = IRCC wins)
-        priority = COLLECTIVE_PRIORITY.get(partner_name, 99)
-        existing = deals_by_sku.get(sku_key)
-        if existing is None or priority < existing["_priority"]:
-            deals_by_sku[sku_key] = {
-                "partner": partner_name,
-                "percentage": float(pct),
-                "basis": basis,
-                "is_direct": False,
-                "source_brand": None,
-                "_priority": priority,
-            }
+    for batch in _chunked(sku_list, CHUNK_SIZE):
+        placeholders = ",".join(["?"] * len(batch))
+        cur.execute(f"""
+            SELECT d.sku_filter, b.brand_name, d.percentage, d.basis
+            FROM data_revenue_deals d
+            JOIN brand_partners b ON b.id = d.brand_id
+            WHERE d.start_date <= ?
+              AND (d.end_date IS NULL OR d.end_date >= ?)
+              AND d.sku_filter IS NOT NULL AND d.sku_filter != ''
+              AND (d.sku_filter IN ({placeholders}) OR d.sku_filter IN ({placeholders}))
+        """, [today_iso, today_iso] + list(batch) + list(batch))
+
+        # Bucket deals by SKU; pick highest-priority collective per SKU
+        for sku_filter, partner_name, pct, basis in cur.fetchall():
+            sku_key = sku_filter.strip()
+            # Score by priority — lower is better (1 = IRCC wins)
+            priority = COLLECTIVE_PRIORITY.get(partner_name, 99)
+            existing = deals_by_sku.get(sku_key)
+            if existing is None or priority < existing["_priority"]:
+                deals_by_sku[sku_key] = {
+                    "partner": partner_name,
+                    "percentage": float(pct),
+                    "basis": basis,
+                    "is_direct": False,
+                    "source_brand": None,
+                    "_priority": priority,
+                }
 
     # 5) Compose the result: direct deals override collective deals
     result: dict[str, dict] = {}
