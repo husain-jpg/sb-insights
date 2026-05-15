@@ -412,7 +412,8 @@
       <div class="nav-group-items">
         <button data-page="analytics">▸ Financial</button>
         <button data-page="partners">▸ Data Collectives</button>
-        <button data-page="data-partners">▸ Data Partners</button>
+        <button data-page="ltos">▸ LTOs</button>
+        <button data-page="data-lp-partners">▸ Data LP Partners</button>
         <button data-page="monthly-reports">▸ Monthly Reports</button>
         <button data-page="settings">▸ Settings</button>
         <button data-page="users">▸ Users</button>
@@ -3667,13 +3668,13 @@ let _dpCurrentLpId = null;
 let _dpFilterActive = false;
 let _dpFilterAgreement = "all";  // 'all' | 'signed' | 'unsigned'
 
-async function renderDataPartners() {
+async function renderLTOs() {
   const main = document.querySelector("main");
   main.innerHTML = `
     <div class="section-header">
       <div>
-        <div class="kicker">Data Partners · Licensed Producers</div>
-        <h2>LP master list with data agreements & contacts</h2>
+        <div class="kicker">LTOs · Limited-Time Offers</div>
+        <h2 style="white-space: nowrap;">LP master list with LTO management</h2>
       </div>
       <div class="controls-row">
         <input type="search" id="dp-search" placeholder="Search LP / supplier name…" style="min-width: 180px;">
@@ -3687,6 +3688,10 @@ async function renderDataPartners() {
           <option value="yes">Records only</option>
           <option value="no">No record yet (in OCS catalog)</option>
         </select>
+        <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Show LTOs whose end date has passed (auto-archived). Default: hidden.">
+          <input type="checkbox" id="dp-show-archived" style="margin: 0;">
+          Show archived LTOs
+        </label>
         <button id="dp-add-btn">+ Add LP</button>
         <button id="dp-seed-btn" title="Re-seed from OCS catalog + master list (preserves edits)">Re-seed</button>
       </div>
@@ -3716,6 +3721,10 @@ async function renderDataPartners() {
   document.getElementById("dp-search").addEventListener("input", () => loadDpList());
   document.getElementById("dp-add-btn").addEventListener("click", addNewLpDialog);
   document.getElementById("dp-seed-btn").addEventListener("click", reseedDialog);
+  // Show archived: re-load the currently-shown LP's LTOs (if any)
+  document.getElementById("dp-show-archived").addEventListener("change", () => {
+    if (_dpCurrentLpId) loadLtosForLp(_dpCurrentLpId);
+  });
 
   await loadDpList();
 }
@@ -3890,23 +3899,48 @@ async function loadLpDetail(lpId) {
           <input type="date" id="lto-start" style="font-size: 12px;">
           <input type="date" id="lto-end" style="font-size: 12px;">
         </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;">
-          <input type="number" id="lto-rate" step="0.1" min="0" max="100" placeholder="Rate %" style="font-size: 12px;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 8px;">
+          <input type="number" id="lto-rate" step="0.1" min="0" max="100" placeholder="Rebate %" title="Data revenue rebate % paid to you" style="font-size: 12px;">
           <select id="lto-basis" style="font-size: 12px;">
             <option value="retail_sales">% of retail sales</option>
             <option value="wholesale_cost">% of wholesale cost</option>
             <option value="gross_profit">% of gross profit</option>
           </select>
+          <input type="number" id="lto-discount-pct" step="0.1" min="0" max="100" placeholder="Discount % off retail" title="Customer-facing discount % (optional)" style="font-size: 12px;">
         </div>
         <input type="text" id="lto-notes" placeholder="Notes (optional)" style="font-size: 12px; width: 100%; margin-bottom: 8px;">
 
-        <div style="font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Apply to SKUs</div>
-        <input type="search" id="lto-sku-search" placeholder="Search OCS catalog by name, brand, or variant…" style="font-size: 12px; width: 100%; margin-bottom: 4px;">
-        <div id="lto-sku-results" style="max-height: 180px; overflow-y: auto; border: 1px solid var(--border); border-radius: 3px; margin-bottom: 8px; display: none;"></div>
+        <!-- Scope mode: SKU-specific vs Brand+Category -->
+        <div style="font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Scope</div>
+        <div style="display: flex; gap: 14px; font-size: 11px; margin-bottom: 8px;">
+          <label style="display: flex; align-items: center; gap: 4px; cursor: pointer;">
+            <input type="radio" name="lto-scope-mode" value="sku" id="lto-scope-sku" checked> Specific SKUs
+          </label>
+          <label style="display: flex; align-items: center; gap: 4px; cursor: pointer;" title="Apply to all SKUs of a brand, optionally narrowed to one category.">
+            <input type="radio" name="lto-scope-mode" value="brand"> Brand (or Brand + Category)
+          </label>
+        </div>
 
-        <div style="font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Selected SKUs (<span id="lto-sku-count">0</span>)</div>
-        <div id="lto-selected-skus" style="min-height: 30px; padding: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; margin-bottom: 8px; font-size: 11px;">
-          <span style="color: var(--text-faint);">No SKUs selected yet</span>
+        <!-- SKU mode UI -->
+        <div id="lto-scope-sku-ui">
+          <input type="search" id="lto-sku-search" placeholder="Search OCS catalog by name, brand, or variant…" style="font-size: 12px; width: 100%; margin-bottom: 4px;">
+          <div id="lto-sku-results" style="max-height: 180px; overflow-y: auto; border: 1px solid var(--border); border-radius: 3px; margin-bottom: 8px; display: none;"></div>
+          <div style="font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Selected SKUs (<span id="lto-sku-count">0</span>)</div>
+          <div id="lto-selected-skus" style="min-height: 30px; padding: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; margin-bottom: 8px; font-size: 11px;">
+            <span style="color: var(--text-faint);">No SKUs selected yet</span>
+          </div>
+        </div>
+
+        <!-- Brand+Category mode UI -->
+        <div id="lto-scope-brand-ui" style="display: none;">
+          <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 8px;">
+            <input type="text" id="lto-applies-brand" placeholder="Brand (required, e.g. 'Spinach')" title="Must match a brand name from the products catalog exactly. Case-insensitive." style="font-size: 12px;">
+            <input type="text" id="lto-applies-category" placeholder="Category (optional)" title="Optional: narrow to a category (e.g. 'Edibles'). Leave blank to apply to ALL products of this brand." style="font-size: 12px;">
+            <input type="text" id="lto-applies-subcategory" placeholder="Subcategory (optional)" title="Optional: further narrow to a subcategory." style="font-size: 12px;">
+          </div>
+          <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 8px;">
+            Brand+Category mode applies to all SKUs that match these scope rules at the time of evaluation. New SKUs added later that match will automatically be included.
+          </div>
         </div>
 
         <div style="display: flex; gap: 6px;">
@@ -3953,6 +3987,15 @@ async function loadLpDetail(lpId) {
   });
   document.getElementById("lto-create-btn").addEventListener("click", () => createNewLto(lpId));
 
+  // Scope mode radio toggle — show/hide the SKU search vs Brand+Category inputs
+  document.querySelectorAll('input[name="lto-scope-mode"]').forEach(r => {
+    r.addEventListener('change', e => {
+      const mode = e.target.value;
+      document.getElementById('lto-scope-sku-ui').style.display = mode === 'sku' ? 'block' : 'none';
+      document.getElementById('lto-scope-brand-ui').style.display = mode === 'brand' ? 'block' : 'none';
+    });
+  });
+
   // Load and render existing LTOs for this LP
   loadLtosForLp(lpId);
 }
@@ -3962,10 +4005,18 @@ const _ltoSelectedSkus = new Map();
 
 function resetLtoCreator() {
   _ltoSelectedSkus.clear();
-  ["lto-name","lto-start","lto-end","lto-rate","lto-notes","lto-sku-search"].forEach(id => {
+  ["lto-name","lto-start","lto-end","lto-rate","lto-notes","lto-sku-search",
+   "lto-discount-pct","lto-applies-brand","lto-applies-category","lto-applies-subcategory"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = "";
   });
+  // Reset scope mode to SKU (the default)
+  const skuRadio = document.getElementById("lto-scope-sku");
+  if (skuRadio) skuRadio.checked = true;
+  const skuUi = document.getElementById("lto-scope-sku-ui");
+  if (skuUi) skuUi.style.display = "block";
+  const brandUi = document.getElementById("lto-scope-brand-ui");
+  if (brandUi) brandUi.style.display = "none";
   document.getElementById("lto-sku-results").style.display = "none";
   document.getElementById("lto-sku-results").innerHTML = "";
   renderSelectedSkus();
@@ -4043,13 +4094,32 @@ async function createNewLto(lpId) {
   const end = document.getElementById("lto-end").value;
   const rate = parseFloat(document.getElementById("lto-rate").value);
   const basis = document.getElementById("lto-basis").value;
+  const discountPctRaw = document.getElementById("lto-discount-pct").value;
+  const discountPct = discountPctRaw ? parseFloat(discountPctRaw) : null;
   const notes = document.getElementById("lto-notes").value.trim();
+  const scopeMode = (document.querySelector('input[name="lto-scope-mode"]:checked') || {}).value || "sku";
 
   if (!name) { alert("Name is required"); return; }
   if (!start || !end) { alert("Start and end dates are required"); return; }
   if (isNaN(rate)) { alert("Rate is required"); return; }
-  if (_ltoSelectedSkus.size === 0) {
-    if (!confirm("No SKUs selected. Create LTO without SKUs?")) return;
+
+  // Scope validation
+  let applies_to_brand = null, applies_to_category = null, applies_to_subcategory = null;
+  let applicable_skus = [];
+  if (scopeMode === "sku") {
+    if (_ltoSelectedSkus.size === 0) {
+      alert("Select at least one SKU, or switch to Brand scope mode.");
+      return;
+    }
+    applicable_skus = Array.from(_ltoSelectedSkus.keys());
+  } else {
+    applies_to_brand = document.getElementById("lto-applies-brand").value.trim();
+    applies_to_category = document.getElementById("lto-applies-category").value.trim() || null;
+    applies_to_subcategory = document.getElementById("lto-applies-subcategory").value.trim() || null;
+    if (!applies_to_brand) {
+      alert("Brand is required in Brand scope mode.");
+      return;
+    }
   }
 
   try {
@@ -4057,8 +4127,10 @@ async function createNewLto(lpId) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name, start_date: start, end_date: end,
-        rate_percentage: rate, rate_basis: basis, notes,
-        applicable_skus: Array.from(_ltoSelectedSkus.keys()),
+        rate_percentage: rate, rate_basis: basis,
+        discount_pct: discountPct, notes,
+        applicable_skus,
+        applies_to_brand, applies_to_category, applies_to_subcategory,
       }),
     });
     if (!res.ok) {
@@ -4076,7 +4148,10 @@ async function loadLtosForLp(lpId) {
   const list = document.getElementById("dp-ltos-list");
   if (!list) return;
   try {
-    const data = await api(`/api/lps/${lpId}/ltos`);
+    // Honor the archive toggle if it's present (only on the LTOs tab)
+    const archEl = document.getElementById("dp-show-archived");
+    const includeArchived = archEl && archEl.checked ? "true" : "false";
+    const data = await api(`/api/lps/${lpId}/ltos?include_archived=${includeArchived}`);
     if (data.items.length === 0) {
       list.innerHTML = '<div style="color: var(--text-faint); font-size: 11px; padding: 8px;">No LTOs yet for this LP.</div>';
       return;
@@ -4092,10 +4167,25 @@ async function loadLtosForLp(lpId) {
       const statusTag = isCurrent
         ? '<span class="tag tag-accent" style="font-size: 9px; padding: 1px 5px;">ACTIVE</span>'
         : (lto.end_date < today
-          ? '<span class="tag" style="font-size: 9px; padding: 1px 5px;">PAST</span>'
+          ? '<span class="tag" style="font-size: 9px; padding: 1px 5px;" title="End date has passed — auto-archived. Toggle &quot;Show archived LTOs&quot; to see all.">ARCHIVED</span>'
           : '<span class="tag tag-info" style="font-size: 9px; padding: 1px 5px;">UPCOMING</span>');
+      // Scope description: SKU list vs Brand+Category rule
+      let scopeText;
+      if (lto.applies_to_brand) {
+        const parts = [lto.applies_to_brand];
+        if (lto.applies_to_category) parts.push(lto.applies_to_category);
+        if (lto.applies_to_subcategory) parts.push(lto.applies_to_subcategory);
+        scopeText = `Brand scope: ${parts.join(' / ')}`;
+      } else if (lto.sku_count > 0) {
+        scopeText = `${lto.sku_count} SKU${lto.sku_count === 1 ? '' : 's'}`;
+      } else {
+        scopeText = `<span style="color: var(--critical);">No scope — won't match any SKU</span>`;
+      }
+      const discountText = lto.discount_pct
+        ? ` &nbsp;·&nbsp; ${lto.discount_pct.toFixed(1)}% off retail`
+        : '';
       return `
-        <div style="border: 1px solid var(--border); padding: 8px; margin-bottom: 6px; border-radius: 3px;">
+        <div style="border: 1px solid var(--border); padding: 8px; margin-bottom: 6px; border-radius: 3px; ${lto.is_archived ? 'opacity: 0.6;' : ''}">
           <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px;">
             <div><strong>${escapeHtml(lto.name)}</strong> ${statusTag}</div>
             <button class="btn-link lto-delete-btn" data-lto-id="${lto.id}" style="font-size: 10px;">Delete</button>
@@ -4103,8 +4193,9 @@ async function loadLtosForLp(lpId) {
           <div style="font-size: 11px; color: var(--text-dim);">
             ${fmt(lto.start_date)} → ${fmt(lto.end_date)}
             &nbsp;·&nbsp; ${(lto.rate_percentage || 0).toFixed(2)}% of ${({retail_sales: 'retail', wholesale_cost: 'wholesale', gross_profit: 'GP'})[lto.rate_basis] || lto.rate_basis}
-            &nbsp;·&nbsp; ${lto.sku_count} SKU${lto.sku_count === 1 ? '' : 's'}
+            ${discountText}
           </div>
+          <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">${scopeText}</div>
           ${lto.notes ? `<div style="font-size: 11px; color: var(--text-dim); margin-top: 4px; font-style: italic;">${escapeHtml(lto.notes)}</div>` : ''}
           ${lto.skus && lto.skus.length > 0 ? `
             <div style="margin-top: 6px; font-size: 10px;">
@@ -4916,6 +5007,266 @@ async function loadOcsDetail(sku) {
 //
 // Per-collective filtering will be added once we know what each collective
 // actually wants (waiting on user's historical examples).
+
+// ============================================================================
+// Data LP Partners — ongoing rebate agreements with brands/LPs.
+// Distinct from collectives (per-SKU rebates via IRCC/CC/Seeker) and LTOs
+// (time-bound promos). These are open-ended arrangements: "this brand pays
+// us X% of Y month after month."
+// ============================================================================
+
+async function renderDataLpPartners() {
+  const main = document.getElementById("main");
+  main.innerHTML = `<div class="loading">LOADING DATA LP PARTNERS...</div>`;
+  try {
+    const data = await api("/api/data-lp-partners?include_inactive=true");
+    const RATE_TYPE_LABELS = {
+      pct_wholesale: "% of wholesale cost",
+      pct_retail: "% of retail sales",
+      pct_gross_margin: "% of gross margin",
+      flat_per_month: "Flat $/month",
+      flat_per_unit: "Flat $/unit sold",
+    };
+    const fmtRate = (rt, val) => {
+      if (!rt) return "—";
+      if (rt.startsWith("pct_")) return `${(val || 0).toFixed(1)}%`;
+      if (rt === "flat_per_month") return `$${(val || 0).toFixed(2)}/mo`;
+      if (rt === "flat_per_unit") return `$${(val || 0).toFixed(4)}/unit`;
+      return String(val);
+    };
+    const fmtDate = (d) => {
+      if (!d) return "—";
+      try { return new Date(d + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); }
+      catch { return d; }
+    };
+    const today = new Date().toISOString().slice(0, 10);
+
+    main.innerHTML = `
+      <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
+        <div>
+          <div class="kicker">Ongoing Rebate Agreements</div>
+          <h2 style="white-space: nowrap;">Data LP Partners</h2>
+        </div>
+        <div class="controls-row">
+          <input type="search" id="dlp-search" placeholder="Search partner name…" style="min-width: 180px;">
+          <select id="dlp-filter-status">
+            <option value="active" selected>Active only</option>
+            <option value="all">All (incl. inactive)</option>
+            <option value="inactive">Inactive only</option>
+          </select>
+          <button id="dlp-add-btn" class="btn btn-primary">+ New Agreement</button>
+        </div>
+      </div>
+
+      <div class="hint-box">
+        <strong>What's this tab?</strong> Track ongoing rebate agreements with brands/LPs.
+        These are <strong>different from</strong> Data Collectives (IRCC/CC/Seeker, per-SKU rebates via a third-party program) and <strong>different from</strong> LTOs (time-bound promotions).
+        These are open-ended arrangements: "Spinach pays us 5% of wholesale every month."
+        <br><br>
+        <strong>Hierarchy:</strong> LTOs and Data LP Partners stack with each other. If a SKU has both, both contribute to your effective margin. When either is present, Data Collective rebates are NOT applied for that SKU.
+      </div>
+
+      <div class="card">
+        <div id="dlp-list" style="padding: 0;"></div>
+      </div>
+
+      <!-- Create / Edit dialog -->
+      <div id="dlp-dialog" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div class="card" style="width: 520px; padding: 20px;">
+          <h3 id="dlp-dialog-title" style="margin: 0 0 14px 0; font-size: 16px;">New Data LP Partner Agreement</h3>
+          <input type="hidden" id="dlp-id" value="">
+          <div style="display: grid; gap: 8px;">
+            <label style="font-size: 11px; color: var(--text-dim);">Partner name
+              <input type="text" id="dlp-partner-name" placeholder="e.g. Spinach, Organigram" style="width: 100%; margin-top: 4px;">
+            </label>
+            <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 8px;">
+              <label style="font-size: 11px; color: var(--text-dim);">Scope type
+                <select id="dlp-scope-type" style="width: 100%; margin-top: 4px;">
+                  <option value="brand">Brand</option>
+                  <option value="lp">LP (Licensed Producer)</option>
+                </select>
+              </label>
+              <label style="font-size: 11px; color: var(--text-dim);">Scope value (brand or LP name)
+                <input type="text" id="dlp-scope-value" placeholder="e.g. Spinach" style="width: 100%; margin-top: 4px;">
+              </label>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+              <label style="font-size: 11px; color: var(--text-dim);">Rate type
+                <select id="dlp-rate-type" style="width: 100%; margin-top: 4px;">
+                  <option value="pct_wholesale">% of wholesale cost</option>
+                  <option value="pct_retail">% of retail sales</option>
+                  <option value="pct_gross_margin">% of gross margin</option>
+                  <option value="flat_per_month">Flat $/month</option>
+                  <option value="flat_per_unit">Flat $/unit sold</option>
+                </select>
+              </label>
+              <label style="font-size: 11px; color: var(--text-dim);">Rate value
+                <input type="number" id="dlp-rate-value" step="0.01" min="0" placeholder="e.g. 5.0" style="width: 100%; margin-top: 4px;">
+              </label>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+              <label style="font-size: 11px; color: var(--text-dim);">Start date
+                <input type="date" id="dlp-start-date" value="${today}" style="width: 100%; margin-top: 4px;">
+              </label>
+              <label style="font-size: 11px; color: var(--text-dim);">End date (optional — leave blank for open-ended)
+                <input type="date" id="dlp-end-date" style="width: 100%; margin-top: 4px;">
+              </label>
+            </div>
+            <label style="font-size: 11px; color: var(--text-dim);">Notes (optional)
+              <input type="text" id="dlp-notes" placeholder="Anything to remember about this deal" style="width: 100%; margin-top: 4px;">
+            </label>
+            <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px;">
+              <input type="checkbox" id="dlp-is-active" checked> Active
+            </label>
+          </div>
+          <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px;">
+            <button class="btn-link" id="dlp-cancel-btn">Cancel</button>
+            <button class="btn btn-primary" id="dlp-save-btn">Save</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const renderList = () => {
+      const q = document.getElementById("dlp-search").value.trim().toLowerCase();
+      const status = document.getElementById("dlp-filter-status").value;
+      let items = data.items.slice();
+      if (status === "active") items = items.filter(a => a.is_active);
+      if (status === "inactive") items = items.filter(a => !a.is_active);
+      if (q) items = items.filter(a =>
+        (a.partner_name || "").toLowerCase().includes(q) ||
+        (a.scope_value || "").toLowerCase().includes(q)
+      );
+      const list = document.getElementById("dlp-list");
+      if (items.length === 0) {
+        list.innerHTML = '<div style="padding: 32px; text-align: center; color: var(--text-dim); font-size: 12px;">No agreements found. Click <strong>+ New Agreement</strong> to add one.</div>';
+        return;
+      }
+      list.innerHTML = `
+        <table style="width: 100%;">
+          <thead>
+            <tr>
+              <th>Partner</th>
+              <th>Scope</th>
+              <th>Rate</th>
+              <th>Active period</th>
+              <th>Status</th>
+              <th style="width: 100px;"></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${items.map(a => `
+              <tr ${a.is_active ? '' : 'style="opacity: 0.6;"'}>
+                <td><strong>${escapeHtml(a.partner_name)}</strong>${a.notes ? `<div class="sku">${escapeHtml(a.notes)}</div>` : ''}</td>
+                <td><span class="tag" style="font-size: 9px; padding: 1px 5px;">${a.scope_type}</span> ${escapeHtml(a.scope_value)}</td>
+                <td>${fmtRate(a.rate_type, a.rate_value)} <div class="sku">${RATE_TYPE_LABELS[a.rate_type] || a.rate_type}</div></td>
+                <td>${fmtDate(a.start_date)} → ${fmtDate(a.end_date) || 'open-ended'}</td>
+                <td>${a.is_active
+                  ? '<span class="tag tag-accent" style="font-size: 9px; padding: 1px 5px;">ACTIVE</span>'
+                  : '<span class="tag" style="font-size: 9px; padding: 1px 5px;">INACTIVE</span>'}</td>
+                <td style="text-align: right;">
+                  <button class="btn-link dlp-edit-btn" data-id="${a.id}" style="font-size: 10px;">Edit</button>
+                  <button class="btn-link dlp-del-btn" data-id="${a.id}" style="font-size: 10px; color: var(--critical);">Delete</button>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+      list.querySelectorAll(".dlp-edit-btn").forEach(b => b.addEventListener("click", () => openDialog(parseInt(b.dataset.id))));
+      list.querySelectorAll(".dlp-del-btn").forEach(b => b.addEventListener("click", () => deleteDlp(parseInt(b.dataset.id))));
+    };
+
+    const openDialog = (id = null) => {
+      const dlg = document.getElementById("dlp-dialog");
+      dlg.style.display = "flex";
+      document.getElementById("dlp-id").value = id || "";
+      if (id) {
+        document.getElementById("dlp-dialog-title").textContent = "Edit Agreement";
+        const a = data.items.find(x => x.id === id);
+        if (!a) return;
+        document.getElementById("dlp-partner-name").value = a.partner_name || "";
+        document.getElementById("dlp-scope-type").value = a.scope_type || "brand";
+        document.getElementById("dlp-scope-value").value = a.scope_value || "";
+        document.getElementById("dlp-rate-type").value = a.rate_type || "pct_wholesale";
+        document.getElementById("dlp-rate-value").value = a.rate_value != null ? a.rate_value : "";
+        document.getElementById("dlp-start-date").value = a.start_date || today;
+        document.getElementById("dlp-end-date").value = a.end_date || "";
+        document.getElementById("dlp-notes").value = a.notes || "";
+        document.getElementById("dlp-is-active").checked = !!a.is_active;
+      } else {
+        document.getElementById("dlp-dialog-title").textContent = "New Data LP Partner Agreement";
+        ["dlp-partner-name","dlp-scope-value","dlp-rate-value","dlp-end-date","dlp-notes"].forEach(i => {
+          document.getElementById(i).value = "";
+        });
+        document.getElementById("dlp-scope-type").value = "brand";
+        document.getElementById("dlp-rate-type").value = "pct_wholesale";
+        document.getElementById("dlp-start-date").value = today;
+        document.getElementById("dlp-is-active").checked = true;
+      }
+    };
+
+    const closeDialog = () => {
+      document.getElementById("dlp-dialog").style.display = "none";
+    };
+
+    const saveDlp = async () => {
+      const id = document.getElementById("dlp-id").value;
+      const payload = {
+        partner_name: document.getElementById("dlp-partner-name").value.trim(),
+        scope_type: document.getElementById("dlp-scope-type").value,
+        scope_value: document.getElementById("dlp-scope-value").value.trim(),
+        rate_type: document.getElementById("dlp-rate-type").value,
+        rate_value: parseFloat(document.getElementById("dlp-rate-value").value),
+        start_date: document.getElementById("dlp-start-date").value,
+        end_date: document.getElementById("dlp-end-date").value || null,
+        notes: document.getElementById("dlp-notes").value.trim() || null,
+        is_active: document.getElementById("dlp-is-active").checked,
+      };
+      if (!payload.partner_name || !payload.scope_value || isNaN(payload.rate_value) || !payload.start_date) {
+        alert("Partner name, scope value, rate value, and start date are required.");
+        return;
+      }
+      const url = id ? `/api/data-lp-partners/${id}` : `/api/data-lp-partners`;
+      const method = id ? "PUT" : "POST";
+      try {
+        const res = await fetch(`${API}${url}`, {
+          method, headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          alert("Failed: " + (err.detail || "unknown"));
+          return;
+        }
+        closeDialog();
+        renderDataLpPartners();  // reload everything
+      } catch (e) { alert("Failed: " + e.message); }
+    };
+
+    const deleteDlp = async (id) => {
+      const a = data.items.find(x => x.id === id);
+      if (!confirm(`Delete agreement with ${a ? a.partner_name : 'this partner'}?\nThis cannot be undone.`)) return;
+      try {
+        const res = await fetch(`${API}/api/data-lp-partners/${id}`, { method: "DELETE" });
+        if (!res.ok) { alert("Failed to delete"); return; }
+        renderDataLpPartners();
+      } catch (e) { alert("Failed: " + e.message); }
+    };
+
+    // Wire up
+    document.getElementById("dlp-search").addEventListener("input", renderList);
+    document.getElementById("dlp-filter-status").addEventListener("change", renderList);
+    document.getElementById("dlp-add-btn").addEventListener("click", () => openDialog());
+    document.getElementById("dlp-save-btn").addEventListener("click", saveDlp);
+    document.getElementById("dlp-cancel-btn").addEventListener("click", closeDialog);
+    document.getElementById("dlp-dialog").addEventListener("click", e => {
+      if (e.target.id === "dlp-dialog") closeDialog();
+    });
+
+    renderList();
+  } catch (e) { showError(e); }
+}
 
 async function renderMonthlyReports() {
   const main = document.getElementById("main");
@@ -6253,7 +6604,8 @@ const routes = {
   outcomes: renderOutcomes,
   analytics: renderAnalytics,
   partners: renderPartners,
-  "data-partners": renderDataPartners,
+  ltos: renderLTOs,
+  "data-lp-partners": renderDataLpPartners,
   "monthly-reports": renderMonthlyReports,
   settings: renderSettings,
   users: renderUsers,

@@ -99,10 +99,16 @@ def get_session_user(conn: sqlite3.Connection, session_token: str | None) -> Opt
         return None
     if not active:
         return None
-    # Touch last_seen_at
-    cur.execute("UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE session_token = ?",
-                (session_token,))
-    conn.commit()
+# Touch last_seen_at — best-effort. If the DB is locked (backup running,
+    # concurrent write), silently skip rather than crash the request. The
+    # last_seen_at field is informational only; being a few seconds stale
+    # is fine. Real fix is Postgres at cloud launch.
+    try:
+        cur.execute("UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE session_token = ?",
+                    (session_token,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     return {
         "id": uid, "email": email, "name": name, "role": role,
         "must_change_password": bool(must_change),

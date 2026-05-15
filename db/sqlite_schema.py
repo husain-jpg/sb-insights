@@ -712,10 +712,83 @@ def init_schema(conn) -> None:
     _ensure_column(conn, "ltos", "rate_basis", "TEXT")  # 'retail_sales' | 'wholesale_cost' | 'gross_profit'
     _ensure_column(conn, "ltos", "rate_percentage", "REAL")  # The data revenue % for this LTO
 
+    # LTO scope expansion (May 2026): in addition to per-SKU targeting via
+    # lto_skus junction, an LTO can apply to:
+    #   - A whole brand (applies_to_brand IS NOT NULL, others NULL)
+    #   - A brand + category combo (applies_to_brand + applies_to_category)
+    #   - A brand + category + subcategory combo (all three set)
+    # If an LTO has rows in lto_skus, the SKU-specific match takes precedence
+    # over brand-level rules (avoids double-counting).
+    _ensure_column(conn, "ltos", "applies_to_brand", "TEXT")
+    _ensure_column(conn, "ltos", "applies_to_category", "TEXT")
+    _ensure_column(conn, "ltos", "applies_to_subcategory", "TEXT")
+    # discount_pct as a percentage off retail (preferred for promo-style LTOs).
+    # Distinct from rate_percentage (which is the rebate basis for revenue-share).
+    _ensure_column(conn, "ltos", "discount_pct", "REAL")
+
     cur = conn.cursor()
     cur.execute("CREATE INDEX IF NOT EXISTS ix_products_lp ON products (lp)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_brand_partners_direct ON brand_partners (is_direct_deal, partner_type)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_ltos_lp ON ltos (lp_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_ltos_scope ON ltos (applies_to_brand, applies_to_category)")
+    conn.commit()
+
+    # Data LP Partners — ongoing rebate agreements with brands/LPs.
+    # Distinct from data_revenue_deals (which is collective-managed; brands
+    # are paid via IRCC/CC/Seeker). These are DIRECT, ongoing agreements
+    # between the retailer and a brand/LP — e.g., "Spinach pays us 5% of
+    # wholesale spend monthly." Replaces the is_direct_deal flag on
+    # brand_partners (migration below moves any existing direct deals here).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS data_lp_partner_agreements (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_name    TEXT NOT NULL,              -- display name, e.g., "Spinach"
+            scope_type      TEXT NOT NULL DEFAULT 'brand',  -- 'brand' | 'lp'
+            scope_value     TEXT NOT NULL,              -- brand name or LP name (match against products.brand or products.lp)
+            rate_type       TEXT NOT NULL,              -- 'pct_wholesale' | 'pct_retail' | 'pct_gross_margin' | 'flat_per_month' | 'flat_per_unit'
+            rate_value      REAL NOT NULL,              -- numeric value (% or $)
+            start_date      TEXT NOT NULL,
+            end_date        TEXT,                       -- NULL = open-ended
+            notes           TEXT,
+            is_active       INTEGER NOT NULL DEFAULT 1,
+            created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_lp_partner_agreements_scope ON data_lp_partner_agreements (scope_type, scope_value)")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_lp_partner_agreements_active ON data_lp_partner_agreements (is_active, start_date)")
+    conn.commit()
+
+    # ONE-TIME MIGRATION: move legacy is_direct_deal=1 brand_partners into
+    # the new data_lp_partner_agreements table. We don't know the actual
+    # rate type or value from the old data — we just create a placeholder
+    # row at 0% so the relationship is preserved. User edits rates afterwards
+    # via the new UI.
+    #
+    # Safe to re-run: only inserts if no agreement exists for that scope yet.
+    cur.execute("""
+        SELECT brand_name, partner_type FROM brand_partners
+        WHERE is_direct_deal = 1 AND is_active = 1
+    """)
+    legacy_directs = cur.fetchall()
+    for name, ptype in legacy_directs:
+        if not name:
+            continue
+        scope_type = 'lp' if (ptype or 'brand').lower() == 'lp' else 'brand'
+        # Skip if we've already migrated this one (idempotency)
+        cur.execute("""
+            SELECT 1 FROM data_lp_partner_agreements
+            WHERE scope_type = ? AND scope_value = ?
+              AND notes LIKE '%Auto-migrated from legacy%'
+        """, (scope_type, name))
+        if cur.fetchone():
+            continue
+        cur.execute("""
+            INSERT INTO data_lp_partner_agreements
+                (partner_name, scope_type, scope_value, rate_type, rate_value,
+                 start_date, end_date, notes, is_active)
+            VALUES (?, ?, ?, 'pct_wholesale', 0.0, date('now'), NULL,
+                    'Auto-migrated from legacy is_direct_deal flag — set actual rate via UI.', 1)
+        """, (name, scope_type, name))
     conn.commit()
 
     # Seed default app_settings on first run. Idempotent — never overwrites

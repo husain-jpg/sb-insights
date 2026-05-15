@@ -4618,39 +4618,62 @@ def delete_data_revenue_deal(deal_id: int) -> dict:
 # ---- LTOs ----
 
 @app.get("/api/ltos")
-def list_ltos(brand_id: int | None = None, active_on: str | None = None,
+def list_ltos(brand_id: int | None = None, lp_id: int | None = None,
+              active_on: str | None = None,
+              include_archived: bool = False,
               include_skus: bool = True) -> list[dict]:
     """
-    List LTOs. Filters: brand_id, active_on (date). When include_skus is True,
-    each LTO has an `applicable_skus` list (empty list = all SKUs of brand).
+    List LTOs. Filters:
+      - brand_id: filter to LTOs tied to this brand_partner
+      - lp_id: filter to LTOs tied to this LP (licensed producer)
+      - active_on: date — return LTOs active on that date
+      - include_archived: if False (default), hide LTOs with end_date < today
+    When include_skus is True, each LTO has an `applicable_skus` list (empty
+    list = applies via brand/category scope rules, not SKU junction).
     """
+    from datetime import date as _date
+    today_iso = _date.today().isoformat()
     where = []
     params = []
     if brand_id is not None:
         where.append("l.brand_id = ?"); params.append(brand_id)
+    if lp_id is not None:
+        where.append("l.lp_id = ?"); params.append(lp_id)
     if active_on:
         where.append("l.start_date <= ? AND l.end_date >= ?")
         params.extend([active_on, active_on])
+    if not include_archived:
+        # Hide LTOs whose end_date is in the past (auto-archived)
+        where.append("l.end_date >= ?")
+        params.append(today_iso)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     with db() as conn:
         cur = conn.cursor()
         cur.execute(f"""
             SELECT l.id, l.name, l.brand_id, b.brand_name, l.start_date, l.end_date,
                    l.lto_type, l.discount_per_unit, l.rebate_threshold,
-                   l.rebate_percentage, l.notes, l.is_active, l.created_at
+                   l.rebate_percentage, l.notes, l.is_active, l.created_at,
+                   l.lp_id, l.rate_basis, l.applies_to_brand,
+                   l.applies_to_category, l.applies_to_subcategory, l.discount_pct
             FROM ltos l
             LEFT JOIN brand_partners b ON b.id = l.brand_id
             {where_sql}
             ORDER BY l.start_date DESC, l.id DESC
         """, params)
-        ltos = [
-            {"id": r[0], "name": r[1], "brand_id": r[2], "brand_name": r[3],
-             "start_date": r[4], "end_date": r[5], "lto_type": r[6],
-             "discount_per_unit": r[7], "rebate_threshold": r[8],
-             "rebate_percentage": r[9], "notes": r[10],
-             "is_active": bool(r[11]), "created_at": r[12]}
-            for r in cur.fetchall()
-        ]
+        ltos = []
+        for r in cur.fetchall():
+            is_archived = (r[5] or "") < today_iso  # end_date < today
+            ltos.append({
+                "id": r[0], "name": r[1], "brand_id": r[2], "brand_name": r[3],
+                "start_date": r[4], "end_date": r[5], "lto_type": r[6],
+                "discount_per_unit": r[7], "rebate_threshold": r[8],
+                "rebate_percentage": r[9], "notes": r[10],
+                "is_active": bool(r[11]), "created_at": r[12],
+                "lp_id": r[13], "rate_basis": r[14],
+                "applies_to_brand": r[15], "applies_to_category": r[16],
+                "applies_to_subcategory": r[17], "discount_pct": r[18],
+                "is_archived": is_archived,
+            })
         if include_skus and ltos:
             ids = [str(l["id"]) for l in ltos]
             cur.execute(f"""
@@ -4670,27 +4693,41 @@ def create_lto(payload: dict = Body(...)) -> dict:
     name = (payload.get("name") or "").strip()
     start_date = payload.get("start_date")
     end_date = payload.get("end_date")
-    lto_type = payload.get("lto_type")
-    if not (name and start_date and end_date and lto_type):
+    lto_type = payload.get("lto_type") or "wholesale_discount"
+    if not (name and start_date and end_date):
         raise HTTPException(status_code=400,
-                            detail="name, start_date, end_date, lto_type are required")
+                            detail="name, start_date, end_date are required")
     if lto_type not in ("wholesale_discount", "volume_rebate", "promo_credit", "feature_flag"):
         raise HTTPException(status_code=400, detail="invalid lto_type")
     skus = payload.get("applicable_skus", []) or []
     if not isinstance(skus, list):
         raise HTTPException(status_code=400, detail="applicable_skus must be a list of SKU strings")
+    # New scope fields. At least one of (skus list, applies_to_brand) should be set.
+    applies_to_brand = (payload.get("applies_to_brand") or "").strip() or None
+    applies_to_category = (payload.get("applies_to_category") or "").strip() or None
+    applies_to_subcategory = (payload.get("applies_to_subcategory") or "").strip() or None
+    if not skus and not applies_to_brand:
+        raise HTTPException(status_code=400,
+                            detail="Either applicable_skus or applies_to_brand must be specified — an LTO with no scope would never match")
     with db() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO ltos (name, brand_id, start_date, end_date, lto_type,
+            INSERT INTO ltos (name, brand_id, lp_id, start_date, end_date, lto_type,
                               discount_per_unit, rebate_threshold, rebate_percentage,
+                              rate_basis, rate_percentage, discount_pct,
+                              applies_to_brand, applies_to_category, applies_to_subcategory,
                               notes, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            name, payload.get("brand_id"), start_date, end_date, lto_type,
+            name, payload.get("brand_id"), payload.get("lp_id"),
+            start_date, end_date, lto_type,
             payload.get("discount_per_unit"),
             payload.get("rebate_threshold"),
             payload.get("rebate_percentage"),
+            payload.get("rate_basis"),
+            payload.get("rate_percentage"),
+            payload.get("discount_pct"),
+            applies_to_brand, applies_to_category, applies_to_subcategory,
             payload.get("notes"),
             1 if payload.get("is_active", True) else 0,
         ))
@@ -4705,8 +4742,10 @@ def create_lto(payload: dict = Body(...)) -> dict:
 @app.put("/api/ltos/{lto_id}")
 def update_lto(lto_id: int, payload: dict = Body(...)) -> dict:
     fields, params = [], []
-    valid = ("name", "brand_id", "start_date", "end_date", "lto_type",
+    valid = ("name", "brand_id", "lp_id", "start_date", "end_date", "lto_type",
              "discount_per_unit", "rebate_threshold", "rebate_percentage",
+             "rate_basis", "rate_percentage", "discount_pct",
+             "applies_to_brand", "applies_to_category", "applies_to_subcategory",
              "notes", "is_active")
     for k in valid:
         if k in payload:
@@ -4739,6 +4778,110 @@ def delete_lto(lto_id: int) -> dict:
         cur.execute("DELETE FROM ltos WHERE id = ?", (lto_id,))
         conn.commit()
     return {"ok": True, "deleted": cur.rowcount}
+
+
+# ============================================================================
+# Data LP Partners — ongoing rebate agreements (replaces is_direct_deal flag)
+# ============================================================================
+# Distinct from collective deals (data_revenue_deals) and from LTOs.
+# A Data LP Partner is an ongoing arrangement: "this brand/LP pays us X% of
+# Y on an ongoing basis." Multiple rate types supported.
+
+@app.get("/api/data-lp-partners")
+def list_data_lp_partners(include_inactive: bool = False) -> dict:
+    """List all Data LP Partner agreements."""
+    where = []
+    if not include_inactive:
+        where.append("is_active = 1")
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT id, partner_name, scope_type, scope_value, rate_type,
+                   rate_value, start_date, end_date, notes, is_active, created_at
+            FROM data_lp_partner_agreements
+            {where_sql}
+            ORDER BY partner_name, start_date DESC
+        """)
+        cols = [d[0] for d in cur.description]
+        items = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for it in items:
+            it["is_active"] = bool(it["is_active"])
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/data-lp-partners")
+def create_data_lp_partner(payload: dict = Body(...)) -> dict:
+    """Create a new Data LP Partner agreement."""
+    partner_name = (payload.get("partner_name") or "").strip()
+    scope_type = (payload.get("scope_type") or "brand").strip()
+    scope_value = (payload.get("scope_value") or "").strip()
+    rate_type = (payload.get("rate_type") or "").strip()
+    rate_value = payload.get("rate_value")
+    start_date = payload.get("start_date")
+    if not (partner_name and scope_value and rate_type and start_date and rate_value is not None):
+        raise HTTPException(status_code=400,
+                            detail="partner_name, scope_value, rate_type, rate_value, start_date required")
+    if scope_type not in ("brand", "lp"):
+        raise HTTPException(status_code=400, detail="scope_type must be 'brand' or 'lp'")
+    if rate_type not in ("pct_wholesale", "pct_retail", "pct_gross_margin",
+                         "flat_per_month", "flat_per_unit"):
+        raise HTTPException(status_code=400, detail="invalid rate_type")
+    try:
+        rate_value = float(rate_value)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="rate_value must be numeric")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO data_lp_partner_agreements
+                (partner_name, scope_type, scope_value, rate_type, rate_value,
+                 start_date, end_date, notes, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            partner_name, scope_type, scope_value, rate_type, rate_value,
+            start_date, payload.get("end_date"),
+            payload.get("notes"),
+            1 if payload.get("is_active", True) else 0,
+        ))
+        conn.commit()
+        return {"ok": True, "id": cur.lastrowid}
+
+
+@app.put("/api/data-lp-partners/{agreement_id}")
+def update_data_lp_partner(agreement_id: int, payload: dict = Body(...)) -> dict:
+    """Update a Data LP Partner agreement."""
+    valid = ("partner_name", "scope_type", "scope_value", "rate_type",
+             "rate_value", "start_date", "end_date", "notes", "is_active")
+    fields, params = [], []
+    for k in valid:
+        if k in payload:
+            v = payload[k]
+            if k == "is_active":
+                v = 1 if v else 0
+            fields.append(f"{k} = ?"); params.append(v)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    params.append(agreement_id)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE data_lp_partner_agreements SET {', '.join(fields)} WHERE id = ?", params)
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Agreement not found")
+        conn.commit()
+    return {"ok": True, "id": agreement_id}
+
+
+@app.delete("/api/data-lp-partners/{agreement_id}")
+def delete_data_lp_partner(agreement_id: int) -> dict:
+    """Delete a Data LP Partner agreement."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM data_lp_partner_agreements WHERE id = ?", (agreement_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Agreement not found")
+        conn.commit()
+    return {"ok": True}
 
 
 @app.get("/api/order-outcomes/invoices")
@@ -5678,14 +5821,23 @@ def search_ocs_catalog(
 # These coexist with brand-scoped LTOs (lp_id NULL, brand_id set).
 
 @app.get("/api/lps/{lp_id}/ltos")
-def list_ltos_for_lp(lp_id: int, active_only: bool = False) -> dict:
-    """List LTOs scoped to an LP."""
+def list_ltos_for_lp(lp_id: int, active_only: bool = False,
+                     include_archived: bool = False) -> dict:
+    """List LTOs scoped to an LP.
+
+    By default, auto-hides LTOs whose end_date is in the past (archived).
+    Pass include_archived=True to see them.
+    """
+    from datetime import date as _date
+    today_iso = _date.today().isoformat()
     with db() as conn:
         cur = conn.cursor()
         sql = """
             SELECT lt.id, lt.name, lt.start_date, lt.end_date,
                    lt.rate_percentage, lt.rate_basis, lt.is_active,
                    lt.notes, lt.created_at,
+                   lt.applies_to_brand, lt.applies_to_category,
+                   lt.applies_to_subcategory, lt.discount_pct,
                    (SELECT COUNT(*) FROM lto_skus s WHERE s.lto_id = lt.id) AS sku_count
             FROM ltos lt
             WHERE lt.lp_id = ?
@@ -5693,10 +5845,17 @@ def list_ltos_for_lp(lp_id: int, active_only: bool = False) -> dict:
         params: list = [lp_id]
         if active_only:
             sql += " AND lt.is_active = 1"
+        if not include_archived:
+            sql += " AND lt.end_date >= ?"
+            params.append(today_iso)
         sql += " ORDER BY lt.start_date DESC"
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        # Tag each item with is_archived (computed) for the UI
+        for it in items:
+            it["is_archived"] = (it.get("end_date") or "") < today_iso
 
         # Attach SKU lists for each LTO
         for it in items:
@@ -5718,7 +5877,9 @@ def create_lp_lto(lp_id: int, payload: dict = Body(...)) -> dict:
       - start_date / end_date (active period)
       - rate_percentage (data revenue %)
       - rate_basis (retail_sales | wholesale_cost | gross_profit)
-      - applicable_skus (list of OCS variant numbers)
+      - discount_pct (% off retail for the promo, separate from rate_percentage)
+      - applies_to_brand / applies_to_category / applies_to_subcategory (scope)
+      - applicable_skus (list of OCS variant numbers — alternative to scope rules)
     """
     name = (payload.get("name") or "").strip()
     start_date = payload.get("start_date")
@@ -5739,6 +5900,18 @@ def create_lp_lto(lp_id: int, payload: dict = Body(...)) -> dict:
     skus = payload.get("applicable_skus", []) or []
     if not isinstance(skus, list):
         raise HTTPException(status_code=400, detail="applicable_skus must be a list")
+    # New scope fields. If user specifies a brand-level scope, no SKU list needed.
+    applies_to_brand = (payload.get("applies_to_brand") or "").strip() or None
+    applies_to_category = (payload.get("applies_to_category") or "").strip() or None
+    applies_to_subcategory = (payload.get("applies_to_subcategory") or "").strip() or None
+    discount_pct = payload.get("discount_pct")
+    try:
+        discount_pct = float(discount_pct) if discount_pct is not None else None
+    except (ValueError, TypeError):
+        discount_pct = None
+    if not skus and not applies_to_brand:
+        raise HTTPException(status_code=400,
+                            detail="Either applicable_skus or applies_to_brand must be specified")
 
     with db() as conn:
         cur = conn.cursor()
@@ -5749,9 +5922,13 @@ def create_lp_lto(lp_id: int, payload: dict = Body(...)) -> dict:
 
         cur.execute("""
             INSERT INTO ltos (lp_id, name, start_date, end_date, lto_type,
-                              rate_percentage, rate_basis, notes, is_active)
-            VALUES (?, ?, ?, ?, 'volume_rebate', ?, ?, ?, 1)
-        """, (lp_id, name, start_date, end_date, rate_f, basis, payload.get("notes")))
+                              rate_percentage, rate_basis, discount_pct,
+                              applies_to_brand, applies_to_category, applies_to_subcategory,
+                              notes, is_active)
+            VALUES (?, ?, ?, ?, 'volume_rebate', ?, ?, ?, ?, ?, ?, ?, 1)
+        """, (lp_id, name, start_date, end_date, rate_f, basis, discount_pct,
+              applies_to_brand, applies_to_category, applies_to_subcategory,
+              payload.get("notes")))
         lto_id = cur.lastrowid
         if skus:
             cur.executemany("INSERT INTO lto_skus (lto_id, sku) VALUES (?, ?)",
