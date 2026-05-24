@@ -33,3 +33,9 @@ desktop.ini
 # Temp files
 *.tmp
 *.log
+
+# Cova catalogue exports — large binary source data
+cova-catalog/
+
+# Claude Code local config
+.claude/
