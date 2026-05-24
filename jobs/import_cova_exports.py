@@ -720,6 +720,80 @@ def import_ocs_catalog(conn, file_path: Path) -> dict:
     }
 
 
+def import_cova_catalog(conn, file_path: Path | None = None) -> dict:
+    """
+    Import the Cova product catalogue export (the "Products" sheet of the
+    per-store Cova catalogue dump). Populates the cova_catalog table, which
+    successor detection reads for manufacturer / size / Date Added / UPC —
+    fields not present in products or ocs_catalog.
+
+    Full replace each time (mirrors import_ocs_catalog). If file_path is None,
+    uses the most recent cova-catalog-*.xlsx in <repo>/cova-catalog/.
+    """
+    if file_path is None:
+        cdir = Path(__file__).resolve().parent.parent / "cova-catalog"
+        candidates = sorted(cdir.glob("cova-catalog-*.xlsx"))
+        if not candidates:
+            raise FileNotFoundError(f"No cova-catalog-*.xlsx found in {cdir}")
+        file_path = candidates[-1]
+    file_path = Path(file_path)
+
+    log.info("Reading Cova catalogue: %s", file_path.name)
+    df = pd.read_excel(file_path, sheet_name="Products", dtype=str)
+    log.info("  %d catalogue rows loaded", len(df))
+
+    def _s(v):
+        return str(v).strip() if pd.notna(v) and str(v).strip() != "" else None
+
+    def _ci(v):
+        try:
+            return int(float(v)) if pd.notna(v) and str(v).strip() != "" else None
+        except (ValueError, TypeError):
+            return None
+
+    # Keyed by catalog_sku to dedupe against the PRIMARY KEY (last row wins).
+    rows: dict[str, tuple] = {}
+    for _, r in df.iterrows():
+        sku = _s(r.get("Catalog SKU"))
+        if not sku:
+            continue
+        rows[sku] = (
+            sku,
+            _s(r.get("Product Name *")),
+            _s(r.get("Brand")),
+            _s(r.get("Vendor SKU")),
+            _s(r.get("UPC")),
+            _s(r.get("Size")),
+            _s(r.get("Manufacturer")),
+            _s(r.get("Net Weight")),
+            _ci(r.get("Case Qty")),
+            _s(r.get("Date Added (UTC)")),
+            _s(r.get("Date Updated (UTC)")),
+            _s(r.get("Product Status")),
+        )
+
+    cur = conn.cursor()
+    cur.execute("DELETE FROM cova_catalog")
+    cur.executemany(
+        """
+        INSERT INTO cova_catalog (
+            catalog_sku, product_name, brand, vendor_sku, upc, size,
+            manufacturer, net_weight, case_qty, date_added, date_updated, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        list(rows.values()),
+    )
+    conn.commit()
+    log.info("  loaded %d Cova catalog rows", len(rows))
+
+    return {
+        "type": "cova_catalog",
+        "catalog_rows": len(rows),
+        "source": file_path.name,
+        "with_upc": int(df["UPC"].notna().sum()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------

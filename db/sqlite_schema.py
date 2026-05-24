@@ -64,6 +64,29 @@ CREATE INDEX IF NOT EXISTS ix_ocs_brand ON ocs_catalog (brand);
 CREATE INDEX IF NOT EXISTS ix_ocs_category ON ocs_catalog (category);
 CREATE INDEX IF NOT EXISTS ix_ocs_stock ON ocs_catalog (stock_status);
 
+-- Cova product catalogue export (the per-store Cova "Products" sheet). Holds
+-- fields successor detection needs that aren't in products/ocs_catalog:
+-- manufacturer, size, Date Added, and the UPC (== OCS GTIN for live listings).
+-- Full-replace each import (mirrors ocs_catalog). Removes the .xlsx file
+-- dependency from successor_detection.py.
+CREATE TABLE IF NOT EXISTS cova_catalog (
+    catalog_sku    TEXT PRIMARY KEY,    -- == products.sku
+    product_name   TEXT,
+    brand          TEXT,
+    vendor_sku     TEXT,                -- Cova "Vendor SKU" == OCS variant number
+    upc            TEXT,                -- == OCS GTIN for live listings
+    size           TEXT,
+    manufacturer   TEXT,
+    net_weight     TEXT,
+    case_qty       INTEGER,
+    date_added     TEXT,
+    date_updated   TEXT,
+    status         TEXT,                -- 'Active' / 'Inactive'
+    as_of          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_cova_brand ON cova_catalog (brand);
+CREATE INDEX IF NOT EXISTS ix_cova_vendor ON cova_catalog (vendor_sku);
+
 CREATE TABLE IF NOT EXISTS inventory_snapshots (
     sku                  TEXT NOT NULL,
     location_id          TEXT NOT NULL,
@@ -671,6 +694,50 @@ CREATE TABLE IF NOT EXISTS invoice_lines (
     PRIMARY KEY (invoice_no, ocs_variant)
 );
 CREATE INDEX IF NOT EXISTS ix_invlines_variant ON invoice_lines (ocs_variant);
+
+-- ============================================================================
+-- Successor detection (Reorder Report) — re-listed-product handling
+-- ============================================================================
+-- When OCS re-lists a product it gets a new variant number + new GTIN, and
+-- Cova mints a new Catalog SKU (often tagged "*New*"). The old SKU becomes an
+-- orphan. Detection runs at report-generation time (no permanent remap).
+-- These two tables persist manager decisions only.
+
+-- Manager-dismissed predecessor->successor candidates. A row with
+-- rejected_successor_sku = NULL means "dismiss ALL candidates for this
+-- predecessor" (hide it from successor suggestions entirely). A specific
+-- rejected_successor_sku dismisses only that one pairing (chain-wide, forever).
+CREATE TABLE IF NOT EXISTS successor_dismissals (
+    id                     SERIAL PRIMARY KEY,
+    predecessor_sku        TEXT NOT NULL,
+    rejected_successor_sku TEXT,
+    dismissed_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    dismissed_by_user_id   INTEGER,
+    reason                 TEXT,
+    FOREIGN KEY (dismissed_by_user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS ix_succ_dismiss_pred ON successor_dismissals (predecessor_sku);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_succ_dismiss_pair
+    ON successor_dismissals (predecessor_sku, rejected_successor_sku);
+
+-- Per-SKU manager flags driving Reorder Report behavior.
+--   'do_not_reorder'      — suppress this SKU from reorder suggestions
+--   'clearance'           — mark for clearance (Delisted-with-Inventory / Promotions)
+--   'confirmed_successor' — manager confirmed this SKU succeeds target_sku
+--                           (target_sku = the predecessor); enables history carryforward
+CREATE TABLE IF NOT EXISTS sku_flags (
+    id              SERIAL PRIMARY KEY,
+    sku             TEXT NOT NULL,
+    flag_type       TEXT NOT NULL,
+    target_sku      TEXT,
+    set_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    set_by_user_id  INTEGER,
+    notes           TEXT,
+    FOREIGN KEY (set_by_user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS ix_sku_flags_sku ON sku_flags (sku, flag_type);
+CREATE INDEX IF NOT EXISTS ix_sku_flags_target ON sku_flags (target_sku);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_sku_flags_unique ON sku_flags (sku, flag_type, target_sku);
 """
 
 # SQLite doesn't have SERIAL — fix that
@@ -876,6 +943,14 @@ _DEFAULT_SETTINGS = [
      "Overstock threshold (days)",
      "SKUs with more than this many days of supply are flagged as overstocked.",
      30),
+    ("reorder.stockout_imminent_days", 3.0, 0, 30, "days", "Reorder Engine — Filtering",
+     "Stockout-imminent (days)",
+     "If days of supply is below this AND velocity clears the floor below, order one full case even when demand is under the pack-size threshold — so active sellers with large OCS case sizes don't silently stock out.",
+     40),
+    ("reorder.stockout_min_velocity", 0.3, 0.0, 5.0, "float", "Reorder Engine — Filtering",
+     "Stockout override min velocity (units/day)",
+     "Minimum velocity for the stockout-imminent override to fire. Prevents slow/winding-down sellers from triggering a full-case buy.",
+     50),
 
     # Hero Classification
     ("hero.top_n_per_format", 5, 1, 20, "int", "Hero Classification",

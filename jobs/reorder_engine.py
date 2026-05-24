@@ -51,6 +51,11 @@ COVERAGE_DAYS = ORDER_CYCLE_DAYS + LEAD_TIME_DAYS  # legacy global, recomputed p
 CEILING_DAYS_DEFAULT = 10
 MIN_VELOCITY_DEFAULT = 0.0
 OVERSTOCK_DAYS = 50
+# Stockout-imminent override: an active seller about to hit zero gets one full
+# case even if demand is below the pack-size threshold (so large-case SKUs with
+# steady velocity don't silently stock out and never reorder).
+STOCKOUT_IMMINENT_DAYS = 3.0
+STOCKOUT_MIN_VELOCITY = 0.3
 
 TOP_SKU_COUNT = 50                  # legacy global cap (only used if per_format=False)
 TOP_SKU_PER_FORMAT_N = 5
@@ -75,6 +80,8 @@ def _load_settings(conn) -> dict:
         "reorder.min_velocity": MIN_VELOCITY_DEFAULT,
         "reorder.pack_size_min_fraction": PACK_SIZE_MIN_FRACTION,
         "reorder.overstock_days": OVERSTOCK_DAYS,
+        "reorder.stockout_imminent_days": STOCKOUT_IMMINENT_DAYS,
+        "reorder.stockout_min_velocity": STOCKOUT_MIN_VELOCITY,
         "hero.top_n_per_format": TOP_SKU_PER_FORMAT_N,
         "hero.lookback_days": TOP_SKU_TRAILING_DAYS,
     }
@@ -115,6 +122,17 @@ class ReorderRec:
     mix_multiplier: float = 1.0  # 1.0 when mix-aware reorder is off
     is_top_sku: bool = False  # True if SKU is in per-store Top N by trailing revenue
 
+    # Successor detection (Phase 3). Populated only when this rec is a re-listed
+    # orphan resolved to a live successor; None on all normal recs. The rec's
+    # sku/product_name/ocs_variant are the SUCCESSOR's, but demand math
+    # (velocity, days_supply, reorder_qty) stays based on the predecessor.
+    successor_predecessor_sku: str | None = None
+    successor_predecessor_name: str | None = None
+    successor_confidence: float | None = None    # 0.0-1.0
+    successor_tier: str | None = None            # 'HIGH' | 'MEDIUM'
+    successor_in_stock: bool | None = None       # successor stock_status == YES at OCS?
+    successor_on_hand_legacy: int | None = None  # successor SKU's own on_hand (usually 0)
+
     def to_dict(self) -> dict:
         d = asdict(self)
         return d
@@ -135,7 +153,10 @@ def classify_urgency(on_hand: int, velocity: float, days_supply: float | None,
         return "dead_stock"
     if effective_on_hand == 0 and velocity > 0:
         return "stockout"
-    assert days_supply is not None
+     # If velocity is zero, days_supply will be None — treat as zero days of cover
+    # (the SKU has no sales-day basis, so urgency math doesn't apply).
+    if days_supply is None:
+        days_supply = 0.0
     _coverage = coverage_days if coverage_days is not None else COVERAGE_DAYS
     _overstock = overstock_days if overstock_days is not None else OVERSTOCK_DAYS
     _lead = lead_time_days if lead_time_days is not None else LEAD_TIME_DAYS
@@ -177,9 +198,18 @@ def compute_reorder_qty(
 
 
 def round_to_pack(raw_qty: int, pack_size: int | None,
-                  *, min_fraction: float | None = None) -> tuple[int, int | None]:
+                  *, min_fraction: float | None = None,
+                  days_supply: float | None = None, velocity: float | None = None,
+                  stockout_days: float | None = None,
+                  stockout_min_velocity: float | None = None) -> tuple[int, int | None]:
     """Round qty up to nearest full case, OR skip entirely if it's below
-    min_fraction of a case (default = module PACK_SIZE_MIN_FRACTION)."""
+    min_fraction of a case (default = module PACK_SIZE_MIN_FRACTION).
+
+    Stockout-imminent override: if days_supply < stockout_days AND
+    velocity >= stockout_min_velocity, order one full case even when demand is
+    below the pack-size threshold — so active sellers with large case sizes
+    don't silently stock out. All four override args must be provided for it to
+    apply (callers that don't pass them keep the plain threshold behavior)."""
     if not pack_size or pack_size <= 1:
         return raw_qty, None
     if raw_qty <= 0:
@@ -187,6 +217,10 @@ def round_to_pack(raw_qty: int, pack_size: int | None,
     fraction = raw_qty / pack_size
     threshold = min_fraction if min_fraction is not None else PACK_SIZE_MIN_FRACTION
     if fraction < threshold:
+        if (days_supply is not None and velocity is not None
+                and stockout_days is not None and stockout_min_velocity is not None
+                and days_supply < stockout_days and velocity >= stockout_min_velocity):
+            return pack_size, 1  # one full case to avoid stocking out an active seller
         return 0, 0
     cases = math.ceil(raw_qty / pack_size)
     return cases * pack_size, cases
@@ -443,6 +477,16 @@ def compute_top_skus_per_store(
     return by_loc
 
 
+def _successor_on_hand(conn, succ_sku: str, loc_id: str) -> int:
+    """Latest on_hand for a successor SKU at a location (0 if never stocked)."""
+    row = conn.execute(
+        """SELECT on_hand FROM inventory_snapshots
+           WHERE sku = ? AND location_id = ? ORDER BY as_of DESC LIMIT 1""",
+        (succ_sku, loc_id),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def compute_all_reorders(
     conn,
     *,
@@ -452,6 +496,7 @@ def compute_all_reorders(
     min_velocity: float | None = None,
     mix_multipliers: dict[str, float] | None = None,
     use_top_sku_tier: bool = True,
+    apply_successors: bool = False,
 ) -> list[ReorderRec]:
     """
     Compute reorder recs for every (SKU, location) with stock or recent sales.
@@ -459,6 +504,13 @@ def compute_all_reorders(
     All numeric parameters default to None, in which case live values from
     app_settings are used. Pass explicit values to override (useful for
     backtesting or scenario analysis).
+
+    apply_successors (Phase 3): when True (the Reorder Report), orphaned cannabis
+    SKUs — those whose OCS variant no longer matches ocs_catalog because OCS
+    re-listed the product — are resolved via successor detection. None/LOW-tier
+    orphans are dropped (surfaced separately in the Delisted view); HIGH/MEDIUM
+    orphans are shown AS their live successor. Left False for KPI/dead-stock/
+    overstock consumers so their universe is unchanged.
     """
     # Resolve runtime knobs from app_settings (with kwargs taking priority)
     settings = _load_settings(conn)
@@ -467,9 +519,16 @@ def compute_all_reorders(
     if min_velocity is None:
         min_velocity = float(settings["reorder.min_velocity"])
     hero_ceiling = int(settings["reorder.hero_ceiling_days"])
-    pack_min_fraction = float(settings["reorder.pack_size_min_fraction"])
+    # pack_size_min_fraction is stored as a PERCENT (e.g. 50) for the UI, but
+    # round_to_pack expects a 0-1 fraction. Normalize the same way
+    # reorder_diagnose.py does. Without this, threshold=50 zeroes EVERY
+    # multi-pack SKU (raw/pack is always < 50), silently suppressing reorders.
+    _pack_min_raw = float(settings["reorder.pack_size_min_fraction"])
+    pack_min_fraction = _pack_min_raw / 100.0 if _pack_min_raw > 1.0 else _pack_min_raw
     coverage_days = int(settings["reorder.order_cycle_days"]) + int(settings["reorder.lead_time_days"])
     overstock_days = int(settings["reorder.overstock_days"])
+    stockout_days = float(settings["reorder.stockout_imminent_days"])
+    stockout_min_vel = float(settings["reorder.stockout_min_velocity"])
 
     as_of = (as_of_date or date.today()).isoformat()
     window_start = ((as_of_date or date.today()) - timedelta(days=VELOCITY_WINDOW_DAYS)).isoformat()
@@ -531,6 +590,11 @@ def compute_all_reorders(
     rows = cur.fetchall()
 
     recs: list[ReorderRec] = []
+    # Phase 3 successor detection: lazy import + per-SKU memo (result is
+    # location-independent, so compute once per predecessor SKU).
+    _succ_memo: dict = {}
+    if apply_successors:
+        from jobs.successor_detection import detect_successor
     for row in rows:
         (sku, loc_id, name, category, category_path, top_level, brand,
          on_hand, units_30d, revenue_30d,
@@ -578,10 +642,64 @@ def compute_all_reorders(
             ceiling_days=sku_ceiling, min_velocity=sku_min_velocity,
             coverage_days=coverage_days,
         )
+        # Pack size / wholesale default to the row's OCS match (None for orphans).
+        # For successor recs these get re-read from the successor below, BEFORE
+        # rounding, so the case-pack math uses the live successor's pack size.
         pack_size = int(ocs_pack_size) if ocs_pack_size else None
-        rounded_qty, cases = round_to_pack(raw_qty, pack_size, min_fraction=pack_min_fraction)
-
         wholesale = float(ocs_unit_price) if ocs_unit_price else None
+        rec_stock_status = ocs_stock_status  # overridden to successor's below
+
+        # ---- Successor detection for orphaned cannabis SKUs (Phase 3) ----
+        # An "orphan" has an OCS variant that no longer matches ocs_catalog
+        # (OCS re-listed the product under a new SKU). When apply_successors is
+        # on (the Reorder Report), resolve the orphan to its live successor:
+        #   None / LOW  -> drop from the report (surfaced in the Delisted view)
+        #   HIGH / MED  -> display AS the successor, keeping predecessor demand
+        succ_pred_sku = succ_pred_name = succ_tier = None
+        succ_conf = succ_in_stock = succ_oh_legacy = None
+        is_orphan = bool(ocs_variant) and ocs_stock_status is None
+        if apply_successors and is_orphan and top_level == "Cannabis":
+            if sku not in _succ_memo:
+                _succ_memo[sku] = detect_successor(sku, conn)
+            succ = _succ_memo[sku]
+            if succ is None or succ["tier"] == "LOW":
+                continue  # excluded from actionable; Delisted view (Phase 4) handles it
+            # Replace display identity with the successor; demand math stays
+            # predecessor-based (already computed above).
+            succ_pred_sku = sku
+            succ_pred_name = name or sku
+            succ_tier = succ["tier"]
+            succ_conf = round(succ["confidence"], 4)
+            succ_in_stock = succ["successor_in_stock"]
+            # CHANGE 2: displayed on_hand = predecessor + successor (usually 0).
+            succ_oh_legacy = _successor_on_hand(conn, succ["successor_sku"], loc_id)
+            on_hand = on_hand + succ_oh_legacy
+            sku = succ["successor_sku"]
+            name = succ["successor_name"]
+            ocs_variant = succ["successor_variant"]
+            # Re-read the SUCCESSOR's catalog fields so case-pack rounding, cost,
+            # and stock status use the live successor, not the predecessor's NULL.
+            # Case-insensitive: cova vendor_sku is upper-case, ocs variant lower.
+            srow = conn.execute(
+                """SELECT pack_size, unit_price, stock_status FROM ocs_catalog
+                   WHERE LOWER(ocs_variant_number) = LOWER(?)""",
+                (succ["successor_variant"],),
+            ).fetchone()
+            if srow:
+                if srow[0]:
+                    pack_size = int(srow[0])
+                if srow[1]:
+                    wholesale = float(srow[1])
+                rec_stock_status = srow[2]  # successor's OCS stock status
+
+        # Round AFTER the successor swap so successor recs use the successor's
+        # pack size (predecessor orphans have pack_size=None until re-read above).
+        # Pass demand signals so the stockout-imminent override can fire.
+        rounded_qty, cases = round_to_pack(
+            raw_qty, pack_size, min_fraction=pack_min_fraction,
+            days_supply=days_supply, velocity=velocity,
+            stockout_days=stockout_days, stockout_min_velocity=stockout_min_vel,
+        )
 
         recs.append(ReorderRec(
             sku=sku,
@@ -602,9 +720,15 @@ def compute_all_reorders(
             ocs_variant=ocs_variant,
             ocs_pack_size=pack_size,
             ocs_unit_price=wholesale,
-            ocs_stock_status=ocs_stock_status,
+            ocs_stock_status=rec_stock_status,
             mix_multiplier=round(mix_mult, 2),
             is_top_sku=is_top,
+            successor_predecessor_sku=succ_pred_sku,
+            successor_predecessor_name=succ_pred_name,
+            successor_confidence=succ_conf,
+            successor_tier=succ_tier,
+            successor_in_stock=succ_in_stock,
+            successor_on_hand_legacy=succ_oh_legacy,
         ))
 
     urgency_order = {

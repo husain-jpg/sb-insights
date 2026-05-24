@@ -129,12 +129,78 @@ def _start_backup_thread():
     print("[backup] Scheduler thread started (nightly @ 3am)")
 
 
+_scraper_thread_started = False
+
+
+def _scraper_loop():
+    """Daemon thread: poll active email accounts for new Cova exports, then
+    import the newly-downloaded files. Polling alone only saves files to
+    imports/; this loop also loads them so the DB stays current without a
+    server restart. Imports ONLY the files just downloaded (not the whole
+    imports/ backlog) to keep each cycle cheap."""
+    from jobs.email_scraper import poll_all_active_accounts
+    from jobs.import_cova_exports import run_import
+    from pathlib import Path as _Path
+    while True:
+        interval_s = 900
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("PRAGMA busy_timeout = 10000")
+                row = conn.execute(
+                    "SELECT MIN(poll_interval_min) FROM email_scraper_accounts WHERE is_active = 1"
+                ).fetchone()
+                if not row or row[0] is None:
+                    _time.sleep(900)
+                    continue  # no active accounts — idle and recheck later
+                interval_s = max(300, int(row[0]) * 60)  # honor config, floor at 5 min
+                results = poll_all_active_accounts(conn)
+            imports_dir = _Path("imports")
+            processed = imports_dir / "processed"
+            processed.mkdir(parents=True, exist_ok=True)
+            saved = [f for r in results for f in (r.get("files_saved") or [])]
+            for name in saved:
+                fp = imports_dir / name
+                if not fp.exists():
+                    continue
+                try:
+                    run_import(fp, DB_PATH)
+                    dest = processed / fp.name
+                    i = 1
+                    while dest.exists():
+                        dest = processed / f"{fp.stem}_{i}{fp.suffix}"
+                        i += 1
+                    fp.rename(dest)
+                except Exception as e:
+                    print(f"[scraper] import failed for {name}: {e}")
+            if saved:
+                print(f"[scraper] polled + imported {len(saved)} new file(s)")
+        except Exception as e:
+            print(f"[scraper] Loop error: {e}")
+        _time.sleep(interval_s)
+
+
+@app.on_event("startup")
+def _start_scraper_thread():
+    """Launch the auto-poll+import thread (opt out via TERROIR_DISABLE_SCRAPER=1)."""
+    global _scraper_thread_started
+    if _scraper_thread_started:
+        return
+    if os.environ.get("TERROIR_DISABLE_SCRAPER") == "1":
+        print("[scraper] Disabled via TERROIR_DISABLE_SCRAPER")
+        return
+    t = threading.Thread(target=_scraper_loop, daemon=True, name="email-scraper")
+    t.start()
+    _scraper_thread_started = True
+    print("[scraper] Scheduler thread started (auto-poll + import)")
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard_page(request: Request):
     # If users exist and you're not logged in → bounce to login
     if os.path.exists(DB_PATH):
         try:
             with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("PRAGMA busy_timeout = 10000")
                 cur = conn.cursor()
                 cur.execute("SELECT 1 FROM users WHERE is_active = 1 LIMIT 1")
                 has_users = cur.fetchone() is not None
@@ -162,6 +228,13 @@ def db():
             detail=f"Database not found at {DB_PATH}. Run the import command first.",
         )
     conn = sqlite3.connect(DB_PATH)
+    # SQLite is single-writer. During the nightly backup window or any other
+    # concurrent write, naive requests fail with "database is locked". Set a
+    # busy_timeout so SQLite WAITS for the lock instead of immediately erroring.
+    # 10 seconds is generous — covers the worst-case backup window for our DB
+    # size while still failing fast enough that hung requests don't pile up.
+    # Real fix is Postgres at cloud launch; this is the right SQLite mitigation.
+    conn.execute("PRAGMA busy_timeout = 10000")
     try:
         yield conn
     finally:
@@ -584,6 +657,7 @@ def get_reorder(
             ceiling_days=ceiling_days,
             min_velocity=min_velocity,
             mix_multipliers=mix_multipliers,
+            apply_successors=True,  # Phase 3: resolve re-listed orphans to successors
         )
         price_map = get_price_map(conn)
 
@@ -731,9 +805,15 @@ def get_reorder(
                   if p["urgency"] in ("stockout", "critical", "high", "medium")
                   and p["reorder_qty"] > 0]
 
-    # Exclude OCS-out-of-stock items unless explicitly requested
+    # Exclude OCS-out-of-stock items unless explicitly requested. Successor recs
+    # are EXEMPT: an OOS successor still appears (flagged via successor_in_stock)
+    # so the manager sees the re-listed product with a "currently unavailable at
+    # OCS" badge instead of losing it silently. Non-successor OOS recs are still
+    # dropped — you can't reorder an OOS catalog item.
     if not include_ocs_out:
-        actionable = [p for p in actionable if p.get("ocs_stock_status") != "NO"]
+        actionable = [p for p in actionable
+                      if p.get("successor_predecessor_sku") is not None
+                      or p.get("ocs_stock_status") != "NO"]
 
     # Urgency filter (optional)
     if urgency and urgency != "all":
@@ -3513,6 +3593,39 @@ def get_ocs_catalogue(
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, row)) for row in cur.fetchall()]
 
+        # Attach data revenue / rebate info via the resolver so the OCS
+        # Catalogue tab shows the same badges as the Reorder Report.
+        # Match on both Cova SKU and OCS variant — the resolver accepts either.
+        try:
+            from jobs.data_revenue_resolver import get_active_deals_for_skus
+            sku_set = set()
+            for it in items:
+                if it.get("cova_sku"):
+                    sku_set.add(it["cova_sku"])
+                if it.get("ocs_variant_number"):
+                    sku_set.add(it["ocs_variant_number"])
+            deal_map = get_active_deals_for_skus(conn, sku_set) if sku_set else {}
+            for it in items:
+                # Prefer Cova-SKU match if available, fall back to OCS variant
+                deal = deal_map.get(it.get("cova_sku")) or deal_map.get(it.get("ocs_variant_number"))
+                if deal:
+                    it["data_fee_pct"] = round(deal["percentage"], 2)
+                    it["data_fee_partner"] = deal["partner"]
+                    it["data_fee_basis"] = deal["basis"]
+                    it["data_fee_is_direct"] = deal["is_direct"]
+                else:
+                    it["data_fee_pct"] = None
+                    it["data_fee_partner"] = None
+                    it["data_fee_basis"] = None
+                    it["data_fee_is_direct"] = False
+        except Exception:
+            # Resolver fails shouldn't kill the whole catalogue listing
+            for it in items:
+                it.setdefault("data_fee_pct", None)
+                it.setdefault("data_fee_partner", None)
+                it.setdefault("data_fee_basis", None)
+                it.setdefault("data_fee_is_direct", False)
+
         # Distinct categories + brands for filter dropdowns
         cur.execute("SELECT DISTINCT category FROM ocs_catalog WHERE category IS NOT NULL ORDER BY category")
         categories = [r[0] for r in cur.fetchall()]
@@ -4525,13 +4638,16 @@ def get_settings_history(key: str | None = None, limit: int = 100) -> dict:
 # ---- Data revenue deals ----
 
 @app.get("/api/data-revenue-deals")
-def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None = None) -> list[dict]:
+def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None = None,
+                            include_archived: bool = False) -> list[dict]:
     """
     List data revenue deals. Optional filters:
         brand_id  -- only deals for this brand
-        active_on -- only deals active on this date (YYYY-MM-DD), i.e.
-                     start_date <= active_on AND (end_date IS NULL OR end_date >= active_on)
+        active_on -- only deals active on this date (YYYY-MM-DD)
+        include_archived -- if False (default), hide deals where end_date < today
     """
+    from datetime import date as _date
+    today_iso = _date.today().isoformat()
     where = []
     params = []
     if brand_id is not None:
@@ -4539,6 +4655,10 @@ def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None =
     if active_on:
         where.append("d.start_date <= ? AND (d.end_date IS NULL OR d.end_date >= ?)")
         params.extend([active_on, active_on])
+    if not include_archived:
+        # Hide deals whose end_date is in the past. NULL end_date = open-ended, keep visible.
+        where.append("(d.end_date IS NULL OR d.end_date >= ?)")
+        params.append(today_iso)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     with db() as conn:
         cur = conn.cursor()
@@ -4550,13 +4670,17 @@ def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None =
             {where_sql}
             ORDER BY d.start_date DESC, d.id DESC
         """, params)
-        return [
-            {"id": r[0], "brand_id": r[1], "brand_name": r[2],
-             "start_date": r[3], "end_date": r[4],
-             "percentage": r[5], "basis": r[6],
-             "sku_filter": r[7], "notes": r[8], "created_at": r[9]}
-            for r in cur.fetchall()
-        ]
+        out = []
+        for r in cur.fetchall():
+            is_archived = (r[4] is not None) and (r[4] < today_iso)
+            out.append({
+                "id": r[0], "brand_id": r[1], "brand_name": r[2],
+                "start_date": r[3], "end_date": r[4],
+                "percentage": r[5], "basis": r[6],
+                "sku_filter": r[7], "notes": r[8], "created_at": r[9],
+                "is_archived": is_archived,
+            })
+        return out
 
 
 @app.post("/api/data-revenue-deals")

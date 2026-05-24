@@ -72,7 +72,7 @@ def diagnose_sku(conn: sqlite3.Connection,
     # ----- Gather inputs -----
     # Product record
     cur.execute("""
-        SELECT p.sku, p.name, p.brand, p.lp, p.ocs_variant_number, p.top_level_classification
+        SELECT p.sku, p.name, p.brand, p.lp, p.ocs_variant_number, p.top_level
         FROM products p WHERE p.sku = ?
     """, (sku,))
     prod = cur.fetchone()

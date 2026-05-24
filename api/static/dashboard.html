@@ -3340,20 +3340,19 @@ async function renderPartners() {
   main.innerHTML = `
     <div class="section-header">
       <div>
-        <div class="kicker">Data Collectives · Deals · LTOs</div>
-        <h2>Track collective partnerships, data revenue deals, and limited-time offers</h2>
+        <div class="kicker">Data Collectives · Deals</div>
+        <h2>Track collective partnerships and per-SKU rebate deals</h2>
       </div>
       <div class="controls-row">
         <button class="btn-tab active" data-section="brands">Collectives</button>
         <button class="btn-tab" data-section="deals">Data Revenue Deals</button>
-        <button class="btn-tab" data-section="ltos">LTOs</button>
       </div>
     </div>
     <div id="partners-content">
       <div class="loading">Loading...</div>
     </div>
     <div class="hint-box">
-      <strong>Brands</strong> are your commercial partners. <strong>Data revenue deals</strong> are agreements where the brand pays a percentage of sales for data access — date-bounded since terms change. <strong>LTOs</strong> are limited-time offers (wholesale discounts, volume rebates, promo credits) that affect specific SKUs for a period.
+      <strong>Brands</strong> are your commercial partners (IRCC, Canna Collective, Seeker, etc.). <strong>Data revenue deals</strong> are per-SKU rebate agreements managed by these collectives. For brand-specific or LP-specific LTOs and direct rebate agreements, use the <strong>LTOs</strong> and <strong>Data LP Partners</strong> tabs.
     </div>
   `;
 
@@ -3367,7 +3366,6 @@ async function renderPartners() {
     try {
       if (section === "brands") await renderBrandsSection(c);
       else if (section === "deals") await renderDealsSection(c);
-      else if (section === "ltos") await renderLtosSection(c);
     } catch (e) { showError(e); }
   }));
 
@@ -3678,16 +3676,6 @@ async function renderLTOs() {
       </div>
       <div class="controls-row">
         <input type="search" id="dp-search" placeholder="Search LP / supplier name…" style="min-width: 180px;">
-        <select id="dp-filter-agreement" title="Filter by data deal / agreement status.">
-          <option value="all">All</option>
-          <option value="signed">Has data deal</option>
-          <option value="unsigned">No data deal</option>
-        </select>
-        <select id="dp-filter-record" title="Filter by whether we have a partnership record on file.">
-          <option value="">All LPs (catalog + records)</option>
-          <option value="yes">Records only</option>
-          <option value="no">No record yet (in OCS catalog)</option>
-        </select>
         <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Show LTOs whose end date has passed (auto-archived). Default: hidden.">
           <input type="checkbox" id="dp-show-archived" style="margin: 0;">
           Show archived LTOs
@@ -3714,10 +3702,6 @@ async function renderLTOs() {
     </div>
   `;
 
-  document.getElementById("dp-filter-record").addEventListener("change", () => loadDpList());
-  document.getElementById("dp-filter-agreement").addEventListener("change", e => {
-    _dpFilterAgreement = e.target.value; loadDpList();
-  });
   document.getElementById("dp-search").addEventListener("input", () => loadDpList());
   document.getElementById("dp-add-btn").addEventListener("click", addNewLpDialog);
   document.getElementById("dp-seed-btn").addEventListener("click", reseedDialog);
@@ -3731,16 +3715,9 @@ async function renderLTOs() {
 
 async function loadDpList() {
   const params = new URLSearchParams();
-  if (_dpFilterAgreement === "signed") params.set("has_agreement", "true");
-  if (_dpFilterAgreement === "unsigned") params.set("has_agreement", "false");
   const searchEl = document.getElementById("dp-search");
   const query = searchEl ? searchEl.value.trim() : "";
   if (query) params.set("search", query);
-  // Filter for "no record" / "has record" via has_record param if checkbox UI exists
-  const recordFilter = document.getElementById("dp-filter-record");
-  if (recordFilter && recordFilter.value) {
-    params.set("has_record", recordFilter.value === "yes" ? "true" : "false");
-  }
 
   const data = await api(`/api/lps-from-catalog?${params.toString()}`);
   const list = document.getElementById("dp-list");
@@ -3750,17 +3727,14 @@ async function loadDpList() {
     return;
   }
 
-  let html = '<table class="data-table"><thead><tr>';
+  let html = '<table class="data-table" style="table-layout: fixed; width: 100%;"><thead><tr>';
   html += '<th style="text-align: left;">LP / Supplier</th>';
-  html += '<th style="text-align: right;" title="SKUs in OCS catalog">SKUs</th>';
-  html += '<th style="text-align: right;" title="In stock at OCS">In stock</th>';
-  html += '<th style="text-align: center;" title="Agreement signed">Agmt</th>';
-  html += '<th style="text-align: right;">Contacts</th>';
-  html += '<th style="text-align: right;" title="Active LTOs">LTOs</th>';
+  html += '<th style="text-align: right; width: 60px;" title="SKUs in OCS catalog">SKUs</th>';
+  html += '<th style="text-align: right; width: 70px;" title="In stock at OCS">In stock</th>';
+  html += '<th style="text-align: right; width: 50px;" title="Active LTOs">LTOs</th>';
   html += '</tr></thead><tbody>';
   for (const item of data.items) {
     const cls = item.lp_id === _dpCurrentLpId ? 'background: var(--bg-elev-2);' : '';
-    const cb = (v) => v ? '<span style="color: var(--ok, #6a7);">✓</span>' : '<span style="color: var(--text-faint);">·</span>';
     const inactive = item.has_lp_record && !item.is_active ? ' style="opacity: 0.5;"' : '';
     // For records, lp_id is set; for catalog-only, we use supplier as the key
     const dataAttr = item.lp_id ? `data-lp-id="${item.lp_id}"` : `data-supplier="${escapeHtml(item.supplier)}"`;
@@ -3768,11 +3742,9 @@ async function loadDpList() {
       ? ''
       : '<span class="tag" style="font-size: 9px; padding: 1px 5px; background: rgba(180,140,40,0.15); color: #c89b32; margin-left: 6px;" title="No partnership record yet — click to create">NEW</span>';
     html += `<tr ${dataAttr} class="dp-row" style="cursor: pointer; ${cls}"${inactive}>
-      <td><strong>${escapeHtml(item.supplier)}</strong>${noRecordTag}${item.primary_contact ? `<div class="sku">${escapeHtml(item.primary_contact || '')}</div>` : ''}</td>
+      <td style="word-wrap: break-word; word-break: break-word;"><strong>${escapeHtml(item.supplier)}</strong>${noRecordTag}</td>
       <td style="text-align: right; font-variant-numeric: tabular-nums;">${item.sku_count || 0}</td>
       <td style="text-align: right; font-variant-numeric: tabular-nums;">${item.in_stock_count || 0}</td>
-      <td style="text-align: center;">${item.has_lp_record ? cb(item.agreement_signed) : '<span style="color: var(--text-faint);">—</span>'}</td>
-      <td style="text-align: right;">${item.contact_count || 0}</td>
       <td style="text-align: right;">${item.active_lto_count || 0}</td>
     </tr>`;
   }
@@ -3830,30 +3802,11 @@ async function loadLpDetail(lpId) {
       </div>
     </div>
 
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-      <div>
-        <div style="font-size: 11px; font-weight: 600; color: var(--text); text-transform: uppercase; margin-bottom: 6px;">Agreement Status</div>
-        ${cb('agreement_sent', 'Agreement sent')}
-        ${cb('agreement_signed', 'Agreement signed')}
-        ${cb('data_sent', 'Data sent')}
-        ${cb('report_sent', 'Report sent')}
-        ${cb('invoice_sent', 'Invoice sent')}
-        ${cb('is_active', 'LP is active')}
-      </div>
-      <div>
-        <div style="font-size: 11px; font-weight: 600; color: var(--text); text-transform: uppercase; margin-bottom: 6px;">LTO Status</div>
-        ${cb('lto_active', 'Active LTO')}
-        ${cb('lto_report_sent', 'LTO report sent')}
-        ${cb('lto_invoice_sent', 'LTO invoice sent')}
-      </div>
+    <div style="margin-top: 4px;">
+      ${cb('is_active', 'LP is active')}
     </div>
 
     <div style="margin-top: 14px;">
-      ${txt('terms_summary', 'Terms summary', 'e.g. 6% on COGS')}
-      ${txt('payment_terms', 'Payment terms', 'e.g. Net 30')}
-      ${txt('lto_offer', 'LTO offer', 'description of current LTO')}
-      ${txt('lto_applicable_skus', 'LTO applicable SKUs', 'comma-sep or "See sheet"')}
-      ${txt('lto_payment_terms', 'LTO payment terms', '')}
       ${ta('notes', 'Notes', 'free-text notes')}
     </div>
 
@@ -4188,7 +4141,12 @@ async function loadLtosForLp(lpId) {
         <div style="border: 1px solid var(--border); padding: 8px; margin-bottom: 6px; border-radius: 3px; ${lto.is_archived ? 'opacity: 0.6;' : ''}">
           <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px;">
             <div><strong>${escapeHtml(lto.name)}</strong> ${statusTag}</div>
-            <button class="btn-link lto-delete-btn" data-lto-id="${lto.id}" style="font-size: 10px;">Delete</button>
+            <div style="display: flex; gap: 8px;">
+              ${lto.is_archived
+                ? ''
+                : `<button class="btn-link lto-archive-btn" data-lto-id="${lto.id}" style="font-size: 10px;" title="Archive this LTO (deactivates it and sets end date to today)">Archive</button>`}
+              <button class="btn-link lto-delete-btn" data-lto-id="${lto.id}" style="font-size: 10px;">Delete</button>
+            </div>
           </div>
           <div style="font-size: 11px; color: var(--text-dim);">
             ${fmt(lto.start_date)} → ${fmt(lto.end_date)}
@@ -4211,6 +4169,25 @@ async function loadLtosForLp(lpId) {
         if (!confirm("Delete this LTO?")) return;
         try {
           await fetch(`${API}/api/ltos/${btn.dataset.ltoId}`, { method: 'DELETE' });
+          await loadLtosForLp(lpId);
+        } catch (e) { alert("Failed: " + e.message); }
+      });
+    });
+    list.querySelectorAll(".lto-archive-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!confirm("Archive this LTO?\nIt will be deactivated and hidden from the default view.\nYou can still see it by toggling 'Show archived LTOs'.")) return;
+        try {
+          const todayIso = new Date().toISOString().slice(0, 10);
+          const res = await fetch(`${API}/api/ltos/${btn.dataset.ltoId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ is_active: false, end_date: todayIso }),
+          });
+          if (!res.ok) {
+            const err = await res.json();
+            alert("Failed to archive: " + (err.detail || "unknown"));
+            return;
+          }
           await loadLtosForLp(lpId);
         } catch (e) { alert("Failed: " + e.message); }
       });
@@ -4791,7 +4768,7 @@ async function renderOcsCatalogue() {
 
     const columns = [
       { key: 'product_name', label: 'Product',
-        render: r => `${escapeHtml(r.product_name)}<div class="sku">${r.brand || '—'} · ${r.ocs_variant_number}</div>` },
+        render: r => `${rebateBadgeHtml(r)}${escapeHtml(r.product_name)}<div class="sku">${r.brand || '—'} · ${r.ocs_variant_number}</div>` },
       { key: 'category', label: 'Category',
         render: r => r.subcategory ? `${r.category}<div class="sku">${r.subcategory}</div>` : (r.category || '—') },
       { key: 'size', label: 'Size', render: r => r.size || '—' },
