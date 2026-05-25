@@ -240,6 +240,22 @@ def _save_to_imports(content: bytes, filename: str) -> Path:
     return dest
 
 
+def _move_to_processed(path: Path) -> None:
+    """Move an imported download into imports/processed/ so it isn't re-imported
+    on the next startup (collision-safe). Mirrors run.py's behavior."""
+    proc = IMPORTS_DIR / "processed"
+    proc.mkdir(parents=True, exist_ok=True)
+    dest = proc / path.name
+    i = 1
+    while dest.exists():
+        dest = proc / f"{path.stem}_{i}{path.suffix}"
+        i += 1
+    try:
+        path.rename(dest)
+    except OSError:
+        pass
+
+
 def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
     """Pull the catalogue + Order Fill and import them. Records run status on
     the ocs_account row.
@@ -268,6 +284,7 @@ def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
         content, filename = fetch_catalogue(session, account)
         cat_path = _save_to_imports(content, filename)
         run_import(cat_path, db_path)
+        _move_to_processed(cat_path)
         imported.append(cat_path.name)
 
         # 2) OrderExport — per store. The mapping stores OCS store numbers; the
@@ -288,6 +305,7 @@ def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
             content, filename = of
             path = _save_to_imports(content, f"{location_id}__{filename}")
             import_order_fill_file(conn, path, location_id=location_id)
+            _move_to_processed(path)
             imported.append(path.name)
 
         _record_status(conn, account.id, "ok", None)
