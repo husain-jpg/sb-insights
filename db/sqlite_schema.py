@@ -816,6 +816,13 @@ def init_schema(conn) -> None:
     # so the Reorder Report slow/dead-stock KPIs don't re-scan inventory_snapshots.
     _ensure_column(conn, "current_inventory", "days_since_last_sold", "INTEGER")
 
+    # Order Fill is per-store (each store's order window differs): tag each run
+    # with the store it was pulled for. NULL = legacy chain-wide run (pre-migration).
+    _ensure_column(conn, "order_fill_runs", "location_id", "TEXT")
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_ofr_loc ON order_fill_runs (location_id, generated_at DESC)")
+    conn.commit()
+
     # LTOs can be tied to an LP (licensed_producers) instead of a brand_partner.
     # This is how the Data Partners tab creates LTOs for OCS catalog products.
     _ensure_column(conn, "ltos", "lp_id", "INTEGER")

@@ -38,8 +38,10 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # Filename detection
+# Allow an optional store prefix (e.g. "S5__OrderExport_…") so per-store files
+# saved by the upload endpoint / connector still detect as Order Fills.
 ORDER_FILL_FILENAME_RE = re.compile(
-    r"^OrderExport_\d{1,2}_[A-Za-z]{3,9}_\d{4}.*\.xlsx?$",
+    r"(?:^|_)OrderExport_\d{1,2}_[A-Za-z]{3,9}_\d{4}.*\.xlsx?$",
     re.IGNORECASE,
 )
 
@@ -67,7 +69,7 @@ def is_order_fill_file(file_path: Path) -> bool:
 def _extract_generated_at(file_path: Path) -> Optional[str]:
     """Parse generation date from filename like 'OrderExport_01_May_2026_703AM_Packs.xlsx'.
     Returns ISO date string or None if unparseable."""
-    m = re.match(r"^OrderExport_(\d{1,2})_([A-Za-z]+)_(\d{4})", file_path.name)
+    m = re.search(r"OrderExport_(\d{1,2})_([A-Za-z]+)_(\d{4})", file_path.name)
     if not m:
         return None
     day, month_str, year = m.groups()
@@ -123,8 +125,13 @@ def _safe_float(val) -> Optional[float]:
         return None
 
 
-def import_order_fill_file(conn, file_path: Path) -> dict:
+def import_order_fill_file(conn, file_path: Path, location_id: str | None = None) -> dict:
     """Parse and persist an OCS Order Fill xlsx.
+
+    location_id tags the run with the store it was pulled for — Order Fill is
+    per-store because each store's order window (and thus availability/delivery)
+    differs. None = a legacy chain-wide run. Idempotent per source_file, so the
+    connector should give each store's file a store-unique name.
 
     Returns a summary dict including computed lead times per delivery tier.
     """
@@ -183,13 +190,14 @@ def import_order_fill_file(conn, file_path: Path) -> dict:
     # Idempotent insert by source_file
     cur.execute("""
         INSERT INTO order_fill_runs (
-            source_file, generated_at,
+            source_file, generated_at, location_id,
             click_to_buy_lead_days, flow_thru_expedited_lead_days, flow_thru_standard_lead_days,
             click_to_buy_delivery, flow_thru_expedited_delivery, flow_thru_standard_delivery,
             sku_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (source_file) DO UPDATE SET
             generated_at = excluded.generated_at,
+            location_id = excluded.location_id,
             click_to_buy_lead_days = excluded.click_to_buy_lead_days,
             flow_thru_expedited_lead_days = excluded.flow_thru_expedited_lead_days,
             flow_thru_standard_lead_days = excluded.flow_thru_standard_lead_days,
@@ -200,7 +208,7 @@ def import_order_fill_file(conn, file_path: Path) -> dict:
             imported_at = CURRENT_TIMESTAMP
         RETURNING id
     """, (
-        file_path.name, generated_at,
+        file_path.name, generated_at, location_id,
         ctb_lead, ft_exp_lead, ft_std_lead,
         ctb_delivery, ft_exp_delivery, ft_std_delivery,
         len(df),
@@ -256,6 +264,7 @@ def import_order_fill_file(conn, file_path: Path) -> dict:
     return {
         "type": "order_fill",
         "file_name": file_path.name,
+        "location_id": location_id,
         "run_id": run_id,
         "generated_at": generated_at,
         "rows": len(rows_to_insert),
@@ -277,25 +286,39 @@ def import_order_fill_file(conn, file_path: Path) -> dict:
 
 
 def get_latest_order_fill_skus(conn) -> dict:
-    """Return a dict mapping ocs_variant_number → {back_in_stock, flow_thru, delivery_tier, ...}
-    from the most recent Order Fill. Used by the Reorder tab to render badges."""
+    """Return Order Fill availability keyed by ``(location_id, variant_lower)``,
+    using the latest run *per store*.
+
+    Order Fill is per-store, so we take the most recent run for each location_id
+    independently. A ``location_id`` of None is a legacy chain-wide run; the
+    reorder lookup tries the store-specific key first, then falls back to the
+    ``(None, variant)`` key, so pre-migration data keeps working until per-store
+    runs arrive. Variant is lower-cased so the join is case-insensitive
+    (products/ocs_catalog store it lower-cased; the Order Fill file may not).
+    """
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id FROM order_fill_runs ORDER BY generated_at DESC, id DESC LIMIT 1
-    """)
-    row = cur.fetchone()
-    if not row:
+    # Latest run id per location (NULLs sort last in DESC, so dated runs win).
+    cur.execute("SELECT id, location_id FROM order_fill_runs ORDER BY generated_at DESC, id DESC")
+    latest_run_by_loc: dict = {}
+    for run_id, loc in cur.fetchall():
+        if loc not in latest_run_by_loc:   # first seen per loc = newest
+            latest_run_by_loc[loc] = run_id
+    if not latest_run_by_loc:
         return {}
-    run_id = row[0]
-    cur.execute("""
-        SELECT ocs_variant_number, flow_thru, delivery_tier, estimated_delivery_date,
+
+    loc_by_run = {rid: loc for loc, rid in latest_run_by_loc.items()}
+    run_ids = list(loc_by_run)
+    placeholders = ",".join("?" * len(run_ids))
+    cur.execute(f"""
+        SELECT run_id, ocs_variant_number, flow_thru, delivery_tier, estimated_delivery_date,
                back_in_stock, new_arrival, available_quantity, max_qty,
                price_change, price_change_pct
-        FROM order_fill_skus WHERE run_id = ?
-    """, (run_id,))
+        FROM order_fill_skus WHERE run_id IN ({placeholders})
+    """, run_ids)
     cols = [d[0] for d in cur.description]
-    # Key by lower-cased variant: the Order Fill stores the OCS variant as it
-    # appears in the file, but products/ocs_catalog store it lower-cased and the
-    # Reorder Report looks it up with the lower-cased value. Lower-casing here
-    # makes the join case-insensitive so badges/availability actually match.
-    return {(row[0] or "").lower(): dict(zip(cols, row)) for row in cur.fetchall()}
+    out: dict = {}
+    for row in cur.fetchall():
+        d = dict(zip(cols, row))
+        loc = loc_by_run[d["run_id"]]
+        out[(loc, (d["ocs_variant_number"] or "").lower())] = d
+    return out

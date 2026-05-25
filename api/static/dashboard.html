@@ -1327,6 +1327,12 @@ async function renderReorder() {
           <div style="padding: 0 16px 16px; border-top: 1px solid var(--border);">
             <div style="display: flex; gap: 10px; align-items: end; flex-wrap: wrap; padding: 14px 0;">
               <div>
+                <label style="display: block; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">Store</label>
+                <select id="of-import-store" style="min-width: 200px;">
+                  ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+                </select>
+              </div>
+              <div>
                 <label style="display: block; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">OCS Order Fill (OrderExport_*.xlsx)</label>
                 <input type="file" id="of-import-file" accept=".xlsx" style="font-size: 12px;">
               </div>
@@ -1334,7 +1340,7 @@ async function renderReorder() {
               <span id="of-import-status" style="font-size: 11px; color: var(--text-dim);"></span>
             </div>
             <div style="font-size: 11px; color: var(--text-dim);">
-              Tells the report what OCS will deliver this cycle (flow-through, back-in-stock) so orderable items aren't hidden by a stale "OCS out" status. Updates availability only — reorder quantities are unchanged. Admin only.
+              Order Fill is per-store (each store's order day differs) — pick the store this export is for. Tells the report what OCS will deliver this cycle (flow-through, back-in-stock) so orderable items aren't hidden by a stale "OCS out" status. Updates availability only — reorder quantities are unchanged. Admin only.
             </div>
           </div>
         </details>
@@ -1750,10 +1756,21 @@ async function renderReorder() {
     const ofImportRun = document.getElementById("of-import-run");
     const ofImportFile = document.getElementById("of-import-file");
     const ofImportStatus = document.getElementById("of-import-status");
+    const ofImportStore = document.getElementById("of-import-store");
+    // Default the Order Fill store picker to the main store filter when set.
+    if (ofImportStore && storeFilter.value) ofImportStore.value = storeFilter.value;
+    storeFilter.addEventListener("change", () => {
+      if (ofImportStore && storeFilter.value) ofImportStore.value = storeFilter.value;
+    });
     if (ofImportRun) ofImportRun.addEventListener("click", async () => {
       const file = ofImportFile.files[0];
       if (!file) {
         ofImportStatus.textContent = "Select an OrderExport_*.xlsx file first.";
+        ofImportStatus.style.color = "var(--critical)";
+        return;
+      }
+      if (!ofImportStore || !ofImportStore.value) {
+        ofImportStatus.textContent = "Pick the store this Order Fill is for.";
         ofImportStatus.style.color = "var(--critical)";
         return;
       }
@@ -1763,6 +1780,7 @@ async function renderReorder() {
       try {
         const fd = new FormData();
         fd.append("file", file);
+        fd.append("location_id", ofImportStore.value);
         const res = await fetch("/api/order-fill/import", { method: "POST", body: fd, credentials: "same-origin" });
         if (!res.ok) {
           const err = await res.json().catch(() => ({ detail: res.statusText }));

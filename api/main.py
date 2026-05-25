@@ -887,7 +887,10 @@ def get_reorder(
         # Look up via OCS variant number, which is how Order Fill keys SKUs.
         of = None
         if getattr(r, "ocs_variant", None):
-            of = order_fill_map.get(r.ocs_variant.lower())
+            v = r.ocs_variant.lower()
+            # Order Fill is per-store: prefer this store's run, fall back to a
+            # legacy chain-wide (None) run so pre-migration data still resolves.
+            of = order_fill_map.get((r.location_id, v)) or order_fill_map.get((None, v))
         if of:
             d["order_fill_back_in_stock"] = bool(of["back_in_stock"])
             d["order_fill_new_arrival"] = bool(of["new_arrival"])
@@ -3494,18 +3497,24 @@ async def order_fill(
 @app.post("/api/order-fill/import")
 async def import_order_fill_upload(
     file: UploadFile = File(...),
+    location_id: str | None = Form(None),
     _admin: dict = Depends(require_admin),
 ) -> dict:
-    """Upload an OCS Order Fill (OrderExport_*.xlsx) and import it.
+    """Upload an OCS Order Fill (OrderExport_*.xlsx) for a store and import it.
 
     This is the manual route for the OCS Order Fill, which doesn't arrive via
-    the Cova email scraper. Once imported, the Reorder Report reflects
-    flow-through / back-in-stock availability (an item OCS will deliver this
-    cycle is no longer hidden just because the warehouse-stock catalogue says
-    NO). Admin only. Idempotent — re-importing the same file replaces its run.
+    the Cova email scraper. Once imported, the Reorder Report reflects that
+    store's flow-through / back-in-stock availability (an item OCS will deliver
+    this cycle is no longer hidden just because the warehouse-stock catalogue
+    says NO). Admin only. Order Fill is per-store, so a store must be chosen;
+    the saved filename is store-prefixed to keep each store's run distinct.
+    Idempotent — re-importing the same store's file replaces its run.
     """
     from pathlib import Path as _Path
     from jobs.import_order_fill import is_order_fill_file, import_order_fill_file
+
+    if not location_id:
+        raise HTTPException(status_code=400, detail="Select the store this Order Fill is for")
 
     contents = await file.read()
     if len(contents) > 25_000_000:  # 25MB safety net
@@ -3516,7 +3525,9 @@ async def import_order_fill_upload(
 
     imports_dir = _Path("imports")
     imports_dir.mkdir(exist_ok=True)
-    dest = imports_dir / name
+    # Store-prefix so each store's OrderExport is a distinct source_file
+    # (the OCS filename encodes date/time but not store).
+    dest = imports_dir / f"{location_id}__{name}"
     with open(dest, "wb") as f:
         f.write(contents)
 
@@ -3535,11 +3546,11 @@ async def import_order_fill_upload(
 
     try:
         with db() as conn:
-            result = import_order_fill_file(conn, dest)
+            result = import_order_fill_file(conn, dest, location_id=location_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Import failed: {e}")
 
-    return {"ok": True, **result}
+    return {"ok": True, "location_id": location_id, **result}
 
 
 # ---------------------------------------------------------------------------
