@@ -82,33 +82,103 @@ def _make_session():
 
 
 # ---------------------------------------------------------------------------
-# Site-specific calls — FILL FROM HAR (see module docstring)
+# Site-specific calls — first cut from the HAR (ASP.NET MVC portal on Icescape).
+# UNVALIDATED against the live site (the HAR had response bodies stripped):
+# login-success detection, the SelectStore page's retailer-list HTML, and
+# whether the export GETs stream the file vs redirect to a blob all need
+# confirming on the first authenticated run. Endpoints are known:
+#   POST /Admin/Login            (Email, Password, RememberMe, + hidden fields)
+#   POST /Admin/SelectStore      (retailerID, redirect)
+#   GET  /Sales/GenerateOrderExportFile?packType=<n>&exportOrderTemplate=true
+#   GET  /sales/GenerateCatelogue
 # ---------------------------------------------------------------------------
-def login(session, account: OcsAccount) -> None:
-    """Authenticate the session against the OCS portal.
+import re as _re
 
-    TODO(HAR): GET the login page, parse any CSRF/anti-forgery token, POST the
-    credential form, and confirm the session cookie is set. Raise on failure.
+_HIDDEN_INPUT_RE = _re.compile(
+    r'<input[^>]*\btype=["\']hidden["\'][^>]*>', _re.IGNORECASE)
+_ATTR_RE = _re.compile(r'\b(name|value)=["\']([^"\']*)["\']', _re.IGNORECASE)
+
+
+def _hidden_fields(html: str) -> dict:
+    """Extract hidden <input name=value> pairs from a form page so we resubmit
+    them verbatim (ReturnUrl, CallbackUrl, anti-forgery token if present, …)."""
+    out: dict = {}
+    for tag in _HIDDEN_INPUT_RE.findall(html or ""):
+        attrs = dict((k.lower(), v) for k, v in _ATTR_RE.findall(tag))
+        if attrs.get("name"):
+            out[attrs["name"]] = attrs.get("value", "")
+    return out
+
+
+def _filename_from_response(resp, default: str) -> str:
+    cd = resp.headers.get("content-disposition", "") or ""
+    m = _re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';\r\n]+)', cd, _re.IGNORECASE)
+    return (m.group(1).strip() if m else default)
+
+
+def login(session, account: OcsAccount) -> None:
+    """Authenticate the session. GET the sign-in page to pick up hidden form
+    fields, then POST /Admin/Login. Confirms a session by checking we no longer
+    bounce to the sign-in page. Raises on failure.
+
+    NEEDS LIVE VALIDATION: the success signal (the Login response is small JSON)
+    and the exact sign-in page path may need adjusting once we see real bodies.
     """
-    raise NotImplementedError("OCS login not implemented — fill from HAR capture")
+    base = account.base_url.rstrip("/")
+    session.get(f"{base}/Admin/LoginPreReq", timeout=30)  # mirror the browser precheck
+    signin = session.get(f"{base}/Admin/Signin", timeout=30)
+    form = _hidden_fields(signin.text)
+    form.update({
+        "Email": account.username,
+        "Password": account.password,
+        "RememberMe": "true",
+    })
+    resp = session.post(f"{base}/Admin/Login", data=form, timeout=30,
+                        headers={"Referer": f"{base}/Admin/Signin"})
+    # Heuristic success check until we confirm the JSON shape live.
+    ok = resp.ok and "Admin/Signin" not in (resp.url or "")
+    body = (resp.text or "").lower()
+    if '"success":false' in body or "invalid" in body and "password" in body:
+        ok = False
+    if not ok:
+        raise RuntimeError(f"OCS login failed (status {resp.status_code})")
+
+
+def select_store(session, account: OcsAccount, retailer_id: str) -> None:
+    """Set the active store context (POST /Admin/SelectStore)."""
+    base = account.base_url.rstrip("/")
+    session.post(f"{base}/Admin/SelectStore",
+                 data={"retailerID": retailer_id, "redirect": "/"}, timeout=30,
+                 headers={"Referer": f"{base}/Admin/SelectStore"})
 
 
 def fetch_catalogue(session, account: OcsAccount) -> tuple[bytes, str]:
-    """Return (file_bytes, filename) for the OCS catalogue export.
+    """Download the OCS catalogue export (chain-wide; same for all stores)."""
+    base = account.base_url.rstrip("/")
+    resp = session.get(f"{base}/sales/GenerateCatelogue", timeout=120, allow_redirects=True)
+    resp.raise_for_status()
+    fname = _filename_from_response(resp, "OCS_Catalogue.xlsx")
+    return resp.content, fname
 
-    TODO(HAR): replicate the Export action with account.catalogue_format. If the
-    portal generates asynchronously, poll until ready, then download.
+
+def fetch_order_fill(session, account: OcsAccount, pack_type: int = 1) -> tuple[bytes, str] | None:
+    """Download the OrderExport for the currently-selected store.
+
+    Returns (bytes, filename), or None if no order form is available for this
+    store right now (each store's form only exists ~7pm the night before its
+    order day until that day's deadline). pack_type 1 = 'Packs'.
     """
-    raise NotImplementedError("OCS catalogue fetch not implemented — fill from HAR")
-
-
-def fetch_order_fill(session, account: OcsAccount) -> tuple[bytes, str]:
-    """Return (file_bytes, filename) for the OrderExport (Order Fill).
-
-    TODO(HAR): replicate the Export action with account.order_fill_format
-    (e.g. 'Packs'). Handle generate-then-poll if that's the flow.
-    """
-    raise NotImplementedError("OCS Order Fill fetch not implemented — fill from HAR")
+    base = account.base_url.rstrip("/")
+    resp = session.get(f"{base}/Sales/GenerateOrderExportFile",
+                       params={"packType": pack_type, "exportOrderTemplate": "true"},
+                       timeout=120, allow_redirects=True)
+    ct = (resp.headers.get("content-type") or "").lower()
+    # No form available → portal returns HTML/JSON/empty rather than a spreadsheet.
+    if not resp.ok or not resp.content or "spreadsheet" not in ct and "octet-stream" not in ct \
+            and "excel" not in ct and ".xls" not in (resp.headers.get("content-disposition", "").lower()):
+        return None
+    fname = _filename_from_response(resp, "OrderExport.xlsx")
+    return resp.content, fname
 
 
 # ---------------------------------------------------------------------------
@@ -137,15 +207,34 @@ def sync_ocs(conn, db_path: str) -> dict:
     if account is None or not account.is_active:
         return {"status": "skipped", "reason": "no active OCS account"}
 
+    from jobs.import_order_fill import import_order_fill_file
+
     imported: list[str] = []
     try:
         session = _make_session()
         login(session, account)
-        for fetch in (fetch_catalogue, fetch_order_fill):
-            content, filename = fetch(session, account)
-            path = _save_to_imports(content, filename)
-            run_import(path, db_path)
+
+        # 1) Catalogue — chain-wide (identical for all stores), one fetch.
+        content, filename = fetch_catalogue(session, account)
+        cat_path = _save_to_imports(content, filename)
+        run_import(cat_path, db_path)
+        imported.append(cat_path.name)
+
+        # 2) OrderExport — per store. Poll every store; only the store(s) inside
+        # their order window return a file (else None → skip, don't clobber).
+        # Requires the retailer->location mapping (built during the first live
+        # run; see store_mappings()). Each file is saved store-prefixed so
+        # import_order_fill_file tags a distinct per-store run.
+        for retailer_id, location_id in store_mappings(conn):
+            select_store(session, account, retailer_id)
+            of = fetch_order_fill(session, account, pack_type=1)  # 1 = Packs
+            if not of:
+                continue  # no form available for this store right now
+            content, filename = of
+            path = _save_to_imports(content, f"{location_id}__{filename}")
+            import_order_fill_file(conn, path, location_id=location_id)
             imported.append(path.name)
+
         _record_status(conn, account.id, "ok", None)
         log.info("OCS sync imported %d file(s): %s", len(imported), imported)
         return {"status": "ok", "imported": imported}
@@ -153,6 +242,21 @@ def sync_ocs(conn, db_path: str) -> dict:
         _record_status(conn, account.id, "error", str(e))
         log.warning("OCS sync failed: %s", e)
         return {"status": "error", "error": str(e), "imported": imported}
+
+
+def store_mappings(conn) -> list[tuple[str, str]]:
+    """Return [(ocs_retailer_id, our_location_id), …] from the ocs_store_map
+    table. Empty until configured during the first live run (we'll parse the
+    retailer list off the SelectStore page and map each to S1–S8). When empty,
+    sync_ocs simply imports the catalogue and skips the per-store OrderExport.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT ocs_retailer_id, location_id FROM ocs_store_map WHERE is_active = 1"
+        ).fetchall()
+        return [(str(r[0]), str(r[1])) for r in rows]
+    except Exception:
+        return []
 
 
 def _record_status(conn, account_id: int, status: str, error: Optional[str]) -> None:

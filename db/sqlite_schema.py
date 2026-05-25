@@ -471,6 +471,18 @@ CREATE TABLE IF NOT EXISTS ocs_account (
     created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Maps OCS portal retailers to our stores. Populated during the connector's
+-- first live run (parse the retailer list off the SelectStore page → map each
+-- to S1–S8). Empty until then, in which case the connector skips per-store
+-- OrderExport and just pulls the chain-wide catalogue.
+CREATE TABLE IF NOT EXISTS ocs_store_map (
+    ocs_retailer_id  TEXT PRIMARY KEY,   -- retailerID used by POST /Admin/SelectStore
+    location_id      TEXT NOT NULL,      -- our S1..S8
+    ocs_store_number TEXT,               -- e.g. 6001 (informational)
+    label            TEXT,
+    is_active        INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS email_scraper_accounts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     label           TEXT NOT NULL,           -- 'Cova exports', 'OCS reports', etc.
