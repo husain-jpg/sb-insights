@@ -105,6 +105,23 @@ CREATE TABLE IF NOT EXISTS inventory_snapshots (
 CREATE INDEX IF NOT EXISTS ix_inv_loc_asof ON inventory_snapshots (location_id, as_of DESC);
 CREATE INDEX IF NOT EXISTS ix_inv_sku_asof ON inventory_snapshots (sku, as_of DESC);
 
+-- Materialized "latest on-hand per (sku, location)". inventory_snapshots holds
+-- one row per snapshot date (~2.9M rows), so deriving the latest row per SKU at
+-- query time meant a full window-function scan on every Reorder Report load
+-- (5-9s). This table is the precomputed latest slice — refreshed by
+-- jobs.import_cova_exports.refresh_current_inventory() after each inventory
+-- import. The reorder engine joins against this instead of re-deriving it.
+CREATE TABLE IF NOT EXISTS current_inventory (
+    sku                TEXT NOT NULL,
+    location_id        TEXT NOT NULL,
+    on_hand            INTEGER NOT NULL,
+    last_received_date TEXT,
+    as_of              TEXT NOT NULL,
+    PRIMARY KEY (sku, location_id)
+);
+CREATE INDEX IF NOT EXISTS ix_curinv_sku ON current_inventory(sku);
+CREATE INDEX IF NOT EXISTS ix_curinv_loc ON current_inventory(location_id);
+
 CREATE TABLE IF NOT EXISTS prices (
     sku           TEXT NOT NULL,
     location_id   TEXT NOT NULL,

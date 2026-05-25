@@ -640,13 +640,52 @@ def import_inventory(conn, file_path: Path, as_of: datetime | None = None) -> di
     conn.commit()
     log.info("  inserted %d snapshots, %d prices", len(snapshots), len(price_rows))
 
+    # Refresh the materialized latest-on-hand table so the Reorder Report
+    # doesn't re-derive it from the full snapshot history on every load.
+    current_rows = refresh_current_inventory(conn)
+
     return {
         "type": "inventory",
         "snapshots": len(snapshots),
         "prices": len(price_rows),
+        "current_inventory_rows": current_rows,
         "locations": list(location_map.values()),
         "as_of": as_of_iso,
     }
+
+
+def refresh_current_inventory(conn) -> int:
+    """Rebuild the materialized current_inventory table from inventory_snapshots.
+
+    current_inventory holds exactly one row per (sku, location) — the most
+    recent snapshot. Deriving this at query time required a window-function
+    scan over all ~2.9M snapshot rows on every Reorder Report load. We now
+    precompute it here, once per inventory import, using the same
+    latest-row-per-(sku, location) pattern the reorder engine used to inline.
+
+    Full DELETE + INSERT (the table is a derived snapshot, not authoritative).
+    Returns the number of rows written. Caller is responsible for the commit
+    boundary — we commit here so the refresh is durable even if a later step
+    in the import fails.
+    """
+    cur = conn.cursor()
+    cur.execute("DELETE FROM current_inventory")
+    cur.execute(
+        """
+        INSERT INTO current_inventory (sku, location_id, on_hand, last_received_date, as_of)
+        SELECT sku, location_id, on_hand, last_received_date, as_of FROM (
+            SELECT sku, location_id, on_hand, last_received_date, as_of,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY sku, location_id ORDER BY as_of DESC
+                   ) AS rn
+            FROM inventory_snapshots
+        ) t WHERE rn = 1
+        """
+    )
+    rows = cur.rowcount
+    conn.commit()
+    log.info("  refreshed current_inventory: %d rows", rows)
+    return rows
 
 
 # ---------------------------------------------------------------------------

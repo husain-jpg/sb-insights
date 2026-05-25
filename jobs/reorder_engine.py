@@ -537,15 +537,12 @@ def compute_all_reorders(
     if use_top_sku_tier:
         top_skus_by_loc = compute_top_skus_per_store(conn, as_of_date=as_of_date)
 
+    # PERF: latest on-hand comes from the materialized current_inventory table
+    # (refreshed on each inventory import) instead of a window-function scan
+    # over all ~2.9M inventory_snapshots rows. Same semantics — one latest row
+    # per (sku, location) — at a tiny fraction of the cost.
     sql = """
-    WITH latest_inventory AS (
-        SELECT sku, location_id, on_hand FROM (
-            SELECT sku, location_id, on_hand, as_of,
-                   ROW_NUMBER() OVER (PARTITION BY sku, location_id ORDER BY as_of DESC) AS rn
-            FROM inventory_snapshots
-        ) t WHERE rn = 1
-    ),
-    velocity_30d AS (
+    WITH velocity_30d AS (
         SELECT sku, location_id,
                SUM(units_sold) AS units_30d,
                SUM(gross_revenue) AS revenue_30d
@@ -554,7 +551,7 @@ def compute_all_reorders(
         GROUP BY sku, location_id
     ),
     universe AS (
-        SELECT sku, location_id FROM latest_inventory
+        SELECT sku, location_id FROM current_inventory
         UNION
         SELECT sku, location_id FROM velocity_30d
     )
@@ -574,7 +571,7 @@ def compute_all_reorders(
         oc.unit_price AS ocs_unit_price,
         oc.stock_status AS ocs_stock_status
     FROM universe u
-    LEFT JOIN latest_inventory li USING (sku, location_id)
+    LEFT JOIN current_inventory li USING (sku, location_id)
     LEFT JOIN velocity_30d v USING (sku, location_id)
     LEFT JOIN products p USING (sku)
     LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
