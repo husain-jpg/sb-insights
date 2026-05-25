@@ -477,6 +477,13 @@ def import_sales(conn, file_path: Path) -> dict:
             log.info("    sale_lines: %d / %d", line_count, len(rows))
     log.info("  upserted %d sale_lines rows", line_count)
 
+    # New sales data changes the Hero (top-SKU) ranking — drop the cache so the
+    # next Reorder Report recomputes it. (The reorder engine also keys the cache
+    # on as_of_date, but a same-day re-import keeps the same as_of, so we must
+    # invalidate explicitly here.)
+    from jobs.reorder_engine import reset_hero_cache
+    reset_hero_cache()
+
     return {
         "type": "sales",
         "line_items": len(df),

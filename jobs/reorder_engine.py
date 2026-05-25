@@ -370,6 +370,25 @@ def compute_mix_multipliers(
     return raw
 
 
+# ---------------------------------------------------------------------------
+# Hero (Top-SKU) classification cache.
+# compute_top_skus_per_store re-runs a sales aggregation + per-format ranking
+# on every Reorder Report load (~0.5-1s). The result only changes when the
+# underlying sales data changes, so we memoize it here. Keyed by the inputs
+# that affect the ranking: (per_format, n, per_format_top_n, trailing_days,
+# as_of_date). New sales data advances as_of_date (auto-invalidating the key)
+# AND triggers reset_hero_cache() on import. Manager anchor-override edits also
+# call reset_hero_cache() (those aren't in the key). TTL: until invalidated.
+# ---------------------------------------------------------------------------
+_HERO_CACHE: dict = {}
+
+
+def reset_hero_cache() -> None:
+    """Drop the in-memory Hero classification cache. Call after a sales import
+    commits, or after anchor_overrides change."""
+    _HERO_CACHE.clear()
+
+
 def compute_top_skus_per_store(
     conn,
     *,
@@ -405,6 +424,13 @@ def compute_top_skus_per_store(
         trailing_days = int(settings["hero.lookback_days"])
     if per_format_top_n is None:
         per_format_top_n = int(settings["hero.top_n_per_format"])
+
+    # Memoization: the ranking is fully determined by these inputs plus the
+    # sales/anchor data (invalidated explicitly via reset_hero_cache()).
+    cache_key = (per_format, n, per_format_top_n, trailing_days, as_of_date)
+    cached = _HERO_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     end = as_of_date or date.today()
     start = end - timedelta(days=trailing_days)
@@ -474,6 +500,7 @@ def compute_top_skus_per_store(
     except Exception:
         pass  # table missing — ignore, no overrides
 
+    _HERO_CACHE[cache_key] = by_loc
     return by_loc
 
 

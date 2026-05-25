@@ -3262,6 +3262,10 @@ def upsert_anchor_override(payload: dict = Body(...)) -> dict:
                 created_at = CURRENT_TIMESTAMP
         """, (sku, location_id, mode, reason, author_name))
         conn.commit()
+    # Anchor overrides feed the Hero ranking but aren't in the hero cache key —
+    # invalidate so the change shows on the next Reorder Report load.
+    from jobs.reorder_engine import reset_hero_cache
+    reset_hero_cache()
     return {"ok": True, "sku": sku, "location_id": location_id, "mode": mode}
 
 
@@ -3274,6 +3278,8 @@ def delete_anchor_override(sku: str, location_id: str) -> dict:
             (sku, location_id),
         )
         conn.commit()
+    from jobs.reorder_engine import reset_hero_cache
+    reset_hero_cache()
     return {"ok": True, "deleted": cur.rowcount}
 
 
