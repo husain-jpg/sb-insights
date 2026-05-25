@@ -679,9 +679,10 @@ def refresh_current_inventory(conn) -> int:
     cur.execute("DELETE FROM current_inventory")
     cur.execute(
         """
-        INSERT INTO current_inventory (sku, location_id, on_hand, last_received_date, as_of)
-        SELECT sku, location_id, on_hand, last_received_date, as_of FROM (
-            SELECT sku, location_id, on_hand, last_received_date, as_of,
+        INSERT INTO current_inventory
+            (sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of)
+        SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of FROM (
+            SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of,
                    ROW_NUMBER() OVER (
                        PARTITION BY sku, location_id ORDER BY as_of DESC
                    ) AS rn

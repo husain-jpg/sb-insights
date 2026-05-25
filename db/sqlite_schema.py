@@ -112,11 +112,12 @@ CREATE INDEX IF NOT EXISTS ix_inv_sku_asof ON inventory_snapshots (sku, as_of DE
 -- jobs.import_cova_exports.refresh_current_inventory() after each inventory
 -- import. The reorder engine joins against this instead of re-deriving it.
 CREATE TABLE IF NOT EXISTS current_inventory (
-    sku                TEXT NOT NULL,
-    location_id        TEXT NOT NULL,
-    on_hand            INTEGER NOT NULL,
-    last_received_date TEXT,
-    as_of              TEXT NOT NULL,
+    sku                  TEXT NOT NULL,
+    location_id          TEXT NOT NULL,
+    on_hand              INTEGER NOT NULL,
+    last_received_date   TEXT,
+    days_since_last_sold INTEGER,   -- from Cova export; drives slow/dead-stock KPIs
+    as_of                TEXT NOT NULL,
     PRIMARY KEY (sku, location_id)
 );
 CREATE INDEX IF NOT EXISTS ix_curinv_sku ON current_inventory(sku);
@@ -789,6 +790,10 @@ def init_schema(conn) -> None:
     _ensure_column(conn, "inventory_snapshots", "first_received_date", "TEXT")
     _ensure_column(conn, "inventory_snapshots", "last_received_date", "TEXT")
     _ensure_column(conn, "inventory_snapshots", "days_since_last_sold", "INTEGER")
+
+    # current_inventory carries days_since_last_sold (from the latest snapshot)
+    # so the Reorder Report slow/dead-stock KPIs don't re-scan inventory_snapshots.
+    _ensure_column(conn, "current_inventory", "days_since_last_sold", "INTEGER")
 
     # LTOs can be tied to an LP (licensed_producers) instead of a brand_partner.
     # This is how the Data Partners tab creates LTOs for OCS catalog products.

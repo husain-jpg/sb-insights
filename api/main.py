@@ -589,6 +589,99 @@ def filter_by_top_level(recs, top_level: str | None, *, default_exclude_other: b
     return recs
 
 
+# Slow/dead stock recency cutoffs (days since last sold). Slow = SLOW..DEAD-1,
+# Dead = DEAD+. Kept here so the API and any future report share one definition.
+SLOW_STOCK_DAYS = 60
+DEAD_STOCK_DAYS = 90
+
+
+def compute_reorder_kpis(conn, *, store: str | None, top_level: str, as_of: date) -> dict:
+    """Summary KPIs for the Reorder Report header, scoped to the same store +
+    top_level universe as the recommendations.
+
+    - days_on_hand: on-hand value (at cost) / daily burn, where daily burn is
+      trailing-30-day COGS / 30 (matches the engine's velocity window).
+    - weekly_burn_cost: daily burn x 7.
+    - slow/dead stock: on-hand value whose Cova 'days since last sold' is in
+      [SLOW_STOCK_DAYS, DEAD_STOCK_DAYS) (slow) or >= DEAD_STOCK_DAYS (dead).
+
+    Cost basis mirrors the report: OCS wholesale unit price, else retail x 0.60.
+    """
+    cur = conn.cursor()
+    # top_level scoping: a specific level filters to it; 'All' (or None) keeps
+    # everything except 'Other' (fees/gift cards), matching filter_by_top_level.
+    tl_clause, tl_params = "", []
+    if top_level and top_level != "All":
+        tl_clause = "AND p.top_level = ?"
+        tl_params = [top_level]
+    else:
+        tl_clause = "AND COALESCE(p.top_level, '') != 'Other'"
+    loc_clause = "AND x.location_id = ?" if store else ""
+    loc_param = [store] if store else []
+
+    COST = "COALESCE(oc.unit_price, pr.regular_price * 0.60, 0)"
+
+    # On-hand value (at cost) + units, from the materialized current_inventory.
+    cur.execute(f"""
+        SELECT COALESCE(SUM(x.on_hand * {COST}), 0), COALESCE(SUM(x.on_hand), 0)
+        FROM current_inventory x
+        JOIN products p ON p.sku = x.sku
+        LEFT JOIN prices pr ON pr.sku = x.sku AND pr.location_id = x.location_id
+        LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
+        WHERE 1=1 {tl_clause} {loc_clause}
+    """, tl_params + loc_param)
+    on_hand_value, on_hand_units = cur.fetchone()
+
+    # Trailing-30-day COGS (cost of product sold).
+    win_start = (as_of - timedelta(days=29)).isoformat()
+    cur.execute(f"""
+        SELECT COALESCE(SUM(x.units_sold * {COST}), 0)
+        FROM sales_daily x
+        JOIN products p ON p.sku = x.sku
+        LEFT JOIN prices pr ON pr.sku = x.sku AND pr.location_id = x.location_id
+        LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
+        WHERE x.sale_date >= ? AND x.sale_date <= ? {tl_clause} {loc_clause}
+    """, [win_start, as_of.isoformat()] + tl_params + loc_param)
+    cogs_30d = cur.fetchone()[0] or 0.0
+
+    # Slow / dead stock by recency of last sale (on-hand only).
+    cur.execute(f"""
+        SELECT
+            COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ? AND x.days_since_last_sold < ?
+                              THEN x.on_hand * {COST} ELSE 0 END), 0) AS slow_val,
+            COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ?
+                              THEN x.on_hand * {COST} ELSE 0 END), 0) AS dead_val,
+            COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ? AND x.days_since_last_sold < ?
+                              THEN 1 ELSE 0 END), 0) AS slow_skus,
+            COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ?
+                              THEN 1 ELSE 0 END), 0) AS dead_skus
+        FROM current_inventory x
+        JOIN products p ON p.sku = x.sku
+        LEFT JOIN prices pr ON pr.sku = x.sku AND pr.location_id = x.location_id
+        LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
+        WHERE x.on_hand > 0 {tl_clause} {loc_clause}
+    """, [SLOW_STOCK_DAYS, DEAD_STOCK_DAYS, DEAD_STOCK_DAYS,
+          SLOW_STOCK_DAYS, DEAD_STOCK_DAYS, DEAD_STOCK_DAYS] + tl_params + loc_param)
+    slow_val, dead_val, slow_skus, dead_skus = cur.fetchone()
+
+    daily_burn = (cogs_30d / 30.0) if cogs_30d else 0.0
+    return {
+        "on_hand_value": round(float(on_hand_value), 2),
+        "on_hand_units": int(on_hand_units or 0),
+        "cogs_30d": round(float(cogs_30d), 2),
+        "daily_burn_cost": round(daily_burn, 2),
+        "weekly_burn_cost": round(daily_burn * 7, 2),
+        "days_on_hand": round(float(on_hand_value) / daily_burn, 1) if daily_burn > 0 else None,
+        "slow_stock_value": round(float(slow_val), 2),
+        "slow_stock_skus": int(slow_skus or 0),
+        "dead_stock_value": round(float(dead_val), 2),
+        "dead_stock_skus": int(dead_skus or 0),
+        "slow_dead_total_value": round(float(slow_val) + float(dead_val), 2),
+        "slow_days": SLOW_STOCK_DAYS,
+        "dead_days": DEAD_STOCK_DAYS,
+    }
+
+
 # ---------------------------------------------------------------------------
 # /api/locations
 # ---------------------------------------------------------------------------
@@ -757,6 +850,11 @@ def get_reorder(
         except sqlite3.OperationalError:
             pass
 
+        # Header KPIs (days-on-hand, weekly burn, slow/dead stock) scoped to the
+        # same store + top_level universe as the recs below. Computed inside the
+        # connection block; reorder totals + stockout count are added at return.
+        kpis_inv = compute_reorder_kpis(conn, store=store, top_level=tl, as_of=as_of)
+
     recs = filter_by_top_level(recs, tl, default_exclude_other=True)
 
     payload = []
@@ -871,12 +969,23 @@ def get_reorder(
         return (u, rebate_bump, -(p.get("line_total") or 0))
     actionable.sort(key=_sort_key)
 
+    # Assemble header KPIs: inventory-derived metrics + this week's reorder
+    # totals + active stockout count (selling SKUs at 0 on-hand).
+    kpis = {
+        **kpis_inv,
+        "reorder_cost": round(sum(p["line_total"] for p in actionable), 2),
+        "reorder_units": sum(p["reorder_qty"] for p in actionable),
+        "reorder_skus": len(actionable),
+        "active_stockouts": sum(1 for r in recs if r.urgency == "stockout"),
+    }
+
     return {
         "count": len(actionable),
         "total_wholesale_cost": round(sum(p["line_total"] for p in actionable), 2),
         "total_units": sum(p["reorder_qty"] for p in actionable),
         "recommendations": actionable,
         "all_recs_count": len(payload),
+        "kpis": kpis,
         "top_level": tl,
         "settings": {
             "ceiling_days": ceiling_days,
