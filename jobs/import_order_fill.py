@@ -259,6 +259,21 @@ def import_order_fill_file(conn, file_path: Path, location_id: str | None = None
     """, rows_to_insert)
     conn.commit()
 
+    # Keep Order Fill single-run per store: each connector pull makes a new
+    # timestamped file (→ new run), so prune this store's older runs. Without
+    # this, runs accumulate (8/night under the scheduler). NULL/chain-wide runs
+    # are left alone.
+    if location_id is not None:
+        old_runs = [r[0] for r in cur.execute(
+            "SELECT id FROM order_fill_runs WHERE location_id = ? AND id <> ?",
+            (location_id, run_id)).fetchall()]
+        for oid in old_runs:
+            cur.execute("DELETE FROM order_fill_skus WHERE run_id = ?", (oid,))
+            cur.execute("DELETE FROM order_fill_runs WHERE id = ?", (oid,))
+        if old_runs:
+            conn.commit()
+            log.info("  pruned %d superseded run(s) for %s", len(old_runs), location_id)
+
     log.info("  inserted %d Order Fill SKU rows (run_id=%d)", len(rows_to_insert), run_id)
 
     return {
