@@ -194,6 +194,64 @@ def _start_scraper_thread():
     print("[scraper] Scheduler thread started (auto-poll + import)")
 
 
+# ============================================================================
+# OCS connector scheduler — nightly auto-pull of catalogue + per-store Order Fill
+# ============================================================================
+# Runs sync_ocs once each evening. OCS order forms appear ~7pm the night before
+# a store's order day and vanish after that day's deadline, so an evening run
+# catches whichever stores currently have a live form (the rest are skipped, no
+# clobber). Gated by ocs_account.is_active (sync_ocs(force=False) self-skips when
+# inactive). Mirrors the backup thread.
+#
+# Timezone note: uses the host's LOCAL clock (like _backup_loop). The on-prem box
+# is in Eastern, so "after 8pm local" == after 8pm ET, DST-correct via the OS. On
+# a UTC cloud host, switch this to zoneinfo("America/Toronto").
+_ocs_thread_started = False
+_ocs_last_run_date: str | None = None
+OCS_RUN_AFTER_HOUR = 20  # 8pm local
+
+
+def _ocs_connector_loop():
+    global _ocs_last_run_date
+    from jobs.ocs_connector import sync_ocs
+    while True:
+        try:
+            now = _dt.now()
+            today = now.date().isoformat()
+            if _ocs_last_run_date != today and now.hour >= OCS_RUN_AFTER_HOUR:
+                try:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute("PRAGMA busy_timeout = 30000")
+                        res = sync_ocs(conn, DB_PATH, force=False)
+                    _ocs_last_run_date = today  # one attempt per day
+                    if res.get("status") != "skipped":
+                        print(f"[ocs] nightly sync {res.get('status')}: "
+                              f"{res.get('imported') or res.get('error')}")
+                except Exception as e:
+                    print(f"[ocs] nightly sync failed: {e}")
+            _time.sleep(1800)  # re-check every 30 min
+        except Exception as e:
+            print(f"[ocs] Loop error: {e}")
+            _time.sleep(1800)
+
+
+@app.on_event("startup")
+def _start_ocs_connector_thread():
+    """Launch the nightly OCS connector thread (opt out via
+    TERROIR_DISABLE_OCS_CONNECTOR=1). Only actually syncs when the OCS account
+    is marked active."""
+    global _ocs_thread_started
+    if _ocs_thread_started:
+        return
+    if os.environ.get("TERROIR_DISABLE_OCS_CONNECTOR") == "1":
+        print("[ocs] Connector scheduler disabled via TERROIR_DISABLE_OCS_CONNECTOR")
+        return
+    t = threading.Thread(target=_ocs_connector_loop, daemon=True, name="ocs-connector")
+    t.start()
+    _ocs_thread_started = True
+    print(f"[ocs] Connector scheduler started (nightly after {OCS_RUN_AFTER_HOUR}:00 if active)")
+
+
 _successor_map_built = False
 
 
