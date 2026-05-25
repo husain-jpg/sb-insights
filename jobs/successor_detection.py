@@ -150,9 +150,18 @@ def _load_cova_catalog(conn, force: bool = False) -> dict:
 # import until restart. Call reset_caches() to force a reload.
 _OCS_CACHE: dict | None = None
 
+# Precomputed orphan -> best-successor map (Phase C). Built at server startup
+# and after a Cova catalog import (build_successor_map). Stores the best
+# candidate IGNORING dismissals — dismissals are applied at LOOKUP time in
+# detect_successor so a manager dismissal takes effect immediately, without a
+# rebuild. None means "not built yet" -> detect_successor computes live.
+_SUCCESSOR_MAP: dict | None = None
+
 
 def reset_caches() -> None:
-    """Drop the in-memory Cova/OCS caches (call after a catalog re-import)."""
+    """Drop the in-memory Cova/OCS caches (call after a catalog re-import).
+    Does NOT clear the successor map — that is rebuilt explicitly by
+    build_successor_map()."""
     global _COVA_CACHE, _OCS_CACHE
     _COVA_CACHE = None
     _OCS_CACHE = None
@@ -227,13 +236,15 @@ def _tier(confidence: float, name_sim: float) -> str | None:
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def detect_successor(predecessor_sku: str, conn) -> dict | None:
-    """Find the best successor candidate for an orphaned predecessor SKU.
+def _compute_best_successor(predecessor_sku: str, conn,
+                            *, exclude_skus: frozenset | set = frozenset()) -> dict | None:
+    """Core successor scoring for a predecessor SKU. Returns the best candidate
+    dict (with confidence/tier/signals) or None.
 
-    Returns None if no candidate scores >= 0.50 (or the predecessor is
-    unusable / fully dismissed). Otherwise returns a dict with the chosen
-    successor, its confidence (0..1), tier, the per-signal breakdown, and
-    whether it's live/in-stock at OCS. See module docstring for the data seam.
+    This is dismissal-AGNOSTIC: it only skips the candidate SKUs explicitly
+    passed in `exclude_skus`. The successor map is built with exclude_skus
+    empty (so dismissals can be applied later at lookup time); the live lookup
+    path passes the dismissed set. See module docstring for the data seam.
     """
     # Reorder Report scope is cannabis-only. Accessories (papers, wraps, vapes,
     # trays, etc.) are handled in a separate supplier workflow, and their
@@ -251,10 +262,6 @@ def detect_successor(predecessor_sku: str, conn) -> dict | None:
     if pred is None or not pred["brand"]:
         return None  # can't pool candidates without a brand
 
-    dismiss_all, dismissed = _dismissed(conn, predecessor_sku)
-    if dismiss_all:
-        return None
-
     today = date.today()
     pred_core = pred["name_core"]
     pred_size = pred["size"].lower()
@@ -263,7 +270,7 @@ def detect_successor(predecessor_sku: str, conn) -> dict | None:
 
     best = None
     for cand in cova["by_brand"].get(pred["brand"].lower(), []):
-        if cand["sku"] == predecessor_sku or cand["sku"] in dismissed:
+        if cand["sku"] == predecessor_sku or cand["sku"] in exclude_skus:
             continue
         # Skip the predecessor's own (dead) listing if it appears under the same variant.
         if pred_variant and cand["vendor_sku"].lower() == pred_variant:
@@ -321,3 +328,73 @@ def detect_successor(predecessor_sku: str, conn) -> dict | None:
     best["confidence"] = round(best["confidence"], 4)
     best["tier"] = tier
     return best
+
+
+def detect_successor(predecessor_sku: str, conn) -> dict | None:
+    """Find the best successor candidate for an orphaned predecessor SKU.
+
+    Returns None if no candidate scores >= 0.50 (or the predecessor is
+    unusable / fully dismissed). Otherwise returns a dict with the chosen
+    successor, its confidence (0..1), tier, the per-signal breakdown, and
+    whether it's live/in-stock at OCS.
+
+    Phase C: when the precomputed successor map is available
+    (build_successor_map ran at startup / after a catalog import) this is an
+    O(1) dict lookup. Dismissals are ALWAYS evaluated here, at lookup time, so
+    a manager dismissing a candidate takes effect on the very next call without
+    rebuilding the map:
+      - dismiss-all for the predecessor       -> None
+      - the cached winner is the dismissed one -> recompute live excluding all
+                                                  dismissed candidates (next best)
+      - otherwise                              -> return the cached winner
+    If the map isn't built (or this predecessor isn't in it, e.g. during tests
+    or for a brand-new orphan), fall back to a live computation.
+    """
+    dismiss_all, dismissed = _dismissed(conn, predecessor_sku)
+    if dismiss_all:
+        return None
+
+    if _SUCCESSOR_MAP is not None and predecessor_sku in _SUCCESSOR_MAP:
+        cand = _SUCCESSOR_MAP[predecessor_sku]
+        if cand is None:
+            return None
+        if cand["successor_sku"] not in dismissed:
+            return cand
+        # The cached best was dismissed — recompute live to find the next best
+        # candidate that isn't dismissed (rare path; dismissals are manual).
+
+    return _compute_best_successor(predecessor_sku, conn, exclude_skus=dismissed)
+
+
+def build_successor_map(conn) -> int:
+    """Precompute orphan -> best-successor for every current cannabis orphan.
+
+    An orphan is a cannabis product whose ocs_variant_number no longer matches
+    ocs_catalog (OCS re-listed it under a new variant). We score each one once
+    here instead of per-report-load. Results IGNORE dismissals — those are
+    applied at lookup time in detect_successor (so a dismissal needs no rebuild).
+
+    Resets the Cova/OCS caches first so the map is built against current catalog
+    data (important when called right after a catalog import). Assigns the
+    finished map atomically, so concurrent readers see either the old map or the
+    complete new one — never a half-built one. Returns the number of orphans.
+    """
+    global _SUCCESSOR_MAP
+    reset_caches()
+    _load_cova_catalog(conn)  # warm the cache once up front
+    orphans = conn.execute(
+        """
+        SELECT p.sku FROM products p
+        WHERE p.top_level = 'Cannabis'
+          AND p.ocs_variant_number IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM ocs_catalog oc
+              WHERE oc.ocs_variant_number = p.ocs_variant_number
+          )
+        """
+    ).fetchall()
+    new_map: dict = {}
+    for (sku,) in orphans:
+        new_map[sku] = _compute_best_successor(sku, conn)
+    _SUCCESSOR_MAP = new_map  # atomic swap
+    return len(new_map)

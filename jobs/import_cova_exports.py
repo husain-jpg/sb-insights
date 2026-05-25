@@ -832,6 +832,13 @@ def import_cova_catalog(conn, file_path: Path | None = None) -> dict:
     conn.commit()
     log.info("  loaded %d Cova catalog rows", len(rows))
 
+    # The Cova catalog is successor detection's source of truth — rebuild the
+    # orphan->successor map (and reset the stale cova/ocs caches it reads) so
+    # the Reorder Report reflects the new catalog without a server restart.
+    from jobs.successor_detection import build_successor_map
+    n_orphans = build_successor_map(conn)
+    log.info("  rebuilt successor map: %d orphans", n_orphans)
+
     return {
         "type": "cova_catalog",
         "catalog_rows": len(rows),

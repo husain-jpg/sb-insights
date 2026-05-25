@@ -194,6 +194,42 @@ def _start_scraper_thread():
     print("[scraper] Scheduler thread started (auto-poll + import)")
 
 
+_successor_map_built = False
+
+
+def _build_successor_map_bg():
+    """Build the orphan->successor map in the background so it's ready for the
+    first Reorder Report load. Until it finishes, detect_successor falls back to
+    live computation (correct, just slower), so this never blocks startup."""
+    try:
+        from jobs.successor_detection import build_successor_map
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA busy_timeout = 10000")
+            n = build_successor_map(conn)
+        print(f"[successor] Built successor map: {n} orphans")
+    except Exception as e:
+        print(f"[successor] map build failed (will compute live): {e}")
+
+
+@app.on_event("startup")
+def _start_successor_map_build():
+    """Precompute the successor map on startup (Phase C). Runs in a daemon
+    thread to avoid delaying server readiness; opt out via
+    TERROIR_DISABLE_SUCCESSOR_MAP=1."""
+    global _successor_map_built
+    if _successor_map_built:
+        return
+    if os.environ.get("TERROIR_DISABLE_SUCCESSOR_MAP") == "1":
+        print("[successor] Map build disabled via TERROIR_DISABLE_SUCCESSOR_MAP")
+        return
+    if not os.path.exists(DB_PATH):
+        return  # nothing to build against yet
+    t = threading.Thread(target=_build_successor_map_bg, daemon=True, name="successor-map")
+    t.start()
+    _successor_map_built = True
+    print("[successor] Map build thread started")
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard_page(request: Request):
     # If users exist and you're not logged in → bounce to login
