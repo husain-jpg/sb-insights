@@ -418,6 +418,7 @@
         <button data-page="settings">▸ Settings</button>
         <button data-page="users">▸ Users</button>
         <button data-page="email-scraper">▸ Email Scraper</button>
+        <button data-page="ocs-connector">▸ OCS Connector</button>
         <button data-page="system-health">▸ System Health</button>
       </div>
     </div>
@@ -6083,6 +6084,158 @@ async function renderUsers() {
 // ========================================================================
 // Email Scraper — configure auto-import accounts
 // ========================================================================
+// OCS Connector — configure + validate the auto-pull of catalogue + Order Fill
+// ========================================================================
+async function renderOcsConnector() {
+  const main = document.getElementById("main");
+  main.innerHTML = `<div class="loading">LOADING OCS CONNECTOR...</div>`;
+  try {
+    const [cfg, locs] = await Promise.all([api("/api/ocs/config"), api("/api/locations")]);
+    window._ocsLocs = locs;
+    const last = cfg.configured
+      ? `Last run: ${cfg.last_run_at || 'never'} · ${cfg.last_status || '—'}${cfg.last_error ? ' · ' + escapeHtml(cfg.last_error) : ''}`
+      : 'Not configured yet.';
+
+    main.innerHTML = `
+      <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
+        <div><div class="kicker">Admin · OCS Auto-import</div><h2>OCS Connector</h2></div>
+      </div>
+
+      <div class="hint-box" style="margin-bottom: 14px;">
+        <strong>What this does:</strong> logs into the OCS B2B portal and pulls the <strong>catalogue</strong> (chain-wide) and each store's <strong>OrderExport</strong>, dropping them into <code style="background: var(--bg-elev-2); padding: 1px 6px;">imports/</code> to auto-import.
+        <br><br>
+        <strong>Per-store + time-windowed:</strong> each store's order form only exists ~7pm the night before its order day until that day's deadline, so a run polls every mapped store and imports whichever are available.
+        <br><br>
+        <strong>Not yet auto-scheduled:</strong> validate with "Test login" / "Run now" first; the nightly scheduler gets wired once it's proven. Credentials are encrypted at rest.
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);"><strong>Credentials</strong></div>
+        <div style="padding: 14px 16px; display: grid; grid-template-columns: 160px 1fr; gap: 10px 12px; align-items: center; max-width: 640px;">
+          <label style="font-size: 12px; color: var(--text-dim);">Portal URL</label>
+          <input id="ocs-base-url" type="text" value="${escapeHtml(cfg.base_url || 'https://www.ocswholesale.ca')}" style="font-size: 12px;">
+          <label style="font-size: 12px; color: var(--text-dim);">Username (email)</label>
+          <input id="ocs-username" type="text" value="${escapeHtml(cfg.username || '')}" style="font-size: 12px;">
+          <label style="font-size: 12px; color: var(--text-dim);">Password</label>
+          <input id="ocs-password" type="password" placeholder="${cfg.configured ? 'leave blank to keep current' : 'OCS password'}" style="font-size: 12px;">
+          <label style="font-size: 12px; color: var(--text-dim);">Order Fill format</label>
+          <input id="ocs-format" type="text" value="${escapeHtml(cfg.order_fill_format || 'Packs')}" style="font-size: 12px;">
+          <label style="font-size: 12px; color: var(--text-dim);">Active</label>
+          <label style="font-size: 12px;"><input id="ocs-active" type="checkbox" ${cfg.is_active ? 'checked' : ''}> enable scheduled runs (once wired)</label>
+        </div>
+        <div style="padding: 0 16px 14px; display: flex; gap: 10px; align-items: center;">
+          <button class="btn btn-primary" id="ocs-save">Save</button>
+          <span id="ocs-save-status" style="font-size: 11px; color: var(--text-dim);">${escapeHtml(last)}</span>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);"><strong>Validate</strong></div>
+        <div style="padding: 14px 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+          <button class="btn" id="ocs-test">Test login</button>
+          <button class="btn" id="ocs-fetch-retailers">Fetch retailer list</button>
+          <button class="btn" id="ocs-run">Run now</button>
+          <span id="ocs-action-status" style="font-size: 11px; color: var(--text-dim);"></span>
+        </div>
+        <div id="ocs-retailers" style="padding: 0 16px 16px;"></div>
+      </div>
+    `;
+
+    const setStatus = (id, msg, ok) => {
+      const el = document.getElementById(id);
+      el.textContent = msg;
+      el.style.color = ok === true ? "#6dab84" : ok === false ? "var(--critical)" : "var(--text-dim)";
+    };
+
+    document.getElementById("ocs-save").addEventListener("click", async () => {
+      const body = {
+        base_url: document.getElementById("ocs-base-url").value.trim(),
+        username: document.getElementById("ocs-username").value.trim(),
+        order_fill_format: document.getElementById("ocs-format").value.trim() || "Packs",
+        is_active: document.getElementById("ocs-active").checked,
+      };
+      const pw = document.getElementById("ocs-password").value;
+      if (pw) body.password = pw;
+      setStatus("ocs-save-status", "Saving...");
+      try {
+        const res = await fetch("/api/ocs/config", { method: "POST", credentials: "include",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        if (res.ok) setStatus("ocs-save-status", "Saved.", true);
+        else { const e = await res.json(); setStatus("ocs-save-status", "Failed: " + (e.detail || "?"), false); }
+      } catch (e) { setStatus("ocs-save-status", "Error: " + e.message, false); }
+    });
+
+    document.getElementById("ocs-test").addEventListener("click", async () => {
+      setStatus("ocs-action-status", "Testing login...");
+      try {
+        const res = await fetch("/api/ocs/test-login", { method: "POST", credentials: "include" });
+        const d = await res.json();
+        setStatus("ocs-action-status", d.ok ? "Login OK." : "Login failed: " + (d.error || d.detail || "?"), !!d.ok);
+      } catch (e) { setStatus("ocs-action-status", "Error: " + e.message, false); }
+    });
+
+    document.getElementById("ocs-run").addEventListener("click", async () => {
+      setStatus("ocs-action-status", "Running sync (this can take a minute)...");
+      try {
+        const res = await fetch("/api/ocs/run-now", { method: "POST", credentials: "include" });
+        const d = await res.json();
+        if (d.status === "ok") setStatus("ocs-action-status", `Done. Imported: ${(d.imported || []).join(', ') || 'nothing'}`, true);
+        else if (d.status === "skipped") setStatus("ocs-action-status", "Skipped: " + (d.reason || "inactive"), null);
+        else setStatus("ocs-action-status", "Error: " + (d.error || d.detail || "?"), false);
+      } catch (e) { setStatus("ocs-action-status", "Error: " + e.message, false); }
+    });
+
+    document.getElementById("ocs-fetch-retailers").addEventListener("click", async () => {
+      setStatus("ocs-action-status", "Fetching retailer list...");
+      try {
+        const res = await fetch("/api/ocs/retailers", { credentials: "include" });
+        const d = await res.json();
+        if (!d.ok) { setStatus("ocs-action-status", "Failed: " + (d.error || d.detail || "?"), false); return; }
+        setStatus("ocs-action-status", `Found ${d.retailers.length} retailer(s) — map each to a store, then Save mapping.`, true);
+        renderOcsRetailerMap(d.retailers, cfg.store_map || []);
+      } catch (e) { setStatus("ocs-action-status", "Error: " + e.message, false); }
+    });
+  } catch (e) { showError(e); }
+}
+
+function renderOcsRetailerMap(retailers, existing) {
+  const locs = window._ocsLocs || [];
+  const mapByRid = {}; existing.forEach(m => mapByRid[m.ocs_retailer_id] = m.location_id);
+  const opt = (sel) => `<option value="">— unmapped —</option>` +
+    locs.map(l => `<option value="${l.id}" ${sel === l.id ? 'selected' : ''}>${escapeHtml(l.short_name || l.name)} (${l.id})</option>`).join("");
+  const box = document.getElementById("ocs-retailers");
+  box.innerHTML = `
+    <table style="font-size: 12px; margin: 8px 0;">
+      <thead><tr><th>OCS retailer ID</th><th>Name</th><th>Our store</th></tr></thead>
+      <tbody>
+        ${retailers.map(r => `
+          <tr>
+            <td>${escapeHtml(r.retailer_id)}</td>
+            <td>${escapeHtml(r.name || '')}</td>
+            <td><select class="ocs-map-sel" data-rid="${escapeHtml(r.retailer_id)}" data-name="${escapeHtml(r.name || '')}" style="font-size: 12px;">${opt(mapByRid[r.retailer_id] || '')}</select></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+    <button class="btn btn-primary" id="ocs-save-map">Save mapping</button>
+    <span id="ocs-map-status" style="font-size: 11px; color: var(--text-dim); margin-left: 10px;"></span>
+  `;
+  document.getElementById("ocs-save-map").addEventListener("click", async () => {
+    const mappings = [...document.querySelectorAll(".ocs-map-sel")]
+      .filter(s => s.value)
+      .map(s => ({ ocs_retailer_id: s.dataset.rid, location_id: s.value, label: s.dataset.name }));
+    const st = document.getElementById("ocs-map-status");
+    st.textContent = "Saving...";
+    try {
+      const res = await fetch("/api/ocs/store-map", { method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mappings }) });
+      const d = await res.json();
+      st.textContent = res.ok ? `Saved ${d.count} mapping(s).` : "Failed";
+      st.style.color = res.ok ? "#6dab84" : "var(--critical)";
+    } catch (e) { st.textContent = "Error: " + e.message; st.style.color = "var(--critical)"; }
+  });
+}
+
+// ========================================================================
 async function renderEmailScraper() {
   const main = document.getElementById("main");
   main.innerHTML = `<div class="loading">LOADING EMAIL SCRAPER...</div>`;
@@ -6719,6 +6872,7 @@ const routes = {
   settings: renderSettings,
   users: renderUsers,
   "email-scraper": renderEmailScraper,
+  "ocs-connector": renderOcsConnector,
   "system-health": renderSystemHealth,
 };
 
