@@ -240,19 +240,22 @@ def _save_to_imports(content: bytes, filename: str) -> Path:
     return dest
 
 
-def sync_ocs(conn, db_path: str) -> dict:
+def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
     """Pull the catalogue + Order Fill and import them. Records run status on
-    the ocs_account row. No-op (returns skipped) if the account is missing or
-    inactive — so this is safe to call before login() is implemented.
+    the ocs_account row.
 
-    `conn` is used for account load + status writes; `db_path` is passed to
+    force=False (the scheduler) skips when the account is inactive. force=True
+    (a manual "Run now") runs regardless of is_active, as long as an account
+    exists. `conn` loads the account + writes status; `db_path` is passed to
     run_import, which opens its own connection (matching the email scraper).
     """
     from jobs.import_cova_exports import run_import
 
     account = load_account(conn)
-    if account is None or not account.is_active:
-        return {"status": "skipped", "reason": "no active OCS account"}
+    if account is None:
+        return {"status": "skipped", "reason": "no OCS account configured"}
+    if not force and not account.is_active:
+        return {"status": "skipped", "reason": "OCS account inactive"}
 
     from jobs.import_order_fill import import_order_fill_file
 

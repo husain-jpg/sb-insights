@@ -3670,10 +3670,11 @@ def ocs_save_store_map(payload: dict = Body(...), _admin: dict = Depends(require
 
 @app.post("/api/ocs/run-now")
 def ocs_run_now(_admin: dict = Depends(require_admin)) -> dict:
-    """Trigger a one-off connector sync (catalogue + per-store OrderExports)."""
+    """Trigger a one-off connector sync (catalogue + per-store OrderExports).
+    Manual run — forces a sync even if the account isn't marked active yet."""
     from jobs.ocs_connector import sync_ocs
     with db() as conn:
-        return sync_ocs(conn, DB_PATH)
+        return sync_ocs(conn, DB_PATH, force=True)
 
 
 # ---------------------------------------------------------------------------
