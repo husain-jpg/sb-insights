@@ -6206,12 +6206,13 @@ function renderOcsRetailerMap(retailers, existing) {
   const box = document.getElementById("ocs-retailers");
   box.innerHTML = `
     <table style="font-size: 12px; margin: 8px 0;">
-      <thead><tr><th>OCS retailer ID</th><th>Name</th><th>Our store</th></tr></thead>
+      <thead><tr><th>OCS #</th><th>Name</th><th>Address</th><th>Our store</th></tr></thead>
       <tbody>
         ${retailers.map(r => `
           <tr>
-            <td>${escapeHtml(r.retailer_id)}</td>
+            <td>${escapeHtml(r.store_number || r.retailer_id)}</td>
             <td>${escapeHtml(r.name || '')}</td>
+            <td style="font-size: 11px; color: var(--text-dim);">${escapeHtml(r.address || '')}</td>
             <td><select class="ocs-map-sel" data-rid="${escapeHtml(r.retailer_id)}" data-name="${escapeHtml(r.name || '')}" style="font-size: 12px;">${opt(mapByRid[r.retailer_id] || '')}</select></td>
           </tr>`).join('')}
       </tbody>

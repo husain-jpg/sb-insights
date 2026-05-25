@@ -152,27 +152,51 @@ def select_store(session, account: OcsAccount, retailer_id: str) -> None:
                  headers={"Referer": f"{base}/Admin/SelectStore"})
 
 
-def list_retailers(session, account: OcsAccount) -> list[dict]:
-    """Parse the retailer list off the SelectStore page so OCS retailers can be
-    mapped to our stores (S1–S8).
+def _parse_store_blocks(html: str) -> list[dict]:
+    """Parse the SelectStore page's per-store ``storediv`` blocks.
 
-    Best-effort across common markup patterns — the exact selectors will be
-    confirmed against the live page during the first authenticated run. Returns
-    [{"retailer_id": str, "name": str}, …].
+    Each store carries data-retailer-name, a hidden hdnStoreNumber (e.g. 6001),
+    and a hidden hdnERetailerID token (URL-encoded; this is what SelectStore
+    posts and may be session-bound, so it's re-read each run). Returns
+    [{"store_number", "name", "token"}, …].
     """
+    out: list[dict] = []
+    # Split on each store block's name attribute; chunk[i>0] holds one store.
+    parts = _re.split(r'data-retailer-name=', html or "")
+    for chunk in parts[1:]:
+        nm = _re.match(r'["\']([^"\']*)["\']', chunk)
+        addr = _re.search(r'data-retailer-address=["\']([^"\']*)["\']', chunk)
+        sn = _re.search(r'hdnStoreNumber["\']\s+value=["\']([^"\']+)["\']', chunk)
+        tok = _re.search(r'hdnERetailerID["\']\s+value=["\']([^"\']+)["\']', chunk)
+        store_number = sn.group(1).strip() if sn else ""
+        token = tok.group(1).strip() if tok else ""
+        if store_number or token:
+            out.append({
+                "store_number": store_number,
+                "name": (nm.group(1).strip() if nm else ""),
+                "address": (addr.group(1).strip() if addr else ""),
+                "token": token,
+            })
+    return out
+
+
+def list_retailers(session, account: OcsAccount) -> list[dict]:
+    """Fetch + parse the SelectStore retailer list for the store-mapping UI.
+    Returns [{"retailer_id", "store_number", "name"}, …] where retailer_id is
+    the (stable) store number used as the mapping key."""
     base = account.base_url.rstrip("/")
     html = session.get(f"{base}/Admin/SelectStore", timeout=30).text or ""
-    found: dict = {}
-    # <option value="ID">Name</option>
-    for m in _re.finditer(r'<option[^>]*value=["\'](\d+)["\'][^>]*>([^<]+)</option>', html, _re.IGNORECASE):
-        found[m.group(1)] = m.group(2).strip()
-    # data-retailerid="ID" ... Name
-    for m in _re.finditer(r'data-retailer-?id=["\'](\d+)["\'][^>]*>\s*([^<]{0,80})', html, _re.IGNORECASE):
-        found.setdefault(m.group(1), m.group(2).strip())
-    # bare retailerID=ID references (no name)
-    for m in _re.finditer(r'retailerID["\'=:\s]+(\d+)', html, _re.IGNORECASE):
-        found.setdefault(m.group(1), "")
-    return [{"retailer_id": rid, "name": name} for rid, name in found.items()]
+    return [{"retailer_id": b["store_number"], "store_number": b["store_number"],
+             "name": b["name"], "address": b["address"]}
+            for b in _parse_store_blocks(html)]
+
+
+def _store_tokens(session, account: OcsAccount) -> dict:
+    """Map {store_number: current hdnERetailerID token} from a fresh SelectStore
+    page (tokens may be session-bound, so resolve them at run time)."""
+    base = account.base_url.rstrip("/")
+    html = session.get(f"{base}/Admin/SelectStore", timeout=30).text or ""
+    return {b["store_number"]: b["token"] for b in _parse_store_blocks(html) if b["store_number"]}
 
 
 def fetch_catalogue(session, account: OcsAccount) -> tuple[bytes, str]:
@@ -243,13 +267,18 @@ def sync_ocs(conn, db_path: str) -> dict:
         run_import(cat_path, db_path)
         imported.append(cat_path.name)
 
-        # 2) OrderExport — per store. Poll every store; only the store(s) inside
-        # their order window return a file (else None → skip, don't clobber).
-        # Requires the retailer->location mapping (built during the first live
-        # run; see store_mappings()). Each file is saved store-prefixed so
+        # 2) OrderExport — per store. The mapping stores OCS store numbers; the
+        # SelectStore call needs the encrypted retailer token, which is resolved
+        # fresh from the SelectStore page (tokens are session-bound). Poll every
+        # mapped store; only the store(s) inside their order window return a file
+        # (else None → skip, don't clobber). Files are saved store-prefixed so
         # import_order_fill_file tags a distinct per-store run.
-        for retailer_id, location_id in store_mappings(conn):
-            select_store(session, account, retailer_id)
+        tokens = _store_tokens(session, account)  # {store_number: token}
+        for store_number, location_id in store_mappings(conn):
+            token = tokens.get(str(store_number))
+            if not token:
+                continue  # mapped store not present on the portal
+            select_store(session, account, token)
             of = fetch_order_fill(session, account, pack_type=1)  # 1 = Packs
             if not of:
                 continue  # no form available for this store right now
