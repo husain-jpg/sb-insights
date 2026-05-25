@@ -450,6 +450,27 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON user_sessions (expires_at);
 -- OAuth2 to come later. Configuration is per-account (you might have one
 -- inbox for Cova, another for OCS, etc).
 
+-- OCS B2B portal connector (future auto-pull of catalogue + Order Fill).
+-- Holds one encrypted credential/config row. is_active defaults to 0 so the
+-- connector stays OFF until login is implemented (from a HAR capture) and the
+-- account is configured. password_enc uses the same encrypt_secret as the
+-- email scraper. See jobs/ocs_connector.py.
+CREATE TABLE IF NOT EXISTS ocs_account (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    label                 TEXT NOT NULL DEFAULT 'OCS B2B',
+    base_url              TEXT NOT NULL,            -- portal base/login URL
+    username              TEXT NOT NULL,
+    password_enc          TEXT NOT NULL,            -- encrypted at rest
+    catalogue_format      TEXT,                     -- export format for the OCS catalogue
+    order_fill_format     TEXT DEFAULT 'Packs',     -- export format for the OrderExport
+    is_active             INTEGER NOT NULL DEFAULT 0,  -- off until login is wired
+    schedule_interval_min INTEGER NOT NULL DEFAULT 1440,  -- daily
+    last_run_at           TEXT,
+    last_status           TEXT,                     -- 'ok' | 'error'
+    last_error            TEXT,
+    created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS email_scraper_accounts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     label           TEXT NOT NULL,           -- 'Cova exports', 'OCS reports', etc.
