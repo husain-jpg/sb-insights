@@ -887,7 +887,7 @@ def get_reorder(
         # Look up via OCS variant number, which is how Order Fill keys SKUs.
         of = None
         if getattr(r, "ocs_variant", None):
-            of = order_fill_map.get(r.ocs_variant)
+            of = order_fill_map.get(r.ocs_variant.lower())
         if of:
             d["order_fill_back_in_stock"] = bool(of["back_in_stock"])
             d["order_fill_new_arrival"] = bool(of["new_arrival"])
@@ -939,15 +939,25 @@ def get_reorder(
                   if p["urgency"] in ("stockout", "critical", "high", "medium")
                   and p["reorder_qty"] > 0]
 
-    # Exclude OCS-out-of-stock items unless explicitly requested. Successor recs
-    # are EXEMPT: an OOS successor still appears (flagged via successor_in_stock)
-    # so the manager sees the re-listed product with a "currently unavailable at
-    # OCS" badge instead of losing it silently. Non-successor OOS recs are still
-    # dropped — you can't reorder an OOS catalog item.
+    # Exclude OCS-out-of-stock items unless explicitly requested. Two exemptions
+    # keep genuinely-orderable items from being hidden by a stale catalogue NO:
+    #   1. Successor recs — an OOS successor still appears (flagged via
+    #      successor_in_stock) so the re-listed product isn't lost silently.
+    #   2. Order Fill availability — the OCS Order Fill is the authoritative
+    #      "what OCS will deliver this cycle" feed. A flow-through item ships from
+    #      the LP, so it correctly reads NO in the warehouse-stock catalogue yet
+    #      is still orderable. If it's in the latest Order Fill (flow-through,
+    #      back-in-stock, or available qty > 0), keep it. Display/math unchanged.
+    def _orderable_via_order_fill(p: dict) -> bool:
+        return (p.get("order_fill_flow_thru") is not None     # present in latest Order Fill
+                or bool(p.get("order_fill_back_in_stock"))
+                or (p.get("order_fill_available_qty") or 0) > 0)
+
     if not include_ocs_out:
         actionable = [p for p in actionable
                       if p.get("successor_predecessor_sku") is not None
-                      or p.get("ocs_stock_status") != "NO"]
+                      or p.get("ocs_stock_status") != "NO"
+                      or _orderable_via_order_fill(p)]
 
     # Urgency filter (optional)
     if urgency and urgency != "all":

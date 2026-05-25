@@ -294,4 +294,8 @@ def get_latest_order_fill_skus(conn) -> dict:
         FROM order_fill_skus WHERE run_id = ?
     """, (run_id,))
     cols = [d[0] for d in cur.description]
-    return {row[0]: dict(zip(cols, row)) for row in cur.fetchall()}
+    # Key by lower-cased variant: the Order Fill stores the OCS variant as it
+    # appears in the file, but products/ocs_catalog store it lower-cased and the
+    # Reorder Report looks it up with the lower-cased value. Lower-casing here
+    # makes the join case-insensitive so badges/availability actually match.
+    return {(row[0] or "").lower(): dict(zip(cols, row)) for row in cur.fetchall()}
