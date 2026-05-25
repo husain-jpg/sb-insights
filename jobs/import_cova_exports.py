@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -92,12 +93,33 @@ def _read_any(file_path: Path, **kwargs):
 
 def extract_historical_as_of(file_path: Path) -> datetime | None:
     """
-    Cova's "Inventory by Product Historical" export includes a Parameters
-    sheet with an 'As Of' row. If we find it, parse and return the date.
-    Regular "Inventory On Hand" exports don't have this sheet — return None.
+    Cova's "Inventory by Product Historical" export is a point-in-time backfill.
+    Determine its as-of date so it doesn't default to now() and wrongly become
+    the "latest" snapshot (which clobbers current on-hand + days_since_last_sold).
+
+    Order: (1) the xlsx Parameters sheet 'As Of' row (most precise), then
+    (2) the date embedded in a "Historical" filename
+    (e.g. "Inventory by Product Historical - 20260430-...csv" -> 2026-04-30).
+    Regular "Inventory On Hand" exports return None (they ARE current → now()).
     """
-    if file_path.suffix.lower() not in (".xlsx", ".xls"):
-        return None
+    if file_path.suffix.lower() in (".xlsx", ".xls"):
+        dt = _historical_as_of_from_parameters(file_path)
+        if dt is not None:
+            return dt
+    # Filename fallback (covers CSV historical exports, which have no Parameters
+    # sheet). Only applies to files explicitly named "Historical".
+    if "historical" in file_path.name.lower():
+        m = re.search(r"(\d{8})", file_path.name)
+        if m:
+            try:
+                return datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    return None
+
+
+def _historical_as_of_from_parameters(file_path: Path) -> datetime | None:
+    """Read the 'As Of' date from a Historical export's Parameters sheet."""
     try:
         params = pd.read_excel(file_path, sheet_name="Parameters")
     except (ValueError, KeyError):
@@ -691,7 +713,14 @@ def refresh_current_inventory(conn) -> int:
         SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of FROM (
             SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of,
                    ROW_NUMBER() OVER (
-                       PARTITION BY sku, location_id ORDER BY as_of DESC
+                       PARTITION BY sku, location_id
+                       -- Prefer the latest real Inventory-On-Hand reading (which
+                       -- carries days_since_last_sold) over a historical backfill
+                       -- that lacks it, so a mis-dated backfill can't clobber the
+                       -- current slice. Falls back to latest overall when no
+                       -- reading has the field.
+                       ORDER BY (CASE WHEN days_since_last_sold IS NOT NULL THEN 0 ELSE 1 END),
+                                as_of DESC
                    ) AS rn
             FROM inventory_snapshots
         ) t WHERE rn = 1
