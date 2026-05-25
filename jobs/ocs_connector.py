@@ -152,6 +152,29 @@ def select_store(session, account: OcsAccount, retailer_id: str) -> None:
                  headers={"Referer": f"{base}/Admin/SelectStore"})
 
 
+def list_retailers(session, account: OcsAccount) -> list[dict]:
+    """Parse the retailer list off the SelectStore page so OCS retailers can be
+    mapped to our stores (S1–S8).
+
+    Best-effort across common markup patterns — the exact selectors will be
+    confirmed against the live page during the first authenticated run. Returns
+    [{"retailer_id": str, "name": str}, …].
+    """
+    base = account.base_url.rstrip("/")
+    html = session.get(f"{base}/Admin/SelectStore", timeout=30).text or ""
+    found: dict = {}
+    # <option value="ID">Name</option>
+    for m in _re.finditer(r'<option[^>]*value=["\'](\d+)["\'][^>]*>([^<]+)</option>', html, _re.IGNORECASE):
+        found[m.group(1)] = m.group(2).strip()
+    # data-retailerid="ID" ... Name
+    for m in _re.finditer(r'data-retailer-?id=["\'](\d+)["\'][^>]*>\s*([^<]{0,80})', html, _re.IGNORECASE):
+        found.setdefault(m.group(1), m.group(2).strip())
+    # bare retailerID=ID references (no name)
+    for m in _re.finditer(r'retailerID["\'=:\s]+(\d+)', html, _re.IGNORECASE):
+        found.setdefault(m.group(1), "")
+    return [{"retailer_id": rid, "name": name} for rid, name in found.items()]
+
+
 def fetch_catalogue(session, account: OcsAccount) -> tuple[bytes, str]:
     """Download the OCS catalogue export (chain-wide; same for all stores)."""
     base = account.base_url.rstrip("/")

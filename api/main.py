@@ -3554,6 +3554,129 @@ async def import_order_fill_upload(
 
 
 # ---------------------------------------------------------------------------
+# OCS connector — config + live-validation harness (admin only)
+# ---------------------------------------------------------------------------
+# Credentials are encrypted at rest (encrypt_secret). The connector itself
+# stays gated by ocs_account.is_active; these endpoints let an admin configure
+# it, test the login, see the retailer list to build the store mapping, and run
+# a manual sync. The auto-scheduler is intentionally NOT wired until the
+# connector is validated live.
+
+@app.get("/api/ocs/config")
+def ocs_get_config(_admin: dict = Depends(require_admin)) -> dict:
+    with db() as conn:
+        row = conn.execute(
+            """SELECT base_url, username, order_fill_format, is_active,
+                      last_run_at, last_status, last_error
+               FROM ocs_account ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        maps = conn.execute(
+            "SELECT ocs_retailer_id, location_id, ocs_store_number, label, is_active FROM ocs_store_map"
+        ).fetchall()
+    store_map = [dict(zip(["ocs_retailer_id", "location_id", "ocs_store_number", "label", "is_active"], m))
+                 for m in maps]
+    if not row:
+        return {"configured": False, "store_map": store_map}
+    return {
+        "configured": True, "base_url": row[0], "username": row[1],
+        "order_fill_format": row[2], "is_active": bool(row[3]),
+        "last_run_at": row[4], "last_status": row[5], "last_error": row[6],
+        "store_map": store_map,
+    }
+
+
+@app.post("/api/ocs/config")
+def ocs_save_config(payload: dict = Body(...), _admin: dict = Depends(require_admin)) -> dict:
+    base_url = (payload.get("base_url") or "").strip()
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password")  # optional on update (keep existing if blank)
+    if not base_url or not username:
+        raise HTTPException(status_code=400, detail="base_url and username are required")
+    is_active = 1 if payload.get("is_active") else 0
+    order_fill_format = payload.get("order_fill_format") or "Packs"
+    from jobs.auth import encrypt_secret
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id, password_enc FROM ocs_account ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        pw_enc = encrypt_secret(password) if password else (existing[1] if existing else None)
+        if pw_enc is None:
+            raise HTTPException(status_code=400, detail="password required for first setup")
+        if existing:
+            conn.execute(
+                """UPDATE ocs_account SET base_url=?, username=?, password_enc=?,
+                          order_fill_format=?, is_active=? WHERE id=?""",
+                (base_url, username, pw_enc, order_fill_format, is_active, existing[0]))
+        else:
+            conn.execute(
+                """INSERT INTO ocs_account (label, base_url, username, password_enc, order_fill_format, is_active)
+                   VALUES ('OCS B2B', ?, ?, ?, ?, ?)""",
+                (base_url, username, pw_enc, order_fill_format, is_active))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/ocs/test-login")
+def ocs_test_login(_admin: dict = Depends(require_admin)) -> dict:
+    from jobs.ocs_connector import load_account, _make_session, login
+    with db() as conn:
+        acct = load_account(conn)
+    if not acct:
+        raise HTTPException(status_code=400, detail="Configure OCS credentials first")
+    try:
+        login(_make_session(), acct)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/ocs/retailers")
+def ocs_list_retailers(_admin: dict = Depends(require_admin)) -> dict:
+    """Log in and parse the SelectStore retailer list (for building the store
+    mapping). Live call — used during validation."""
+    from jobs.ocs_connector import load_account, _make_session, login, list_retailers
+    with db() as conn:
+        acct = load_account(conn)
+    if not acct:
+        raise HTTPException(status_code=400, detail="Configure OCS credentials first")
+    try:
+        s = _make_session()
+        login(s, acct)
+        return {"ok": True, "retailers": list_retailers(s, acct)}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "retailers": []}
+
+
+@app.post("/api/ocs/store-map")
+def ocs_save_store_map(payload: dict = Body(...), _admin: dict = Depends(require_admin)) -> dict:
+    """Replace the OCS-retailer → our-store mapping. payload: {"mappings": [...]}"""
+    rows = payload.get("mappings", [])
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM ocs_store_map")
+        n = 0
+        for m in rows:
+            rid, loc = m.get("ocs_retailer_id"), m.get("location_id")
+            if not rid or not loc:
+                continue
+            cur.execute(
+                """INSERT INTO ocs_store_map (ocs_retailer_id, location_id, ocs_store_number, label, is_active)
+                   VALUES (?, ?, ?, ?, 1)""",
+                (str(rid), str(loc), m.get("ocs_store_number"), m.get("label")))
+            n += 1
+        conn.commit()
+    return {"ok": True, "count": n}
+
+
+@app.post("/api/ocs/run-now")
+def ocs_run_now(_admin: dict = Depends(require_admin)) -> dict:
+    """Trigger a one-off connector sync (catalogue + per-store OrderExports)."""
+    from jobs.ocs_connector import sync_ocs
+    with db() as conn:
+        return sync_ocs(conn, DB_PATH)
+
+
+# ---------------------------------------------------------------------------
 # Order Outcome Analysis — sell-through tracking against historical invoices
 # ---------------------------------------------------------------------------
 
