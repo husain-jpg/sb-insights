@@ -39,7 +39,11 @@ def ensure_folders():
 def import_new_files():
     """Look for xlsx files in ./imports and load them into the DB."""
     imports = Path("imports")
-    files = list(imports.glob("*.xlsx")) + list(imports.glob("*.xls"))
+    # Include .csv: run_import processes csv too, so they must also be moved to
+    # processed/ afterward — otherwise they pile up in imports/ and get
+    # re-imported on every startup (slow).
+    files = (list(imports.glob("*.xlsx")) + list(imports.glob("*.xls"))
+             + list(imports.glob("*.csv")))
     if not files:
         print("→ No new files in ./imports (that's okay if you've already imported)")
         return

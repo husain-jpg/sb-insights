@@ -500,10 +500,16 @@ def import_sales(conn, file_path: Path) -> dict:
 # Inventory importer
 # ---------------------------------------------------------------------------
 
-def import_inventory(conn, file_path: Path, as_of: datetime | None = None) -> dict:
+def import_inventory(conn, file_path: Path, as_of: datetime | None = None,
+                     refresh_current: bool = True) -> dict:
     """
     Import an Inventory On Hand by Product export. Creates a time-stamped
     snapshot per (sku, location). Also upserts products and prices.
+
+    refresh_current: when True (default), rebuild current_inventory at the end.
+    Batch callers (run_import) pass False and refresh ONCE after all inventory
+    files — the refresh is a full window scan over all snapshots (~minutes on a
+    large DB), so doing it per-file in a multi-file run is pathologically slow.
     """
     as_of = as_of or datetime.now(timezone.utc)
     as_of_iso = as_of.strftime("%Y-%m-%d %H:%M:%S")
@@ -649,7 +655,8 @@ def import_inventory(conn, file_path: Path, as_of: datetime | None = None) -> di
 
     # Refresh the materialized latest-on-hand table so the Reorder Report
     # doesn't re-derive it from the full snapshot history on every load.
-    current_rows = refresh_current_inventory(conn)
+    # Skipped when called in a batch (run_import refreshes once at the end).
+    current_rows = refresh_current_inventory(conn) if refresh_current else None
 
     return {
         "type": "inventory",
@@ -1016,7 +1023,11 @@ def run_import(path: Path, db_path: str) -> list[dict]:
                 if historical_as_of:
                     log.info("  detected Historical export, as_of=%s",
                              historical_as_of.strftime("%Y-%m-%d"))
-                result = import_inventory(conn, f, as_of=historical_as_of)
+                # Defer the current_inventory refresh — done once after the
+                # whole batch (see below) so N inventory files don't trigger N
+                # full window-scan refreshes.
+                result = import_inventory(conn, f, as_of=historical_as_of,
+                                          refresh_current=False)
             elif file_type == "ocs_catalog":
                 result = import_ocs_catalog(conn, f)
             elif file_type == "invoice":
@@ -1098,6 +1109,12 @@ def run_import(path: Path, db_path: str) -> list[dict]:
                         invoice_unmatched, invoice_count)
             log.warning("Review unmatched invoices: SELECT * FROM invoices WHERE location_id IS NULL")
             log.warning("=" * 70)
+
+        # Refresh the materialized current_inventory ONCE if any inventory file
+        # was imported in this batch (import_inventory deferred it). One full
+        # refresh instead of one per file.
+        if any(r.get("type") == "inventory" for r in results):
+            refresh_current_inventory(conn)
 
         # After all imports: backfill any NULL top_level values using the
         # classification fallback map. This handles products that came in
