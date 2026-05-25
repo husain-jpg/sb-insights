@@ -3491,6 +3491,57 @@ async def order_fill(
     }
 
 
+@app.post("/api/order-fill/import")
+async def import_order_fill_upload(
+    file: UploadFile = File(...),
+    _admin: dict = Depends(require_admin),
+) -> dict:
+    """Upload an OCS Order Fill (OrderExport_*.xlsx) and import it.
+
+    This is the manual route for the OCS Order Fill, which doesn't arrive via
+    the Cova email scraper. Once imported, the Reorder Report reflects
+    flow-through / back-in-stock availability (an item OCS will deliver this
+    cycle is no longer hidden just because the warehouse-stock catalogue says
+    NO). Admin only. Idempotent — re-importing the same file replaces its run.
+    """
+    from pathlib import Path as _Path
+    from jobs.import_order_fill import is_order_fill_file, import_order_fill_file
+
+    contents = await file.read()
+    if len(contents) > 25_000_000:  # 25MB safety net
+        raise HTTPException(status_code=413, detail="file too large")
+    name = _Path(file.filename or "").name
+    if not name.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Expected an .xlsx Order Fill export")
+
+    imports_dir = _Path("imports")
+    imports_dir.mkdir(exist_ok=True)
+    dest = imports_dir / name
+    with open(dest, "wb") as f:
+        f.write(contents)
+
+    # Validate it's actually an Order Fill before importing (filename pattern +
+    # MasterCatalogue sheet + required columns).
+    if not is_order_fill_file(dest):
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail="Not a recognized OCS Order Fill — expected OrderExport_DD_Mon_YYYY*.xlsx "
+                   "with a 'MasterCatalogue' sheet.",
+        )
+
+    try:
+        with db() as conn:
+            result = import_order_fill_file(conn, dest)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Import failed: {e}")
+
+    return {"ok": True, **result}
+
+
 # ---------------------------------------------------------------------------
 # Order Outcome Analysis — sell-through tracking against historical invoices
 # ---------------------------------------------------------------------------
