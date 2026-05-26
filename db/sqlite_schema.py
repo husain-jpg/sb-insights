@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS inventory_snapshots (
     first_received_date  TEXT,
     last_received_date   TEXT,
     days_since_last_sold INTEGER,  -- also from Cova export, useful for promo decisions
+    avg_unit_cost        REAL,     -- actual landed cost/unit (Cova "Avg Unit Cost In Stock")
     as_of                TEXT NOT NULL,
     PRIMARY KEY (sku, location_id, as_of)
 );
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS current_inventory (
     on_hand              INTEGER NOT NULL,
     last_received_date   TEXT,
     days_since_last_sold INTEGER,   -- from Cova export; drives slow/dead-stock KPIs
+    avg_unit_cost        REAL,      -- actual landed cost/unit; values on-hand inventory
     as_of                TEXT NOT NULL,
     PRIMARY KEY (sku, location_id)
 );
@@ -823,10 +825,12 @@ def init_schema(conn) -> None:
     _ensure_column(conn, "inventory_snapshots", "first_received_date", "TEXT")
     _ensure_column(conn, "inventory_snapshots", "last_received_date", "TEXT")
     _ensure_column(conn, "inventory_snapshots", "days_since_last_sold", "INTEGER")
+    _ensure_column(conn, "inventory_snapshots", "avg_unit_cost", "REAL")
 
-    # current_inventory carries days_since_last_sold (from the latest snapshot)
-    # so the Reorder Report slow/dead-stock KPIs don't re-scan inventory_snapshots.
+    # current_inventory carries days_since_last_sold + avg_unit_cost (from the
+    # latest snapshot) so the Reorder Report KPIs don't re-scan inventory_snapshots.
     _ensure_column(conn, "current_inventory", "days_since_last_sold", "INTEGER")
+    _ensure_column(conn, "current_inventory", "avg_unit_cost", "REAL")
 
     # Order Fill is per-store (each store's order window differs): tag each run
     # with the store it was pulled for. NULL = legacy chain-wide run (pre-migration).

@@ -1189,7 +1189,7 @@ async function renderReorder() {
         <div class="kpi-card blue" style="${cd}" title="On-hand value at cost ÷ daily burn, where daily burn = trailing 30-day cost of product sold ÷ 30 (matches the reorder engine's velocity window).">
           <div class="kpi-label"><span>Days On Hand</span></div>
           <div class="kpi-value">${doh}</div>
-          <div class="kpi-detail">Inventory ÷ 30-day sales pace · ${fmt$(k.on_hand_value)} on hand (at cost)</div>
+          <div class="kpi-detail">${fmt$(k.on_hand_value)} on hand (at cost)${k.inventory_as_of ? ` · as of ${k.inventory_as_of}` : ''}</div>
         </div>
         <div class="kpi-card purple" style="${cd}" title="Cost of cannabis product sold, averaged over the trailing 30 days and expressed per week.">
           <div class="kpi-label"><span>Weekly Burn</span></div>

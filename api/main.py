@@ -677,11 +677,17 @@ def compute_reorder_kpis(conn, *, store: str | None, top_level: str, as_of: date
     loc_clause = "AND x.location_id = ?" if store else ""
     loc_param = [store] if store else []
 
-    COST = "COALESCE(oc.unit_price, pr.regular_price * 0.60, 0)"
+    # Cost basis: actual Cova landed cost (avg_unit_cost) first — what the
+    # inventory really cost (reconciles to Cova's "In Stock Cost") — then OCS
+    # wholesale, then 60%-of-retail as a last resort.
+    #   COST_OH:   for on-hand rows (current_inventory x → x.avg_unit_cost)
+    #   COST_COGS: for sold rows (no cost on sales_daily; join current_inventory)
+    COST_OH = "COALESCE(x.avg_unit_cost, oc.unit_price, pr.regular_price * 0.60, 0)"
+    COST_COGS = "COALESCE(ci.avg_unit_cost, oc.unit_price, pr.regular_price * 0.60, 0)"
 
     # On-hand value (at cost) + units, from the materialized current_inventory.
     cur.execute(f"""
-        SELECT COALESCE(SUM(x.on_hand * {COST}), 0), COALESCE(SUM(x.on_hand), 0)
+        SELECT COALESCE(SUM(x.on_hand * {COST_OH}), 0), COALESCE(SUM(x.on_hand), 0)
         FROM current_inventory x
         JOIN products p ON p.sku = x.sku
         LEFT JOIN prices pr ON pr.sku = x.sku AND pr.location_id = x.location_id
@@ -690,12 +696,14 @@ def compute_reorder_kpis(conn, *, store: str | None, top_level: str, as_of: date
     """, tl_params + loc_param)
     on_hand_value, on_hand_units = cur.fetchone()
 
-    # Trailing-30-day COGS (cost of product sold).
+    # Trailing-30-day COGS (cost of product sold). Value sold units at the SKU's
+    # current landed cost where known (join current_inventory).
     win_start = (as_of - timedelta(days=29)).isoformat()
     cur.execute(f"""
-        SELECT COALESCE(SUM(x.units_sold * {COST}), 0)
+        SELECT COALESCE(SUM(x.units_sold * {COST_COGS}), 0)
         FROM sales_daily x
         JOIN products p ON p.sku = x.sku
+        LEFT JOIN current_inventory ci ON ci.sku = x.sku AND ci.location_id = x.location_id
         LEFT JOIN prices pr ON pr.sku = x.sku AND pr.location_id = x.location_id
         LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
         WHERE x.sale_date >= ? AND x.sale_date <= ? {tl_clause} {loc_clause}
@@ -706,9 +714,9 @@ def compute_reorder_kpis(conn, *, store: str | None, top_level: str, as_of: date
     cur.execute(f"""
         SELECT
             COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ? AND x.days_since_last_sold < ?
-                              THEN x.on_hand * {COST} ELSE 0 END), 0) AS slow_val,
+                              THEN x.on_hand * {COST_OH} ELSE 0 END), 0) AS slow_val,
             COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ?
-                              THEN x.on_hand * {COST} ELSE 0 END), 0) AS dead_val,
+                              THEN x.on_hand * {COST_OH} ELSE 0 END), 0) AS dead_val,
             COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ? AND x.days_since_last_sold < ?
                               THEN 1 ELSE 0 END), 0) AS slow_skus,
             COALESCE(SUM(CASE WHEN x.days_since_last_sold >= ?
@@ -722,8 +730,18 @@ def compute_reorder_kpis(conn, *, store: str | None, top_level: str, as_of: date
           SLOW_STOCK_DAYS, DEAD_STOCK_DAYS, DEAD_STOCK_DAYS] + tl_params + loc_param)
     slow_val, dead_val, slow_skus, dead_skus = cur.fetchone()
 
+    # As-of date of the on-hand data (latest snapshot feeding current_inventory).
+    cur.execute(f"""
+        SELECT MAX(x.as_of) FROM current_inventory x
+        JOIN products p ON p.sku = x.sku
+        WHERE 1=1 {tl_clause} {loc_clause}
+    """, tl_params + loc_param)
+    row = cur.fetchone()
+    inventory_as_of = (row[0][:10] if row and row[0] else None)
+
     daily_burn = (cogs_30d / 30.0) if cogs_30d else 0.0
     return {
+        "inventory_as_of": inventory_as_of,
         "on_hand_value": round(float(on_hand_value), 2),
         "on_hand_units": int(on_hand_units or 0),
         "cogs_30d": round(float(cogs_30d), 2),

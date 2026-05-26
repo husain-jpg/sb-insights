@@ -151,6 +151,29 @@ def _historical_as_of_from_parameters(file_path: Path) -> datetime | None:
     return None
 
 
+def inventory_as_of_from_filename(file_path: Path) -> datetime | None:
+    """Snapshot date(+time) for ANY inventory export, parsed from the Cova
+    filename, e.g. "Inventory On Hand by Product - 20260524-233126716.xlsx"
+    -> 2026-05-24 23:31:26. Targets the date right after "Product -"/"Historical -"
+    so a scraper-added download-time prefix ("20260525-064232_…") doesn't win.
+    Returns None when no such token (caller falls back to now()).
+
+    Why this matters: stamping inventory with its real snapshot date (not the
+    import time) keeps "latest" unambiguous and makes the on-hand "as of" honest.
+    """
+    m = re.search(r"(?:Product|Historical)\s*-\s*(\d{8})(?:-(\d{6}))?", file_path.name)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+        if m.group(2):
+            t = datetime.strptime(m.group(2), "%H%M%S")
+            dt = dt.replace(hour=t.hour, minute=t.minute, second=t.second)
+        return dt
+    except ValueError:
+        return None
+
+
 def detect_file_type(file_path: Path) -> str:
     """Peek at the column headers to figure out what kind of export this is."""
     df = _read_any(file_path, nrows=0)  # headers only, no rows
@@ -595,6 +618,10 @@ def import_inventory(conn, file_path: Path, as_of: datetime | None = None,
     has_first_recv = "First Received Date" in df.columns
     has_last_recv = "Last Received Date" in df.columns
     has_days_since = "Days Since Last Sold" in df.columns
+    # Actual landed cost per unit, straight from Cova. Used to value on-hand
+    # inventory (what it actually cost), vs OCS wholesale (what re-buying costs).
+    has_avg_cost = "Avg Unit Cost In Stock" in df.columns
+    has_stock_cost = "In Stock Cost" in df.columns
 
     def _date_iso(val):
         """Cova ships dates as 'YYYY-MM-DD HH:MM:SS' or pandas Timestamps.
@@ -627,6 +654,32 @@ def import_inventory(conn, file_path: Path, as_of: datetime | None = None,
         except (ValueError, TypeError):
             return None
 
+    def _float_or_none(val):
+        try:
+            import pandas as _pd
+            if _pd.isna(val):
+                return None
+        except Exception:
+            pass
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    def _avg_unit_cost(r):
+        """Per-unit landed cost: prefer 'Avg Unit Cost In Stock', else derive
+        from 'In Stock Cost' / 'In Stock Qty'."""
+        if has_avg_cost:
+            v = _float_or_none(r["Avg Unit Cost In Stock"])
+            if v is not None:
+                return v
+        if has_stock_cost:
+            sc = _float_or_none(r["In Stock Cost"])
+            qty = _float_or_none(r.get("In Stock Qty"))
+            if sc is not None and qty:
+                return sc / qty
+        return None
+
     snapshots = []
     for _, r in df.iterrows():
         snapshots.append((
@@ -634,6 +687,7 @@ def import_inventory(conn, file_path: Path, as_of: datetime | None = None,
             _date_iso(r["First Received Date"]) if has_first_recv else None,
             _date_iso(r["Last Received Date"]) if has_last_recv else None,
             _int_or_none(r["Days Since Last Sold"]) if has_days_since else None,
+            _avg_unit_cost(r),
             as_of_iso,
         ))
     cur = conn.cursor()
@@ -641,13 +695,15 @@ def import_inventory(conn, file_path: Path, as_of: datetime | None = None,
         """
         INSERT INTO inventory_snapshots
             (sku, location_id, on_hand, reserved,
-             first_received_date, last_received_date, days_since_last_sold, as_of)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             first_received_date, last_received_date, days_since_last_sold,
+             avg_unit_cost, as_of)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (sku, location_id, as_of) DO UPDATE SET
             on_hand = excluded.on_hand,
             first_received_date = COALESCE(excluded.first_received_date, inventory_snapshots.first_received_date),
             last_received_date = COALESCE(excluded.last_received_date, inventory_snapshots.last_received_date),
-            days_since_last_sold = COALESCE(excluded.days_since_last_sold, inventory_snapshots.days_since_last_sold)
+            days_since_last_sold = COALESCE(excluded.days_since_last_sold, inventory_snapshots.days_since_last_sold),
+            avg_unit_cost = COALESCE(excluded.avg_unit_cost, inventory_snapshots.avg_unit_cost)
         """,
         snapshots,
     )
@@ -709,9 +765,9 @@ def refresh_current_inventory(conn) -> int:
     cur.execute(
         """
         INSERT INTO current_inventory
-            (sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of)
-        SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of FROM (
-            SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, as_of,
+            (sku, location_id, on_hand, last_received_date, days_since_last_sold, avg_unit_cost, as_of)
+        SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, avg_unit_cost, as_of FROM (
+            SELECT sku, location_id, on_hand, last_received_date, days_since_last_sold, avg_unit_cost, as_of,
                    ROW_NUMBER() OVER (
                        PARTITION BY sku, location_id
                        -- Prefer the latest real Inventory-On-Hand reading (which
@@ -1046,16 +1102,18 @@ def run_import(path: Path, db_path: str) -> list[dict]:
             if file_type == "sales":
                 result = import_sales(conn, f)
             elif file_type == "inventory":
-                # Detect Historical exports (multi-sheet xlsx with Parameters).
-                # If found, use the embedded As Of date. Otherwise default = now.
-                historical_as_of = extract_historical_as_of(f)
-                if historical_as_of:
-                    log.info("  detected Historical export, as_of=%s",
-                             historical_as_of.strftime("%Y-%m-%d"))
+                # Stamp with the real snapshot date from the filename (so old
+                # backfills don't masquerade as current); fall back to the xlsx
+                # Parameters 'As Of', then now().
+                inv_as_of = (inventory_as_of_from_filename(f)
+                             or extract_historical_as_of(f))
+                if inv_as_of:
+                    log.info("  inventory as_of=%s (from filename/parameters)",
+                             inv_as_of.strftime("%Y-%m-%d %H:%M"))
                 # Defer the current_inventory refresh — done once after the
                 # whole batch (see below) so N inventory files don't trigger N
                 # full window-scan refreshes.
-                result = import_inventory(conn, f, as_of=historical_as_of,
+                result = import_inventory(conn, f, as_of=inv_as_of,
                                           refresh_current=False)
             elif file_type == "ocs_catalog":
                 result = import_ocs_catalog(conn, f)
