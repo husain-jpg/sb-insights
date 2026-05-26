@@ -415,11 +415,19 @@
         <button data-page="ltos">▸ LTOs</button>
         <button data-page="data-lp-partners">▸ Data LP Partners</button>
         <button data-page="monthly-reports">▸ Monthly Reports</button>
-        <button data-page="settings">▸ Settings</button>
+      </div>
+    </div>
+
+    <div class="nav-group" data-group="settings">
+      <button class="nav-group-header" data-toggle="settings">
+        <span class="arrow">▾</span> Settings
+      </button>
+      <div class="nav-group-items">
+        <button data-page="settings">▸ System Settings</button>
         <button data-page="users">▸ Users</button>
+        <button data-page="system-health">▸ System Health</button>
         <button data-page="email-scraper">▸ Email Scraper</button>
         <button data-page="ocs-connector">▸ OCS Connector</button>
-        <button data-page="system-health">▸ System Health</button>
       </div>
     </div>
   </nav>
@@ -1179,51 +1187,68 @@ async function renderReorder() {
     // refetch(); unaffected by client-side search/category/exclusion filters.
     function kpiStripHTML(k) {
       if (!k) return '';
-      const cd = 'cursor: default;';
       const doh = (k.days_on_hand == null)
         ? '—'
-        : `${k.days_on_hand}<span style="font-size:16px; color:var(--text-dim); font-family:inherit;"> days</span>`;
+        : `${k.days_on_hand}<span style="font-size:13px; color:var(--text-dim); font-family:inherit;"> d</span>`;
       const slowRange = `${k.slow_days}–${k.dead_days - 1}`;
+      // Compact card: smaller padding + value so all 5 fit one row.
+      const card = (cls, label, value, detail, title) => `
+        <div class="kpi-card ${cls}" style="cursor:default; padding:13px 14px;" title="${title}">
+          <div class="kpi-label" style="margin-bottom:6px;"><span>${label}</span></div>
+          <div class="kpi-value" style="font-size:22px;">${value}</div>
+          <div class="kpi-detail">${detail}</div>
+        </div>`;
       return `
-      <div class="kpi-grid">
-        <div class="kpi-card blue" style="${cd}" title="On-hand value at cost ÷ daily burn, where daily burn = trailing 30-day cost of product sold ÷ 30 (matches the reorder engine's velocity window).">
-          <div class="kpi-label"><span>Days On Hand</span></div>
-          <div class="kpi-value">${doh}</div>
-          <div class="kpi-detail">${fmt$(k.on_hand_value)} on hand (at cost)${k.inventory_as_of ? ` · as of ${k.inventory_as_of}` : ''}</div>
-        </div>
-        <div class="kpi-card purple" style="${cd}" title="Cost of cannabis product sold, averaged over the trailing 30 days and expressed per week.">
-          <div class="kpi-label"><span>Weekly Burn</span></div>
-          <div class="kpi-value">${fmt$(k.weekly_burn_cost)}</div>
-          <div class="kpi-detail">Cost of product sold (30-day avg)</div>
-        </div>
-        <div class="kpi-card green" style="${cd}" title="Total of this week's suggested reorder at estimated wholesale cost.">
-          <div class="kpi-label"><span>Suggested Reorder This Week</span></div>
-          <div class="kpi-value">${fmt$(k.reorder_cost)}</div>
-          <div class="kpi-detail">${fmtN(k.reorder_units)} units · ${fmtN(k.reorder_skus)} SKUs</div>
-        </div>
-        <div class="kpi-card red" style="${cd}" title="Count of SKUs that are selling but currently at 0 on-hand.">
-          <div class="kpi-label"><span>Active Stockouts</span></div>
-          <div class="kpi-value">${fmtN(k.active_stockouts)}</div>
-          <div class="kpi-detail">Selling SKUs at 0 qty</div>
-        </div>
-      </div>
-      <div class="kpi-grid">
-        <div class="kpi-card amber" style="${cd}" title="On-hand value (at cost) of SKUs whose last sale was ${slowRange} days ago. Moving, but slowly.">
-          <div class="kpi-label"><span>Slow Stock</span></div>
-          <div class="kpi-value">${fmt$(k.slow_stock_value)}</div>
-          <div class="kpi-detail">${fmtN(k.slow_stock_skus)} SKUs · last sold ${slowRange} days ago</div>
-        </div>
-        <div class="kpi-card red" style="${cd}" title="On-hand value (at cost) of SKUs whose last sale was ${k.dead_days}+ days ago. Not moving.">
-          <div class="kpi-label"><span>Dead Stock</span></div>
-          <div class="kpi-value">${fmt$(k.dead_stock_value)}</div>
-          <div class="kpi-detail">${fmtN(k.dead_stock_skus)} SKUs · last sold ${k.dead_days}+ days ago</div>
-        </div>
-        <div class="kpi-card purple" style="${cd}" title="Combined on-hand value of slow + dead stock — capital tied up in product that hasn't sold in ${k.slow_days}+ days.">
-          <div class="kpi-label"><span>Slow + Dead Total</span></div>
-          <div class="kpi-value">${fmt$(k.slow_dead_total_value)}</div>
-          <div class="kpi-detail">Capital not selling in ${k.slow_days}+ days</div>
-        </div>
+      <div class="kpi-grid" style="grid-template-columns: repeat(5, 1fr); gap: 10px;">
+        ${card('blue','Days On Hand', doh,
+          `${fmt$(k.on_hand_value)} at cost${k.inventory_as_of ? ` · as of ${k.inventory_as_of}` : ''}`,
+          'On-hand value (at actual cost) ÷ daily burn (trailing 30-day cost of product sold ÷ 30).')}
+        ${card('purple','Weekly Burn', fmt$(k.weekly_burn_cost), 'Cost sold, 30-day avg',
+          'Cost of product sold, averaged over the trailing 30 days, expressed per week.')}
+        ${card('green','Suggested Reorder', fmt$(k.reorder_cost),
+          `${fmtN(k.reorder_units)} u · ${fmtN(k.reorder_skus)} SKUs`,
+          "This week's suggested reorder at OCS wholesale cost.")}
+        ${card('red','Active Stockouts', fmtN(k.active_stockouts), 'Selling SKUs at 0 qty',
+          'SKUs that are selling but currently at 0 on-hand.')}
+        ${card('amber','Slow + Dead', fmt$(k.slow_dead_total_value),
+          `Slow ${fmt$(k.slow_stock_value)} · Dead ${fmt$(k.dead_stock_value)}`,
+          `On-hand value not sold in ${k.slow_days}+ days. Slow = sold ${slowRange}d ago (${fmtN(k.slow_stock_skus)} SKUs); Dead = ${k.dead_days}+d ago (${fmtN(k.dead_stock_skus)} SKUs).`)}
       </div>`;
+    }
+
+    // Plain-English manager guidance derived from the KPIs (current store/type
+    // scope). Shown above the KPI strip.
+    function highlightsHTML(k) {
+      if (!k) return '';
+      const pts = [];
+      const doh = k.days_on_hand;
+      if (doh != null) {
+        if (doh > 35) pts.push(`<strong>Heavily stocked</strong> — ~${doh} days on hand (target 21–28). Tighten ordering: prioritize Hero / high-velocity SKUs and avoid topping up slow movers.`);
+        else if (doh > 28) pts.push(`<strong>Slightly heavy</strong> — ~${doh} days on hand (target 21–28). Favor Heroes; ease off slower SKUs.`);
+        else if (doh >= 21) pts.push(`<strong>Well-balanced</strong> — ~${doh} days on hand, within the 21–28-day target.`);
+        else if (doh >= 14) pts.push(`<strong>Slightly lean</strong> — ~${doh} days on hand; keep Heroes well-covered.`);
+        else pts.push(`<strong>Running lean</strong> — ~${doh} days on hand; watch for stockouts on fast movers.`);
+      }
+      const sd = k.slow_dead_total_value || 0, oh = k.on_hand_value || 0;
+      if (sd > 0) {
+        const pct = oh > 0 ? Math.round(sd / oh * 100) : 0;
+        pts.push(`<strong>${fmt$(sd)}${pct ? ` (~${pct}%)` : ''}</strong> hasn't sold in ${k.slow_days}+ days — work it down via clearance/promos before it ages further.`);
+      }
+      if (k.active_stockouts > 0) {
+        pts.push(`<strong>${fmtN(k.active_stockouts)} selling SKUs are stocked out</strong> — these are the priority to restock.`);
+      }
+      if ((k.weekly_burn_cost || 0) > 0) {
+        const pct = Math.round((k.reorder_cost || 0) / k.weekly_burn_cost * 100);
+        pts.push(`This week's suggested order is <strong>${fmt$(k.reorder_cost)}</strong> — about ${pct}% of a typical week's sales (at cost).`);
+      }
+      if (!pts.length) return '';
+      return `
+        <div class="card" style="margin-bottom: 16px; padding: 14px 16px; border-left: 3px solid var(--accent);">
+          <div class="kicker" style="margin-bottom: 8px;">Highlights</div>
+          <ul style="margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.6;">
+            ${pts.map(p => `<li>${p}</li>`).join('')}
+          </ul>
+        </div>`;
     }
 
     main.innerHTML = `
@@ -1290,6 +1315,7 @@ async function renderReorder() {
         </div>
       </div>
 
+      <div id="reorder-highlights">${highlightsHTML(data.kpis)}</div>
       <div id="reorder-kpis">${kpiStripHTML(data.kpis)}</div>
 
       <div class="card" style="margin-bottom: 16px;">
@@ -1608,6 +1634,8 @@ async function renderReorder() {
       currentData = d.recommendations;
       const kpiBox = document.getElementById("reorder-kpis");
       if (kpiBox) kpiBox.innerHTML = kpiStripHTML(d.kpis);
+      const hlBox = document.getElementById("reorder-highlights");
+      if (hlBox) hlBox.innerHTML = highlightsHTML(d.kpis);
       renderMixSummary(d.mix_multipliers);
       populateCategoryFilter();
       applyTextFilter();
