@@ -45,6 +45,26 @@ from jobs.auth import (
 )
 from api.excel_export import build_workbook
 
+
+def _load_dotenv():
+    """Minimal .env loader (no dependency): KEY=VALUE lines, '#' comments.
+    Real environment variables take precedence (setdefault). Runs before any
+    config is read so SECRET_KEY/TERROIR_DB/TZ etc. are available."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    try:
+        with open(env_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
 DB_PATH = os.environ.get("TERROIR_DB", "terroir.db")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -85,6 +105,42 @@ from datetime import datetime as _dt
 _backup_thread_started = False
 _last_backup_date: str | None = None
 
+# Background schedulers (backup, email scraper, OCS connector, successor map)
+# start per-process via startup hooks. With multiple web workers that means N
+# nightly backups, N OCS pulls (hammering OCS + duplicate imports), etc. Gate
+# them to a single instance via an exclusive lock file so exactly one process
+# runs them — regardless of worker count. Set TERROIR_NO_SCHEDULERS=1 on web
+# workers when running a dedicated scheduler process.
+_scheduler_lock_fh = None
+_run_schedulers_cached: bool | None = None
+
+
+def _should_run_schedulers() -> bool:
+    """True only in the one process that should run background schedulers.
+    Acquires a process-lifetime exclusive lock; other workers get False. On
+    non-POSIX (Windows dev / single process) there's no contention, so True."""
+    global _run_schedulers_cached, _scheduler_lock_fh
+    if _run_schedulers_cached is not None:
+        return _run_schedulers_cached
+    if os.environ.get("TERROIR_NO_SCHEDULERS") == "1":
+        _run_schedulers_cached = False
+        return False
+    try:
+        import fcntl  # POSIX only
+    except Exception:
+        _run_schedulers_cached = True   # Windows/dev: single process
+        return True
+    try:
+        lock_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or ".",
+                                 ".terroir-schedulers.lock")
+        fh = open(lock_path, "w")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _scheduler_lock_fh = fh  # held for the process lifetime
+        _run_schedulers_cached = True
+    except OSError:
+        _run_schedulers_cached = False  # another worker holds it
+    return _run_schedulers_cached
+
 
 def _backup_loop():
     """Runs in a daemon thread, sleeps until 3am, runs backup, repeats."""
@@ -122,6 +178,9 @@ def _start_backup_thread():
         return
     if os.environ.get("TERROIR_DISABLE_BACKUPS") == "1":
         print("[backup] Disabled via TERROIR_DISABLE_BACKUPS")
+        return
+    if not _should_run_schedulers():
+        print("[backup] Skipped — another worker owns the schedulers")
         return
     t = threading.Thread(target=_backup_loop, daemon=True, name="backup-scheduler")
     t.start()
@@ -188,6 +247,9 @@ def _start_scraper_thread():
     if os.environ.get("TERROIR_DISABLE_SCRAPER") == "1":
         print("[scraper] Disabled via TERROIR_DISABLE_SCRAPER")
         return
+    if not _should_run_schedulers():
+        print("[scraper] Skipped — another worker owns the schedulers")
+        return
     t = threading.Thread(target=_scraper_loop, daemon=True, name="email-scraper")
     t.start()
     _scraper_thread_started = True
@@ -245,6 +307,9 @@ def _start_ocs_connector_thread():
         return
     if os.environ.get("TERROIR_DISABLE_OCS_CONNECTOR") == "1":
         print("[ocs] Connector scheduler disabled via TERROIR_DISABLE_OCS_CONNECTOR")
+        return
+    if not _should_run_schedulers():
+        print("[ocs] Scheduler skipped — another worker owns the schedulers")
         return
     t = threading.Thread(target=_ocs_connector_loop, daemon=True, name="ocs-connector")
     t.start()
@@ -6890,6 +6955,14 @@ def list_db_backups() -> dict:
 
 
 # ---------------------------------------------------------------------------
+
+@app.get("/healthz")
+def healthz() -> dict:
+    """Trivial liveness probe for load balancers / uptime monitors — no DB, no
+    auth, always fast. Use this for health checks, not /api/health (which counts
+    rows on large tables and touches the DB)."""
+    return {"status": "ok"}
+
 
 @app.get("/api/health")
 def health() -> dict:
