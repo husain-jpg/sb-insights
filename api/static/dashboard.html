@@ -1453,10 +1453,18 @@ async function renderReorder() {
         } },
       { key: 'line_total', label: 'Est. $', type: 'number', align: 'right',
         render: r => r.line_total ? fmt$(r.line_total) : '—' },
-      { key: 'ocs_stock_status', label: 'OCS In-Stock', align: 'right',
-        tooltip: "Whether OCS has this SKU available to order. 'Yes' = in stock, 'No' = out at OCS, '—' = SKU not in current OCS catalog (likely discontinued or an accessory).",
+      { key: 'ocs_stock_status', label: 'OCS Avail.', align: 'right',
+        tooltip: "Whether OCS will deliver this SKU. 'Yes' = in warehouse stock; 'Flow-Through'/'Click-to-Buy' = orderable this cycle via the Order Fill (flow-through ships from the LP, so it's available even when the warehouse shows out); 'No' = out and not in this cycle's Order Fill; '—' = not in the current OCS catalog.",
         render: r => {
           if (r.ocs_stock_status === 'YES') return '<span class="tag tag-accent">Yes</span>';
+          // Orderable via the latest Order Fill even if warehouse stock is "NO"
+          // (flow-through ships from the LP). Don't flag these as out of stock.
+          const inFill = r.order_fill_flow_thru !== null && r.order_fill_flow_thru !== undefined;
+          if (inFill || r.order_fill_back_in_stock || (r.order_fill_available_qty || 0) > 0) {
+            const label = r.order_fill_flow_thru === true ? 'Flow-Through'
+                        : r.order_fill_flow_thru === false ? 'Click-to-Buy' : 'Orderable';
+            return `<span class="tag tag-accent" title="Not in OCS warehouse stock, but available to order this cycle via the Order Fill (${label}).">${label}</span>`;
+          }
           if (r.ocs_stock_status === 'NO') return '<span class="tag tag-critical" style="font-weight: 600;">No</span>';
           return '<span class="muted" title="Not in current OCS catalog">—</span>';
         } },
