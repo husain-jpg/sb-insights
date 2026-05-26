@@ -3629,6 +3629,55 @@ async def import_order_fill_upload(
     return {"ok": True, "location_id": location_id, **result}
 
 
+@app.get("/api/reorder/export-ocs-template")
+def export_ocs_template(store: str | None = None):
+    """Fill the store's latest auto-pulled OrderExport with the engine's reorder
+    quantities and return it ready to upload to OCS — no manual upload needed.
+
+    Single-store only (an order is placed per store). 404 if we don't have an
+    Order Fill for that store yet (run the OCS Connector, or import one).
+    """
+    from io import BytesIO
+    from pathlib import Path as _Path
+    from jobs.ocs_order_fill import fill_template, write_filled_template
+
+    if not store:
+        raise HTTPException(status_code=400,
+                            detail="Select a single store to export an OCS order template.")
+    with db() as conn:
+        row = conn.execute(
+            """SELECT source_file, generated_at FROM order_fill_runs
+               WHERE location_id = ? ORDER BY generated_at DESC, id DESC LIMIT 1""",
+            (store,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404,
+                detail=f"No OCS Order Fill imported for {store} yet — run the OCS Connector "
+                       f"(Settings → OCS Connector) or import one there.")
+        source_file = row[0]
+        # Locate the stored OrderExport file (connector/upload saved it).
+        path = _Path("imports") / "processed" / source_file
+        if not path.exists():
+            path = _Path("imports") / source_file
+        if not path.exists():
+            raise HTTPException(status_code=404,
+                detail=f"Order Fill file for {store} is no longer on disk ({source_file}); "
+                       f"re-run the OCS Connector to refresh it.")
+        try:
+            _lines, filled_df, _summary = fill_template(conn, path, location_id=store)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        out = BytesIO()
+        write_filled_template(filled_df, out)
+        out.seek(0)
+
+    fname = f"OCS_Order_{store}_{date.today().isoformat()}.xlsx"
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
 # ---------------------------------------------------------------------------
 # OCS connector — config + live-validation harness (admin only)
 # ---------------------------------------------------------------------------

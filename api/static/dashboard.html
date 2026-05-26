@@ -1258,9 +1258,15 @@ async function renderReorder() {
             <div class="kicker">OCS Reorder Queue</div>
             <h2 style="white-space: nowrap;">Suggested Weekly Reorder</h2>
           </div>
-          <button id="reorder-excel-btn" class="btn" style="white-space: nowrap;">
-            <span style="font-size: 14px; line-height: 1;">⤓</span> Download Excel
-          </button>
+          <div style="display: flex; gap: 8px;">
+            <button id="reorder-export-ocs-btn" class="btn btn-primary" style="white-space: nowrap;"
+                    title="Fill the selected store's latest OCS order template with these reorder quantities, ready to upload to OCS. Select a single store first.">
+              <span style="font-size: 14px; line-height: 1;">⤒</span> Export to OCS Template
+            </button>
+            <button id="reorder-excel-btn" class="btn" style="white-space: nowrap;">
+              <span style="font-size: 14px; line-height: 1;">⤓</span> Download Excel
+            </button>
+          </div>
         </div>
         <div class="controls-row" style="margin-top: 4px;">
           <input type="search" id="reorder-search" placeholder="Search product name or SKU...">
@@ -1317,61 +1323,6 @@ async function renderReorder() {
 
       <div id="reorder-highlights">${highlightsHTML(data.kpis)}</div>
       <div id="reorder-kpis">${kpiStripHTML(data.kpis)}</div>
-
-      <div class="card" style="margin-bottom: 16px;">
-        <details id="order-fill-panel" style="padding: 0;">
-          <summary style="cursor: pointer; padding: 14px 16px; font-weight: 600; user-select: none; display: flex; align-items: center; justify-content: space-between;">
-            <span>🛒 Build OCS Order from Template</span>
-            <span style="font-size: 11px; color: var(--text-dim); font-weight: 400;">Upload a template from OCS, get it back filled in</span>
-          </summary>
-          <div style="padding: 0 16px 16px; border-top: 1px solid var(--border);">
-            <div style="display: flex; gap: 10px; align-items: end; flex-wrap: wrap; padding: 14px 0;">
-              <div>
-                <label style="display: block; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">Target store</label>
-                <select id="order-fill-store" style="min-width: 200px;">
-                  ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
-                </select>
-              </div>
-              <div>
-                <label style="display: block; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">OCS Template (.xlsx)</label>
-                <input type="file" id="order-fill-file" accept=".xlsx" style="font-size: 12px;">
-              </div>
-              <button id="order-fill-run" class="btn btn-primary" style="height: 34px;">Fill Order</button>
-              <button id="order-fill-download" class="btn" style="height: 34px; display: none;">⬇ Download Filled Template</button>
-              <span id="order-fill-status" style="font-size: 11px; color: var(--text-dim);"></span>
-            </div>
-            <div id="order-fill-result" style="display: none;"></div>
-          </div>
-        </details>
-      </div>
-
-      <div class="card" style="margin-bottom: 16px;">
-        <details id="order-fill-import-panel" style="padding: 0;">
-          <summary style="cursor: pointer; padding: 14px 16px; font-weight: 600; user-select: none; display: flex; align-items: center; justify-content: space-between;">
-            <span>📥 Import OCS Order Fill (availability)</span>
-            <span style="font-size: 11px; color: var(--text-dim); font-weight: 400;">Upload the weekly OrderExport so flow-through items aren't hidden</span>
-          </summary>
-          <div style="padding: 0 16px 16px; border-top: 1px solid var(--border);">
-            <div style="display: flex; gap: 10px; align-items: end; flex-wrap: wrap; padding: 14px 0;">
-              <div>
-                <label style="display: block; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">Store</label>
-                <select id="of-import-store" style="min-width: 200px;">
-                  ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
-                </select>
-              </div>
-              <div>
-                <label style="display: block; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">OCS Order Fill (OrderExport_*.xlsx)</label>
-                <input type="file" id="of-import-file" accept=".xlsx" style="font-size: 12px;">
-              </div>
-              <button id="of-import-run" class="btn btn-primary" style="height: 34px;">Import</button>
-              <span id="of-import-status" style="font-size: 11px; color: var(--text-dim);"></span>
-            </div>
-            <div style="font-size: 11px; color: var(--text-dim);">
-              Order Fill is per-store (each store's order day differs) — pick the store this export is for. Tells the report what OCS will deliver this cycle (flow-through, back-in-stock) so orderable items aren't hidden by a stale "OCS out" status. Updates availability only — reorder quantities are unchanged. Admin only.
-            </div>
-          </div>
-        </details>
-      </div>
 
       <div class="card">
         <div class="summary-bar" id="reorder-summary">
@@ -1719,298 +1670,41 @@ async function renderReorder() {
     });
     search.addEventListener("input", applyTextFilter);
 
-    // ==== OCS Order Builder panel wiring ====
-    const orderFillStore = document.getElementById("order-fill-store");
-    const orderFillFile = document.getElementById("order-fill-file");
-    const orderFillRun = document.getElementById("order-fill-run");
-    const orderFillStatus = document.getElementById("order-fill-status");
-    const orderFillResult = document.getElementById("order-fill-result");
-    const orderFillDownload = document.getElementById("order-fill-download");
-
-    // Default the order-fill store picker to whatever the main filter is set to
-    if (storeFilter.value) orderFillStore.value = storeFilter.value;
-    storeFilter.addEventListener("change", () => {
-      if (storeFilter.value) orderFillStore.value = storeFilter.value;
-    });
-
-    let filledBlob = null;
-    let filledName = null;
-
-    orderFillRun.addEventListener("click", async () => {
-      const file = orderFillFile.files[0];
-      if (!file) {
-        orderFillStatus.textContent = "Select an OCS template file first.";
-        orderFillStatus.style.color = "var(--critical)";
+    // ==== Export to OCS Template ====
+    // Fills the selected store's latest auto-pulled OrderExport with the
+    // engine's reorder quantities and downloads it, ready to upload to OCS.
+    const exportOcsBtn = document.getElementById("reorder-export-ocs-btn");
+    if (exportOcsBtn) exportOcsBtn.addEventListener("click", async () => {
+      const store = storeFilter.value;
+      if (!store) {
+        alert("Select a single store (store filter, top-right) before exporting an OCS order template — orders are placed per store.");
         return;
       }
-      orderFillStatus.textContent = "Processing...";
-      orderFillStatus.style.color = "var(--text-dim)";
-      orderFillResult.style.display = "none";
-      orderFillDownload.style.display = "none";
-      orderFillRun.disabled = true;
-
+      const orig = exportOcsBtn.innerHTML;
+      exportOcsBtn.disabled = true;
+      exportOcsBtn.textContent = "Preparing…";
       try {
-        const formData = new FormData();
-        formData.append("template", file);
-        formData.append("location_id", orderFillStore.value);
-        const res = await fetch("/api/order-fill", { method: "POST", body: formData });
+        const res = await fetch(`/api/reorder/export-ocs-template?store=${encodeURIComponent(store)}`, { credentials: "same-origin" });
         if (!res.ok) {
           const err = await res.json().catch(() => ({ detail: res.statusText }));
-          throw new Error(err.detail || "Fill failed");
+          throw new Error(err.detail || "Export failed");
         }
-        const data = await res.json();
-
-        // Stash the filled xlsx as a blob for download
-        const b64 = data.filled_xlsx_base64;
-        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        filledBlob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-        filledName = (file.name || "order").replace(/\.xlsx$/i, "") + "__FILLED.xlsx";
-
-        orderFillStatus.textContent = "Done. Review below, then download.";
-        orderFillStatus.style.color = "var(--ok, #6a7)";
-        orderFillDownload.style.display = "";
-
-        renderOrderFillResult(data);
-        orderFillResult.style.display = "";
+        const blob = await res.blob();
+        const cd = res.headers.get("content-disposition") || "";
+        const m = cd.match(/filename="?([^"]+)"?/);
+        const fname = m ? m[1] : `OCS_Order_${store}.xlsx`;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
       } catch (e) {
-        orderFillStatus.textContent = "Error: " + e.message;
-        orderFillStatus.style.color = "var(--critical)";
+        alert("Export failed: " + e.message);
       } finally {
-        orderFillRun.disabled = false;
+        exportOcsBtn.disabled = false;
+        exportOcsBtn.innerHTML = orig;
       }
     });
-
-    // Import OCS Order Fill (availability) — admin-only upload. On success,
-    // refetch the reorder data so flow-through items appear immediately.
-    const ofImportRun = document.getElementById("of-import-run");
-    const ofImportFile = document.getElementById("of-import-file");
-    const ofImportStatus = document.getElementById("of-import-status");
-    const ofImportStore = document.getElementById("of-import-store");
-    // Default the Order Fill store picker to the main store filter when set.
-    if (ofImportStore && storeFilter.value) ofImportStore.value = storeFilter.value;
-    storeFilter.addEventListener("change", () => {
-      if (ofImportStore && storeFilter.value) ofImportStore.value = storeFilter.value;
-    });
-    if (ofImportRun) ofImportRun.addEventListener("click", async () => {
-      const file = ofImportFile.files[0];
-      if (!file) {
-        ofImportStatus.textContent = "Select an OrderExport_*.xlsx file first.";
-        ofImportStatus.style.color = "var(--critical)";
-        return;
-      }
-      if (!ofImportStore || !ofImportStore.value) {
-        ofImportStatus.textContent = "Pick the store this Order Fill is for.";
-        ofImportStatus.style.color = "var(--critical)";
-        return;
-      }
-      ofImportStatus.textContent = "Importing...";
-      ofImportStatus.style.color = "var(--text-dim)";
-      ofImportRun.disabled = true;
-      try {
-        const fd = new FormData();
-        fd.append("file", file);
-        fd.append("location_id", ofImportStore.value);
-        const res = await fetch("/api/order-fill/import", { method: "POST", body: fd, credentials: "same-origin" });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({ detail: res.statusText }));
-          throw new Error(err.detail || "Import failed");
-        }
-        const data = await res.json();
-        ofImportStatus.textContent = `Imported ${fmtN(data.rows)} SKUs (generated ${data.generated_at || "?"}). Refreshing…`;
-        ofImportStatus.style.color = "var(--ok, #6a7)";
-        await refetch();   // re-pull /api/reorder so newly-available items show
-        ofImportStatus.textContent = `Imported ${fmtN(data.rows)} SKUs (generated ${data.generated_at || "?"}).`;
-      } catch (e) {
-        ofImportStatus.textContent = "Error: " + e.message;
-        ofImportStatus.style.color = "var(--critical)";
-      } finally {
-        ofImportRun.disabled = false;
-      }
-    });
-
-    orderFillDownload.addEventListener("click", () => {
-      if (!filledBlob) return;
-      const url = URL.createObjectURL(filledBlob);
-      const a = document.createElement("a");
-      a.href = url; a.download = filledName;
-      document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    });
-
-    function renderOrderFillResult(data) {
-      const s = data.summary;
-      const lines = data.lines.slice().sort((a, b) => {
-        // Heroes first, then by urgency, then by line_total desc
-        if (a.is_top_sku !== b.is_top_sku) return b.is_top_sku - a.is_top_sku;
-        const ur = { stockout: 0, critical: 1, high: 2, medium: 3 };
-        const ua = ur[a.urgency] ?? 9, ub = ur[b.urgency] ?? 9;
-        if (ua !== ub) return ua - ub;
-        return b.line_total - a.line_total;
-      });
-
-      const unmetHtml = (s.unmet_engine_recs && s.unmet_engine_recs.length)
-        ? `<div style="margin-top: 14px; padding: 10px 12px; background: rgba(200,100,40,0.06); border: 1px solid rgba(200,100,40,0.2); border-radius: 4px;">
-             <strong style="font-size: 11px;">⚠ ${s.unmet_engine_recs.length} engine recommendation(s) not in this week's OCS template</strong>
-             <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">
-               The engine wants these, but OCS isn't offering them. May need to source elsewhere or wait.
-             </div>
-             <ul style="font-size: 11px; margin: 8px 0 0 18px;">
-               ${s.unmet_engine_recs.slice(0, 10).map(u => `<li>${u.is_top_sku ? '★ ' : ''}[${u.urgency || '?'}] ${escapeHtml(u.product_name)} — need ${u.engine_reorder_units}u</li>`).join("")}
-               ${s.unmet_engine_recs.length > 10 ? `<li style="color: var(--text-dim);">…and ${s.unmet_engine_recs.length - 10} more</li>` : ''}
-             </ul>
-           </div>`
-        : '';
-
-      orderFillResult.innerHTML = `
-        <div style="padding: 12px 0; border-top: 1px solid var(--border);">
-          <div style="display: flex; gap: 20px; flex-wrap: wrap; font-size: 12px; margin-bottom: 10px;">
-            <div>Filled lines: <strong>${s.filled_lines}</strong> <span style="color: #c89b32;">(${s.anchor_filled_lines} Hero)</span></div>
-            <div>Total cases: <strong>${fmtN(s.total_cases)}</strong></div>
-            <div>Est. cost: <strong>${fmt$(s.total_cost)}</strong></div>
-            ${s.clamped_lines > 0 ? `<div style="color: var(--warning, #c89b32);">Clamped: <strong>${s.clamped_lines}</strong></div>` : ''}
-          </div>
-          <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 10px;">
-            You can edit quantities here before downloading. The downloaded file will reflect your edits.
-          </div>
-          <div style="max-height: 500px; overflow: auto; border: 1px solid var(--border); border-radius: 4px;">
-            <table class="data-table" style="width: 100%; font-size: 11px;">
-              <thead>
-                <tr>
-                  <th style="width: 30px;"></th>
-                  <th>Status</th>
-                  <th>Product</th>
-                  <th style="text-align: right;">On hand</th>
-                  <th style="text-align: right;">Vel</th>
-                  <th style="text-align: right;">Pack</th>
-                  <th style="text-align: right;">Cases</th>
-                  <th style="text-align: right;">Line $</th>
-                  <th>Notes</th>
-                </tr>
-              </thead>
-              <tbody id="order-fill-tbody">
-                ${lines.map(l => `
-                  <tr data-sku="${l.sku}" data-pack="${l.pack_size}" data-price="${l.item_price}">
-                    <td>${l.is_top_sku ? '<span title="Hero SKU" style="color: #c89b32;">★</span>' : ''}</td>
-                    <td><span class="tag ${urgencyTagClass(l.urgency)}">${l.urgency || '—'}</span></td>
-                    <td>
-                      <div>${escapeHtml(l.product_name)}</div>
-                      <div class="sku">${l.sku} · ${l.sub_category || ''} · ${l.brand || ''}</div>
-                    </td>
-                    <td style="text-align: right;">${l.on_hand}</td>
-                    <td style="text-align: right;">${l.daily_velocity.toFixed(2)}</td>
-                    <td style="text-align: right;">${l.pack_size}</td>
-                    <td style="text-align: right;"><input type="number" min="0" value="${l.suggested_quantity}" class="qty-input" style="width: 60px; text-align: right;" data-original="${l.suggested_quantity}"></td>
-                    <td style="text-align: right;" class="line-total">${fmt$(l.line_total)}</td>
-                    <td style="font-size: 10px; color: var(--text-dim);">${escapeHtml(l.notes || '')}</td>
-                  </tr>
-                `).join("")}
-              </tbody>
-            </table>
-          </div>
-          ${unmetHtml}
-        </div>
-      `;
-
-      // Wire per-row edits. When user changes a quantity, update line total,
-      // summary totals, and the corresponding row in the filled blob.
-      const tbody = document.getElementById("order-fill-tbody");
-      tbody.addEventListener("input", (ev) => {
-        const t = ev.target;
-        if (!t.classList.contains("qty-input")) return;
-        const row = t.closest("tr");
-        const sku = row.dataset.sku;
-        const pack = parseInt(row.dataset.pack);
-        const price = parseFloat(row.dataset.price);
-        const cases = Math.max(0, parseInt(t.value) || 0);
-        t.value = cases;  // normalize
-        const lineTotal = cases * price;
-        row.querySelector(".line-total").textContent = fmt$(lineTotal);
-
-        // Rebuild the filled xlsx with the edit applied
-        updateFilledBlob(sku, cases);
-        // Recompute summary
-        recomputeOrderFillSummary();
-      });
-    }
-
-    async function updateFilledBlob(sku, cases) {
-      // Reload the blob into a workbook, patch the matching row, re-serialize.
-      // We use SheetJS from the shadcn/CDN — already loaded on page? Check.
-      // Simplest path: keep track of edits and re-fetch a filled version
-      // with user edits merged. But for speed, we'll do in-browser via SheetJS
-      // if available, else the user's edits only affect the preview and they
-      // need to re-download after making edits via a server round-trip.
-      //
-      // For MVP: track user edits as a map, and apply them when user clicks
-      // download by patching the blob client-side.
-      if (!window._orderFillEdits) window._orderFillEdits = {};
-      window._orderFillEdits[sku] = cases;
-    }
-
-    function recomputeOrderFillSummary() {
-      const tbody = document.getElementById("order-fill-tbody");
-      let totalCases = 0, totalCost = 0;
-      tbody.querySelectorAll("tr").forEach(row => {
-        const cases = parseInt(row.querySelector(".qty-input").value) || 0;
-        const price = parseFloat(row.dataset.price);
-        totalCases += cases;
-        totalCost += cases * price;
-      });
-      const bar = orderFillResult.querySelector("div > div");
-      if (bar) {
-        bar.innerHTML = `
-          <div>Filled lines: <strong>${tbody.querySelectorAll("tr").length}</strong></div>
-          <div>Total cases: <strong>${fmtN(totalCases)}</strong></div>
-          <div>Est. cost: <strong>${fmt$(totalCost)}</strong></div>
-        `;
-      }
-    }
-
-    // Override download to apply user edits using SheetJS
-    orderFillDownload.addEventListener("click", async (ev) => {
-      if (!filledBlob) return;
-      const edits = window._orderFillEdits || {};
-      if (!Object.keys(edits).length) return;  // no edits, plain download fires first
-      ev.preventDefault(); ev.stopImmediatePropagation();
-      // Load SheetJS dynamically if needed
-      if (!window.XLSX) {
-        await new Promise((res, rej) => {
-          const s = document.createElement("script");
-          s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-          s.onload = res; s.onerror = rej;
-          document.head.appendChild(s);
-        });
-      }
-      const buf = await filledBlob.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array" });
-      const ws = wb.Sheets["MasterCatalogue"];
-      // Find SKU and Quantity column positions
-      const ref = XLSX.utils.decode_range(ws["!ref"]);
-      const headers = {};
-      for (let c = ref.s.c; c <= ref.e.c; c++) {
-        const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
-        if (cell) headers[cell.v] = c;
-      }
-      const skuCol = headers["SKU"], qtyCol = headers["Quantity"];
-      for (let r = 1; r <= ref.e.r; r++) {
-        const skuCell = ws[XLSX.utils.encode_cell({ r, c: skuCol })];
-        if (!skuCell) continue;
-        const sku = String(skuCell.v);
-        if (sku in edits) {
-          const addr = XLSX.utils.encode_cell({ r, c: qtyCol });
-          ws[addr] = { t: "n", v: edits[sku] };
-        }
-      }
-      const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-      const newBlob = new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      const url = URL.createObjectURL(newBlob);
-      const a = document.createElement("a");
-      a.href = url; a.download = filledName;
-      document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }, true);  // capture phase so this runs BEFORE the plain handler
 
   } catch (e) { showError(e); }
 }
@@ -6167,6 +5861,32 @@ async function renderOcsConnector() {
         </div>
         <div id="ocs-retailers" style="padding: 0 16px 16px;"></div>
       </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);">
+          <strong>Manual Order Fill import</strong>
+          <span style="font-size: 11px; color: var(--text-dim); margin-left: 8px;">Fallback — use only if the nightly auto-pull missed a store's order window</span>
+        </div>
+        <div style="padding: 14px 16px;">
+          <div style="display: flex; gap: 10px; align-items: end; flex-wrap: wrap;">
+            <div>
+              <label style="display:block; font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:4px;">Store</label>
+              <select id="ocs-imp-store" style="min-width: 200px;">
+                ${locs.map(l => `<option value="${l.id}">${escapeHtml(l.short_name || l.name)} (${l.id})</option>`).join("")}
+              </select>
+            </div>
+            <div>
+              <label style="display:block; font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:4px;">OrderExport (.xlsx)</label>
+              <input type="file" id="ocs-imp-file" accept=".xlsx" style="font-size: 12px;">
+            </div>
+            <button class="btn btn-primary" id="ocs-imp-run" style="height: 34px;">Import</button>
+            <span id="ocs-imp-status" style="font-size: 11px; color: var(--text-dim);"></span>
+          </div>
+          <div style="font-size: 11px; color: var(--text-dim); margin-top: 8px;">
+            Per-store. Updates that store's flow-through / back-in-stock availability on the Reorder Report. The connector normally does this automatically each evening.
+          </div>
+        </div>
+      </div>
     `;
 
     const setStatus = (id, msg, ok) => {
@@ -6222,6 +5942,30 @@ async function renderOcsConnector() {
         setStatus("ocs-action-status", `Found ${d.retailers.length} retailer(s) — map each to a store, then Save mapping.`, true);
         renderOcsRetailerMap(d.retailers, cfg.store_map || []);
       } catch (e) { setStatus("ocs-action-status", "Error: " + e.message, false); }
+    });
+
+    // Manual Order Fill import (fallback)
+    const impRun = document.getElementById("ocs-imp-run");
+    if (impRun) impRun.addEventListener("click", async () => {
+      const file = document.getElementById("ocs-imp-file").files[0];
+      const store = document.getElementById("ocs-imp-store").value;
+      if (!file) { setStatus("ocs-imp-status", "Select an OrderExport_*.xlsx file.", false); return; }
+      if (!store) { setStatus("ocs-imp-status", "Pick the store this Order Fill is for.", false); return; }
+      setStatus("ocs-imp-status", "Importing\\u2026");
+      impRun.disabled = true;
+      try {
+        const fd = new FormData();
+        fd.append("file", file);
+        fd.append("location_id", store);
+        const res = await fetch("/api/order-fill/import", { method: "POST", body: fd, credentials: "same-origin" });
+        const d = await res.json().catch(() => ({ detail: res.statusText }));
+        if (!res.ok) throw new Error(d.detail || "Import failed");
+        setStatus("ocs-imp-status", `Imported ${fmtN(d.rows)} SKUs for ${store} (generated ${d.generated_at || "?"}).`, true);
+      } catch (e) {
+        setStatus("ocs-imp-status", "Error: " + e.message, false);
+      } finally {
+        impRun.disabled = false;
+      }
     });
   } catch (e) { showError(e); }
 }
