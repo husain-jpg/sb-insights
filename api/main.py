@@ -5865,6 +5865,10 @@ def _query_period_metrics(conn, start: date, end: date,
 def _derive_metrics(raw: dict) -> dict:
     """Add derived metrics: avg_transaction, margin_dollars, margin_pct, discount_pct."""
     out = dict(raw)
+    # Explicit revenue names: Gross Sales = pre-discount (units x regular price);
+    # Net Sales = Gross less discounts = Cova Subtotal (what we store as revenue).
+    out["gross_sales"] = raw["regular_total"]
+    out["net_sales"] = raw["revenue"]
     out["avg_transaction"] = (raw["revenue"] / raw["transactions"]) if raw["transactions"] else 0
     out["margin_dollars"] = raw["revenue_with_cost"] - raw["cost_total"]
     out["margin_pct"] = (
@@ -5959,6 +5963,8 @@ def sales_performance(
             row["prior"] = prev
             row["delta"] = {
                 "revenue": _diff_pair(curr["revenue"], prev["revenue"]),
+                "gross_sales": _diff_pair(curr["gross_sales"], prev["gross_sales"]),
+                "net_sales": _diff_pair(curr["net_sales"], prev["net_sales"]),
                 "units": _diff_pair(curr["units"], prev["units"]),
                 "transactions": _diff_pair(curr["transactions"], prev["transactions"]),
                 "avg_transaction": _diff_pair(curr["avg_transaction"], prev["avg_transaction"]),

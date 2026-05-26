@@ -3087,7 +3087,8 @@ function renderAnalyticsResult(data) {
 
   // Build header
   const metrics = [
-    {key: 'revenue', label: 'Revenue', fmt: fmt$mini, isPct: false},
+    {key: 'gross_sales', label: 'Gross Sales', fmt: fmt$mini, isPct: false},
+    {key: 'net_sales', label: 'Net Sales', fmt: fmt$mini, isPct: false},
     {key: 'units', label: 'Units', fmt: fmtNum, isPct: false},
     {key: 'transactions', label: 'Transactions', fmt: fmtNum, isPct: false},
     {key: 'avg_transaction', label: 'Avg Txn $', fmt: v => '$' + (v||0).toFixed(2), isPct: false},
