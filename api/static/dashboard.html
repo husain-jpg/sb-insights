@@ -1230,7 +1230,16 @@ async function renderReorder() {
       if (!k) return '';
       const pts = [];
       const doh = k.days_on_hand;
-      if (doh != null) {
+      const reorder$ = k.reorder_cost || 0;
+      const stockout$ = k.stockout_value || 0;
+      const stockoutShare = reorder$ > 0 ? stockout$ / reorder$ : 0;
+      const heavy = doh != null && doh > 28;
+      // When aggregate is heavy BUT the order is mostly stockouts, the issue
+      // is mix (heavy on slow movers, lean on best-sellers) — NOT over-ordering.
+      // Cutting that reorder would just lose sales on the sold-out fast movers.
+      if (heavy && stockoutShare > 0.5) {
+        pts.push(`<strong>Heavy on slow movers, lean on best-sellers</strong> — ~${doh} days on hand overall (target 21–28), but <strong>${fmtN(k.active_stockouts)} selling SKUs are at zero</strong>. About ${Math.round(stockoutShare*100)}% of this week's order (${fmt$(stockout$)}) is refilling those — not over-buying. The overstock is concentrated in slow/dead stock; focus sell-down there.`);
+      } else if (doh != null) {
         if (doh > 35) pts.push(`<strong>Heavily stocked</strong> — ~${doh} days on hand (target 21–28). Tighten ordering: prioritize Hero / high-velocity SKUs and avoid topping up slow movers.`);
         else if (doh > 28) pts.push(`<strong>Slightly heavy</strong> — ~${doh} days on hand (target 21–28). Favor Heroes; ease off slower SKUs.`);
         else if (doh >= 21) pts.push(`<strong>Well-balanced</strong> — ~${doh} days on hand, within the 21–28-day target.`);
@@ -1242,12 +1251,14 @@ async function renderReorder() {
         const pct = oh > 0 ? Math.round(sd / oh * 100) : 0;
         pts.push(`<strong>${fmt$(sd)}${pct ? ` (~${pct}%)` : ''}</strong> hasn't sold in ${k.slow_days}+ days — work it down via clearance/promos before it ages further.`);
       }
-      if (k.active_stockouts > 0) {
+      // Skip the stockout bullet when it's already the lead (would repeat).
+      if (k.active_stockouts > 0 && !(heavy && stockoutShare > 0.5)) {
         pts.push(`<strong>${fmtN(k.active_stockouts)} selling SKUs are stocked out</strong> — these are the priority to restock.`);
       }
       if ((k.weekly_burn_cost || 0) > 0) {
-        const pct = Math.round((k.reorder_cost || 0) / k.weekly_burn_cost * 100);
-        pts.push(`This week's suggested order is <strong>${fmt$(k.reorder_cost)}</strong> — about ${pct}% of a typical week's sales (at cost).`);
+        const pct = Math.round(reorder$ / k.weekly_burn_cost * 100);
+        // Note the mixed cost basis so the ratio isn't read as a 1:1 comparison.
+        pts.push(`This week's suggested order is <strong>${fmt$(reorder$)}</strong> at OCS wholesale — about ${pct}% of weekly sales at actual landed cost.`);
       }
       if (!pts.length) return '';
       return `

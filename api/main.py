@@ -1131,6 +1131,12 @@ def get_reorder(
         "reorder_units": sum(p["reorder_qty"] for p in actionable),
         "reorder_skus": len(actionable),
         "active_stockouts": sum(1 for r in recs if r.urgency == "stockout"),
+        # Cost share of the order that's just filling stockouts (genuine missed
+        # demand). Used by Highlights to tell "you're over-ordering" apart from
+        # "you're heavy on the wrong stock — most of this order is refilling
+        # sold-out best-sellers."
+        "stockout_value": round(sum(p["line_total"] or 0 for p in actionable
+                                    if p["urgency"] == "stockout"), 2),
     }
 
     return {
