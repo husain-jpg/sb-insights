@@ -96,16 +96,14 @@ def _parse_sheet_period(sheet_name: str) -> tuple[int, int] | None:
     return (month, year) if month else None
 
 
-def _select_target_sheet(
-    xl: pd.ExcelFile, target_month: int, target_year: int
-) -> tuple[str, int, int, bool] | None:
-    """Pick the General Listings Works sheet for the given month.
+def _select_latest_sheet(xl: pd.ExcelFile) -> tuple[str, int, int] | None:
+    """Pick the MOST RECENT General Listings Works sheet by parsed date.
 
-    Returns (sheet_name, actual_month, actual_year, exact_match) or None.
-    If the exact target isn't present, falls back to the MOST RECENT
-    General Listings Works sheet in the workbook (by parsed sheet date,
-    not workbook order) — and reports its actual month/year so callers
-    can stamp the period correctly. `exact_match=False` signals fallback.
+    Returns (sheet_name, month, year) or None.
+
+    Period stamping does NOT come from the sheet — each row has explicit
+    Offer Start / Offer End columns. The sheet picker just chooses the
+    freshest snapshot of the IRC deal catalogue.
     """
     candidates: list[tuple[int, int, str]] = []  # (year, month, sheet_name)
     for sheet in xl.sheet_names:
@@ -113,17 +111,50 @@ def _select_target_sheet(
         if parsed is None:
             continue
         month, year = parsed
-        if month == target_month and year == target_year:
-            return (sheet, month, year, True)
         candidates.append((year, month, sheet))
-
     if not candidates:
         return None
-
-    # Most recent fallback (latest year, then latest month within year)
     candidates.sort(reverse=True)
     year, month, sheet = candidates[0]
-    return (sheet, month, year, False)
+    return (sheet, month, year)
+
+
+def _coerce_offer_date(value) -> tuple[str | None, bool]:
+    """Parse a cell from the Offer Start / Offer End columns.
+
+    Returns (iso_date_or_None, is_ongoing).
+    - Datetime / date / pandas Timestamp → ISO string, is_ongoing=False
+    - 'Ongoing' (any case) or blank → (None, True if 'ongoing' else False)
+    - Anything else → (None, False)
+    """
+    if value is None:
+        return (None, False)
+    # pandas-style NaN
+    try:
+        if pd.isna(value):
+            return (None, False)
+    except (TypeError, ValueError):
+        pass
+    # String 'Ongoing'
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("ongoing", "open", "indefinite", ""):
+            return (None, s == "ongoing" or s in ("open", "indefinite"))
+        # Try parsing as a date string
+        try:
+            ts = pd.to_datetime(value, errors="coerce")
+            if pd.isna(ts):
+                return (None, False)
+            return (ts.date().isoformat(), False)
+        except Exception:
+            return (None, False)
+    # datetime / date / Timestamp
+    try:
+        if hasattr(value, "date"):
+            return (value.date().isoformat(), False)
+        return (str(value)[:10], False)
+    except Exception:
+        return (None, False)
 
 
 def _ensure_brand_partner(conn, name: str) -> int:
@@ -161,8 +192,14 @@ def _next_month_period(target_month: int, target_year: int) -> tuple[date, date]
 def import_irc_file(conn, file_path: Path,
                     target_month: int | None = None,
                     target_year: int | None = None) -> dict:
-    """
-    Import IRC General Listings for the target month (default: next calendar month).
+    """Import IRC General Listings — each row's Offer Start / Offer End columns
+    drive the deal validity window. The sheet picker only chooses the freshest
+    snapshot of the catalogue; per-row dates are authoritative.
+
+    Each upload is treated as the canonical IRCC snapshot — all existing IRCC
+    deals are deleted and replaced. To target a non-latest sheet for testing,
+    pass target_month/target_year (otherwise the most recent sheet is used).
+
     Returns stats dict.
     """
     import warnings
@@ -170,48 +207,48 @@ def import_irc_file(conn, file_path: Path,
 
     log.info("Reading IRC buysheet: %s", file_path.name)
 
-    # Default target = current calendar month. IRC's sheet names indicate the
-    # month the deals apply to (e.g. "June 2026 General Listings Works" =
-    # deals valid June 1-30). We import the live month.
-    if target_month is None or target_year is None:
-        today = date.today()
-        target_month, target_year = today.month, today.year
-
     xl = pd.ExcelFile(file_path)
-    selection = _select_target_sheet(xl, target_month, target_year)
-    if not selection:
-        raise ValueError(
-            f"No General Listings Works sheet found in {file_path.name}. "
-            f"Sheets: {xl.sheet_names}"
-        )
 
-    sheet_name, actual_month, actual_year, exact_match = selection
-    if not exact_match:
-        log.warning(
-            "  REQUESTED %s %d but no matching sheet — falling back to most "
-            "recent available: %r. Period will be stamped as %s %d, NOT %s %d. "
-            "Upload a newer file from IRC if you need %s data.",
-            _MONTH_NAMES[target_month], target_year, sheet_name,
-            _MONTH_NAMES[actual_month], actual_year,
-            _MONTH_NAMES[target_month], target_year,
-            _MONTH_NAMES[target_month],
-        )
-        # Use the ACTUAL sheet's month/year — don't mis-label data with the
-        # original ask. Caller still sees both via the return dict.
-        target_month, target_year = actual_month, actual_year
+    # Pick which sheet to load
+    if target_month is not None and target_year is not None:
+        # Caller-specified — used for testing or one-off retro imports
+        target_label = f"{_MONTH_NAMES[target_month]} {target_year}".lower()
+        sheet_name = None
+        for sheet in xl.sheet_names:
+            sl = sheet.lower()
+            if target_label in sl and "general listings" in sl and "works" in sl:
+                sheet_name = sheet
+                break
+        if not sheet_name:
+            raise ValueError(
+                f"No {_MONTH_NAMES[target_month]} {target_year} General Listings "
+                f"Works sheet in {file_path.name}. Sheets: {xl.sheet_names}"
+            )
+        sheet_month, sheet_year = target_month, target_year
+        log.info("  using sheet (caller-specified): %s", sheet_name)
     else:
-        log.info("  using sheet: %s", sheet_name)
+        selection = _select_latest_sheet(xl)
+        if not selection:
+            raise ValueError(
+                f"No General Listings Works sheet found in {file_path.name}. "
+                f"Sheets: {xl.sheet_names}"
+            )
+        sheet_name, sheet_month, sheet_year = selection
+        log.info("  using latest available sheet: %s (%s %d)",
+                 sheet_name, _MONTH_NAMES[sheet_month], sheet_year)
 
     # Header at row 9
     df = pd.read_excel(file_path, sheet_name=sheet_name, header=9)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Required columns
-    required = ["LP", "Brand", "Product", "Data Quality Index (DQI)"]
+    # Required columns — now including per-row date columns
+    required = ["LP", "Brand", "Product", "Data Quality Index (DQI)",
+                "Offer Start", "Offer End"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
-            f"IRC buysheet missing required columns: {missing}. Got: {list(df.columns)[:15]}..."
+            f"IRC buysheet missing required columns: {missing}. "
+            f"Got: {list(df.columns)[:18]}..."
         )
 
     # SKU column varies — try common names
@@ -223,8 +260,8 @@ def import_irc_file(conn, file_path: Path,
     if not sku_col:
         raise ValueError(f"IRC buysheet has no recognized SKU column. Got: {list(df.columns)[:15]}")
 
-    # Drop rows missing critical fields
-    df = df.dropna(subset=["LP", "Brand", "Data Quality Index (DQI)", sku_col]).copy()
+    # Drop rows missing critical fields (Offer Start is required; Offer End may be 'Ongoing'/blank)
+    df = df.dropna(subset=["LP", "Brand", "Data Quality Index (DQI)", sku_col, "Offer Start"]).copy()
 
     # Extract rate from DQI
     df["dqi_str"] = df["Data Quality Index (DQI)"].astype(str).str.strip()
@@ -243,29 +280,43 @@ def import_irc_file(conn, file_path: Path,
     if len(df) == 0:
         raise ValueError(f"No valid rows after parsing rates from {file_path.name}")
 
-    # Period dates
-    start_date, end_date = _next_month_period(target_month, target_year)
-
     # Get partner id
     brand_id = _ensure_brand_partner(conn, PARTNER_NAME)
 
-    # Idempotency: clear existing IRC deals for this period
+    # Idempotency: this upload is the authoritative IRC snapshot — clear ALL
+    # existing IRCC deals before re-inserting from this file.
     cur = conn.cursor()
-    cur.execute("""
-        DELETE FROM data_revenue_deals
-        WHERE brand_id = ? AND start_date = ? AND end_date = ?
-    """, (brand_id, start_date.isoformat(), end_date.isoformat()))
+    cur.execute("DELETE FROM data_revenue_deals WHERE brand_id = ?", (brand_id,))
     deleted = cur.rowcount
 
-    # Insert deals + capture LP info on products
+    # Insert deals (with per-row dates) + capture LP info on products
     inserted = 0
+    ongoing_count = 0
+    bad_start_count = 0
     lp_updates = 0
+    seen_starts: set[str] = set()
+    seen_ends: set[str] = set()
+
     for _, r in df.iterrows():
         sku = str(r[sku_col]).strip()
         rate = float(r["rate_pct"])
         lp = str(r["LP"]).strip() if pd.notna(r.get("LP")) else None
         brand = str(r["Brand"]).strip() if pd.notna(r.get("Brand")) else None
         product = str(r["Product"]).strip() if pd.notna(r.get("Product")) else ""
+
+        # Per-row dates — Offer Start MUST parse, Offer End may be NULL ('Ongoing')
+        start_iso, _ = _coerce_offer_date(r["Offer Start"])
+        if start_iso is None:
+            bad_start_count += 1
+            continue
+        end_iso, is_ongoing = _coerce_offer_date(r["Offer End"])
+        if is_ongoing:
+            ongoing_count += 1
+        # else: end_iso may be None (blank/unparseable) — treat as no expiry too
+
+        seen_starts.add(start_iso)
+        if end_iso:
+            seen_ends.add(end_iso)
 
         notes_parts = [product]
         if brand: notes_parts.append(f"Brand: {brand}")
@@ -277,8 +328,7 @@ def import_irc_file(conn, file_path: Path,
             INSERT INTO data_revenue_deals
                 (brand_id, start_date, end_date, percentage, basis, sku_filter, notes)
             VALUES (?, ?, ?, ?, 'wholesale_cost', ?, ?)
-        """, (brand_id, start_date.isoformat(), end_date.isoformat(),
-              rate, sku, notes))
+        """, (brand_id, start_iso, end_iso, rate, sku, notes))
         inserted += 1
 
         # Update LP on products table if SKU exists
@@ -290,18 +340,37 @@ def import_irc_file(conn, file_path: Path,
             if cur.rowcount > 0:
                 lp_updates += 1
 
+    if bad_start_count:
+        log.warning("  skipped %d rows with unparseable Offer Start", bad_start_count)
+
     conn.commit()
+
+    log.info(
+        "  IRCC import: deleted %d prior, inserted %d new (%d ongoing); "
+        "Offer Start range: %s ... %s; Offer End range: %s ... %s",
+        deleted, inserted, ongoing_count,
+        min(seen_starts) if seen_starts else "?",
+        max(seen_starts) if seen_starts else "?",
+        min(seen_ends) if seen_ends else "?",
+        max(seen_ends) if seen_ends else "(ongoing only)",
+    )
 
     return {
         "type": "buysheet_irc",
         "file_name": file_path.name,
         "partner": PARTNER_NAME,
         "sheet": sheet_name,
-        "period_start": start_date.isoformat(),
-        "period_end": end_date.isoformat(),
-        "fallback_used": not exact_match,
+        "sheet_month": sheet_month,
+        "sheet_year": sheet_year,
         "deals_replaced": deleted,
         "deals_inserted": inserted,
+        "ongoing_deals": ongoing_count,
+        "skipped_bad_start_date": bad_start_count,
+        # Range of per-row dates actually used (for sanity check)
+        "earliest_start": min(seen_starts) if seen_starts else None,
+        "latest_start":   max(seen_starts) if seen_starts else None,
+        "earliest_end":   min(seen_ends) if seen_ends else None,
+        "latest_end":     max(seen_ends) if seen_ends else None,
         "lp_updates": lp_updates,
         "skipped_bundles": int(bundles_count),
         "skipped_parse_fail": int(parse_fail),
