@@ -170,13 +170,12 @@ def import_irc_file(conn, file_path: Path,
 
     log.info("Reading IRC buysheet: %s", file_path.name)
 
-    # Default target = next month from today
+    # Default target = current calendar month. IRC's sheet names indicate the
+    # month the deals apply to (e.g. "June 2026 General Listings Works" =
+    # deals valid June 1-30). We import the live month.
     if target_month is None or target_year is None:
         today = date.today()
-        if today.month == 12:
-            target_month, target_year = 1, today.year + 1
-        else:
-            target_month, target_year = today.month + 1, today.year
+        target_month, target_year = today.month, today.year
 
     xl = pd.ExcelFile(file_path)
     selection = _select_target_sheet(xl, target_month, target_year)
