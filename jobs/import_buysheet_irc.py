@@ -72,22 +72,58 @@ def is_irc_file(file_path: Path) -> bool:
     return bool(IRC_FILENAME_RE.search(file_path.name))
 
 
-def _select_target_sheet(xl: pd.ExcelFile, target_month: int, target_year: int) -> str | None:
-    """Pick the General Listings Works sheet for the given month."""
-    month_names = {
-        1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
-        7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December",
-    }
-    target_label = f"{month_names[target_month]} {target_year}".lower()
+_MONTH_NAMES = {
+    1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+    7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December",
+}
+_MONTH_LOOKUP = {name.lower(): num for num, name in _MONTH_NAMES.items()}
+
+# Sheet name like "May 2026 General Listings Works" or truncated "May 2026 General Listings Wor"
+SHEET_MONTH_RE = re.compile(
+    r"^(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(\d{4})\s+General\s+Listings\s+Wor",
+    re.IGNORECASE,
+)
+
+
+def _parse_sheet_period(sheet_name: str) -> tuple[int, int] | None:
+    """Extract (month, year) from a sheet name like 'May 2026 General Listings Works'."""
+    m = SHEET_MONTH_RE.match(sheet_name.strip())
+    if not m:
+        return None
+    month = _MONTH_LOOKUP.get(m.group(1).lower())
+    year = int(m.group(2))
+    return (month, year) if month else None
+
+
+def _select_target_sheet(
+    xl: pd.ExcelFile, target_month: int, target_year: int
+) -> tuple[str, int, int, bool] | None:
+    """Pick the General Listings Works sheet for the given month.
+
+    Returns (sheet_name, actual_month, actual_year, exact_match) or None.
+    If the exact target isn't present, falls back to the MOST RECENT
+    General Listings Works sheet in the workbook (by parsed sheet date,
+    not workbook order) — and reports its actual month/year so callers
+    can stamp the period correctly. `exact_match=False` signals fallback.
+    """
+    candidates: list[tuple[int, int, str]] = []  # (year, month, sheet_name)
     for sheet in xl.sheet_names:
-        sl = sheet.lower()
-        if target_label in sl and "general listings" in sl and "works" in sl:
-            return sheet
-    # Fallback — any "General Listings Works" sheet
-    for sheet in xl.sheet_names:
-        if "general listings" in sheet.lower() and "works" in sheet.lower():
-            return sheet
-    return None
+        parsed = _parse_sheet_period(sheet)
+        if parsed is None:
+            continue
+        month, year = parsed
+        if month == target_month and year == target_year:
+            return (sheet, month, year, True)
+        candidates.append((year, month, sheet))
+
+    if not candidates:
+        return None
+
+    # Most recent fallback (latest year, then latest month within year)
+    candidates.sort(reverse=True)
+    year, month, sheet = candidates[0]
+    return (sheet, month, year, False)
 
 
 def _ensure_brand_partner(conn, name: str) -> int:
@@ -143,14 +179,29 @@ def import_irc_file(conn, file_path: Path,
             target_month, target_year = today.month + 1, today.year
 
     xl = pd.ExcelFile(file_path)
-    sheet_name = _select_target_sheet(xl, target_month, target_year)
-    if not sheet_name:
+    selection = _select_target_sheet(xl, target_month, target_year)
+    if not selection:
         raise ValueError(
-            f"No General Listings Works sheet found for {target_month}/{target_year} "
-            f"in {file_path.name}. Sheets: {xl.sheet_names}"
+            f"No General Listings Works sheet found in {file_path.name}. "
+            f"Sheets: {xl.sheet_names}"
         )
 
-    log.info("  using sheet: %s", sheet_name)
+    sheet_name, actual_month, actual_year, exact_match = selection
+    if not exact_match:
+        log.warning(
+            "  REQUESTED %s %d but no matching sheet — falling back to most "
+            "recent available: %r. Period will be stamped as %s %d, NOT %s %d. "
+            "Upload a newer file from IRC if you need %s data.",
+            _MONTH_NAMES[target_month], target_year, sheet_name,
+            _MONTH_NAMES[actual_month], actual_year,
+            _MONTH_NAMES[target_month], target_year,
+            _MONTH_NAMES[target_month],
+        )
+        # Use the ACTUAL sheet's month/year — don't mis-label data with the
+        # original ask. Caller still sees both via the return dict.
+        target_month, target_year = actual_month, actual_year
+    else:
+        log.info("  using sheet: %s", sheet_name)
 
     # Header at row 9
     df = pd.read_excel(file_path, sheet_name=sheet_name, header=9)
@@ -249,6 +300,7 @@ def import_irc_file(conn, file_path: Path,
         "sheet": sheet_name,
         "period_start": start_date.isoformat(),
         "period_end": end_date.isoformat(),
+        "fallback_used": not exact_match,
         "deals_replaced": deleted,
         "deals_inserted": inserted,
         "lp_updates": lp_updates,
