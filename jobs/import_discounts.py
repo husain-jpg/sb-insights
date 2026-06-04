@@ -22,8 +22,14 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# Filename pattern for Cova Discounts exports — accepts both .xlsx and .csv
-DISCOUNTS_FILENAME_RE = re.compile(r"^Discounts.*\.(xlsx?|csv)$", re.IGNORECASE)
+# Filename pattern for Cova Discounts exports — accepts both .xlsx and .csv.
+# Allow an optional prefix (e.g. the email-scraper's "YYYYMMDD-HHMMSS_" stamp)
+# before the "Discounts" token. Match start-of-name OR any non-word boundary
+# so we don't false-positive on something like "FooDiscountsReport.xlsx".
+DISCOUNTS_FILENAME_RE = re.compile(
+    r"(?:^|[_\-\s/\\])Discounts.*\.(xlsx?|csv)$",
+    re.IGNORECASE,
+)
 
 # Required columns the Discounts report must have. Used to validate
 # files after metadata rows are skipped.
