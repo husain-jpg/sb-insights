@@ -48,7 +48,14 @@ DQI_ORDINAL_RE = re.compile(r"^(ST|ND|RD|TH)([A-Z]|$)", re.IGNORECASE)
 
 
 def parse_dqi_rate(dqi: str) -> float | None:
-    """Extract rebate percentage from a DQI code, or None if unparseable."""
+    """Extract rebate percentage from a DQI code, or None if unparseable.
+
+    Defensive guard: any rate >= 100% is treated as a parse failure. IRC
+    rebates are always in 0-99 range; values above that come from chunks
+    like '0410X' where the regex grabs '0410' as a 4-digit numeric prefix
+    that isn't really a rate. Better to skip + log than to silently load
+    a 410% discount.
+    """
     m = DQI_CHUNK_RE.search(dqi)
     if not m:
         return None
@@ -63,9 +70,13 @@ def parse_dqi_rate(dqi: str) -> float | None:
     if DQI_ORDINAL_RE.match(rest) and len(rate_str) > 1 and '.' not in rate_str:
         rate_str = rate_str[:-1]
     try:
-        return float(rate_str)
+        rate = float(rate_str)
     except ValueError:
         return None
+    # Sanity guard — reject obviously-malformed extractions
+    if rate >= 100:
+        return None
+    return rate
 
 
 def is_irc_file(file_path: Path) -> bool:
