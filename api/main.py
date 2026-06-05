@@ -5227,7 +5227,8 @@ def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None =
 
 
 @app.post("/api/data-revenue-deals")
-def create_data_revenue_deal(payload: dict = Body(...)) -> dict:
+def create_data_revenue_deal(payload: dict = Body(...),
+                             _admin: dict = Depends(require_admin)) -> dict:
     brand_id = payload.get("brand_id")
     start_date = payload.get("start_date")
     percentage = payload.get("percentage")
@@ -5255,7 +5256,8 @@ def create_data_revenue_deal(payload: dict = Body(...)) -> dict:
 
 
 @app.put("/api/data-revenue-deals/{deal_id}")
-def update_data_revenue_deal(deal_id: int, payload: dict = Body(...)) -> dict:
+def update_data_revenue_deal(deal_id: int, payload: dict = Body(...),
+                             _admin: dict = Depends(require_admin)) -> dict:
     fields, params = [], []
     valid = ("brand_id", "start_date", "end_date", "percentage", "basis", "sku_filter", "notes")
     for k in valid:
@@ -5274,7 +5276,8 @@ def update_data_revenue_deal(deal_id: int, payload: dict = Body(...)) -> dict:
 
 
 @app.delete("/api/data-revenue-deals/{deal_id}")
-def delete_data_revenue_deal(deal_id: int) -> dict:
+def delete_data_revenue_deal(deal_id: int,
+                             _admin: dict = Depends(require_admin)) -> dict:
     with db() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM data_revenue_deals WHERE id = ?", (deal_id,))

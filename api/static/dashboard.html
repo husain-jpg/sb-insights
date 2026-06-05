@@ -3335,10 +3335,13 @@ async function renderBrandsSection(container) {
 }
 
 async function renderDealsSection(container) {
-  const [brands, deals] = await Promise.all([
+  const [brands, deals, me] = await Promise.all([
     api("/api/brand-partners?active_only=true"),
     api("/api/data-revenue-deals"),
+    api("/api/auth/me"),
   ]);
+
+  const isAdmin = me && me.logged_in && me.role === 'admin';
 
   if (brands.length === 0) {
     container.innerHTML = `<div class="card" style="padding: 24px; text-align: center; color: var(--text-dim);">Add a Collective first before creating deals.</div>`;
@@ -3346,6 +3349,8 @@ async function renderDealsSection(container) {
   }
 
   const today = new Date().toISOString().slice(0,10);
+  const now = new Date();
+  const monthStartIso = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0,10);
 
   // Format date as "Apr 30, 2026"
   const fmtDealDate = (d) => {
@@ -3356,7 +3361,39 @@ async function renderDealsSection(container) {
     } catch { return d; }
   };
 
-  container.innerHTML = `
+  // Parse the import-generated notes format:
+  //   "Product Name | Brand: X | LP: Y | DQI: Z" (IRC)
+  //   "Product Name | Brand: X | LP: Y | Flag: F" (Canna)
+  // Manually-entered free-text notes (no "Brand:"/"LP:" markers) get
+  // shoved into Product Name so nothing's hidden.
+  function parseDealNotes(notes) {
+    if (!notes) return { product: '', brand: '', lp: '' };
+    const parts = notes.split('|').map(s => s.trim()).filter(Boolean);
+    let product = '', brand = '', lp = '';
+    let i = 0;
+    // Treat first chunk as Product Name unless it's a key:value marker
+    if (parts.length && !/^(Brand|LP|DQI|Flag)\s*:/i.test(parts[0])) {
+      product = parts[0]; i = 1;
+    }
+    for (; i < parts.length; i++) {
+      const m = parts[i].match(/^(Brand|LP)\s*:\s*(.+)$/i);
+      if (!m) continue;
+      if (m[1].toLowerCase() === 'brand') brand = m[2].trim();
+      else if (m[1].toLowerCase() === 'lp') lp = m[2].trim();
+    }
+    // Fallback: if NOTHING parsed (raw freeform note), show entire string as product
+    if (!product && !brand && !lp) product = notes;
+    return { product, brand, lp };
+  }
+
+  // "NEW" badge = created this calendar month
+  const isNewThisMonth = (createdAt) => {
+    if (!createdAt) return false;
+    return String(createdAt).slice(0, 10) >= monthStartIso;
+  };
+
+  // Read-only admin notice for non-admins; full add-deal form for admins
+  const addDealPanel = isAdmin ? `
     <div class="card" style="padding: 16px; margin-bottom: 14px;">
       <div style="display: flex; gap: 8px; align-items: end; flex-wrap: wrap;">
         <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">Filter by Collective</label><br>
@@ -3387,10 +3424,26 @@ async function renderDealsSection(container) {
       <div style="margin-top: 8px; font-size: 11px; color: var(--text-dim);">
         Notes: <input id="d-notes" type="text" placeholder="optional context — e.g. SKU #, LP, product name" style="width: 400px;">
       </div>
-    </div>
+    </div>` : `
+    <div class="card" style="padding: 12px 16px; margin-bottom: 14px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap;">
+      <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">Filter by Collective</label><br>
+        <select id="d-filter-brand" style="min-width: 180px;">
+          <option value="">All Collectives</option>
+          ${brands.map(b => `<option value="${b.id}">${escapeHtml(b.brand_name)}</option>`).join("")}
+        </select></div>
+      <div style="flex: 1; font-size: 11px; color: var(--text-dim);">
+        <strong style="color: var(--text);">Read-only view.</strong>
+        Editing collective deals is restricted to admin users — contact an admin if changes are needed.
+      </div>
+    </div>`;
+
+  container.innerHTML = `
+    ${addDealPanel}
     <div class="card"><div id="deals-table"></div></div>
   `;
 
+  // Column set. Notes column is split into Product Name / Brand / LP.
+  // Delete action only present for admins; non-admins see no actions column.
   const cols = [
     { key: 'brand_name', label: 'Collective Name', render: r => escapeHtml(r.brand_name || '?') },
     { key: 'start_date', label: 'Active Period Start',
@@ -3400,13 +3453,28 @@ async function renderDealsSection(container) {
     { key: 'percentage', label: '%', type: 'number', align: 'right',
       render: r => `${(r.percentage).toFixed(2)}%` },
     { key: 'basis', label: 'Basis',
-      render: r => ({ retail_sales: 'Retail $', wholesale_cost: 'Wholesale $', gross_profit: 'GP', units_sold: 'Units' })[r.basis] || r.basis },
-    { key: 'notes', label: 'Notes',
-      tooltip: 'Add SKU #, LP, product name etc. for context.',
-      render: r => `<div style="max-width: 320px; white-space: normal; font-size: 11px;">${escapeHtml(r.notes || '—')}</div>` },
-    { key: '__actions', label: '', sortable: false,
-      render: r => `<button class="btn-link" data-act="del-deal" data-id="${r.id}">Delete</button>` },
+      render: r => {
+        const txt = ({ retail_sales: 'Retail $', wholesale_cost: 'Wholesale $',
+                       gross_profit: 'GP', units_sold: 'Units' })[r.basis] || r.basis;
+        return `<span style="white-space: nowrap;">${escapeHtml(txt)}</span>`;
+      } },
+    { key: 'product', label: 'Product Name',
+      render: r => {
+        const { product } = parseDealNotes(r.notes);
+        const newTag = isNewThisMonth(r.created_at)
+          ? `<span style="display: inline-block; background: var(--accent, #4ea1f3); color: #fff; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-right: 6px; vertical-align: 1px; letter-spacing: 0.04em;">NEW</span>`
+          : '';
+        return `<div style="max-width: 260px; font-size: 11px;">${newTag}${escapeHtml(product || '—')}</div>`;
+      } },
+    { key: 'brand', label: 'Brand',
+      render: r => `<span style="font-size: 11px;">${escapeHtml(parseDealNotes(r.notes).brand || '—')}</span>` },
+    { key: 'lp', label: 'LP',
+      render: r => `<span style="font-size: 11px;">${escapeHtml(parseDealNotes(r.notes).lp || '—')}</span>` },
   ];
+  if (isAdmin) {
+    cols.push({ key: '__actions', label: '', sortable: false,
+      render: r => `<button class="btn-link" data-act="del-deal" data-id="${r.id}">Delete</button>` });
+  }
 
   // Render with filter applied
   const renderFiltered = () => {
@@ -3419,36 +3487,40 @@ async function renderDealsSection(container) {
   renderFiltered();
   document.getElementById("d-filter-brand").addEventListener("change", renderFiltered);
 
-  document.getElementById("d-add-btn").addEventListener("click", async () => {
-    const pct = parseFloat(document.getElementById("d-pct").value);
-    if (isNaN(pct) || pct < 0 || pct > 100) { alert("Percentage must be 0-100"); return; }
-    const payload = {
-      brand_id: parseInt(document.getElementById("d-brand").value),
-      start_date: document.getElementById("d-start").value,
-      end_date: document.getElementById("d-end").value || null,
-      percentage: pct,
-      basis: document.getElementById("d-basis").value,
-      sku_filter: document.getElementById("d-skus").value.trim() || null,
-      notes: document.getElementById("d-notes").value.trim() || null,
-    };
-    if (!payload.start_date) { alert("Start date required"); return; }
-    try {
-      const res = await fetch("/api/data-revenue-deals", {
-        method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) { const e = await res.json(); alert(`Could not add: ${e.detail}`); return; }
-      await renderDealsSection(container);
-    } catch (e) { alert("Error: " + e.message); }
-  });
+  // Admin-only handlers: the add-deal form + delete action only exist for
+  // admin viewers, so guard the wiring (querySelector returns null otherwise).
+  if (isAdmin) {
+    document.getElementById("d-add-btn").addEventListener("click", async () => {
+      const pct = parseFloat(document.getElementById("d-pct").value);
+      if (isNaN(pct) || pct < 0 || pct > 100) { alert("Percentage must be 0-100"); return; }
+      const payload = {
+        brand_id: parseInt(document.getElementById("d-brand").value),
+        start_date: document.getElementById("d-start").value,
+        end_date: document.getElementById("d-end").value || null,
+        percentage: pct,
+        basis: document.getElementById("d-basis").value,
+        sku_filter: document.getElementById("d-skus").value.trim() || null,
+        notes: document.getElementById("d-notes").value.trim() || null,
+      };
+      if (!payload.start_date) { alert("Start date required"); return; }
+      try {
+        const res = await fetch("/api/data-revenue-deals", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) { const e = await res.json(); alert(`Could not add: ${e.detail}`); return; }
+        await renderDealsSection(container);
+      } catch (e) { alert("Error: " + e.message); }
+    });
 
-  document.getElementById("deals-table").addEventListener("click", async (e) => {
-    const btn = e.target;
-    if (btn.dataset.act !== "del-deal") return;
-    if (!confirm("Delete this deal? This cannot be undone.")) return;
-    await fetch(`/api/data-revenue-deals/${btn.dataset.id}`, { method: "DELETE" });
-    await renderDealsSection(container);
-  });
+    document.getElementById("deals-table").addEventListener("click", async (e) => {
+      const btn = e.target;
+      if (btn.dataset.act !== "del-deal") return;
+      if (!confirm("Delete this deal? This cannot be undone.")) return;
+      await fetch(`/api/data-revenue-deals/${btn.dataset.id}`, { method: "DELETE" });
+      await renderDealsSection(container);
+    });
+  }
 }
 
 async function renderLtosSection(container) {
