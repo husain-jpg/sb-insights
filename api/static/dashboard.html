@@ -293,6 +293,19 @@
   .sticky-cols-4 thead th:nth-child(4),
   .sticky-cols-4 tbody td:nth-child(4) { left: 400px; }
 
+  /* Promos table override — col 1 is just a small tier badge so the default
+     220px col-2 left offset leaves a giant gap. Tighten offsets to match
+     the actual column widths. Dead-stock table (#ds-table) keeps the
+     default offsets since its col 1 is wider. */
+  #promos-table.sticky-cols-4 thead th:nth-child(1),
+  #promos-table.sticky-cols-4 tbody td:nth-child(1) { left: 0; min-width: 70px; max-width: 80px; text-align: center; }
+  #promos-table.sticky-cols-4 thead th:nth-child(2),
+  #promos-table.sticky-cols-4 tbody td:nth-child(2) { left: 80px; }
+  #promos-table.sticky-cols-4 thead th:nth-child(3),
+  #promos-table.sticky-cols-4 tbody td:nth-child(3) { left: 320px; }
+  #promos-table.sticky-cols-4 thead th:nth-child(4),
+  #promos-table.sticky-cols-4 tbody td:nth-child(4) { left: 390px; }
+
   /* Tables in sticky-col mode need horizontal scroll on their wrapper. */
   .table-scroll { overflow-x: auto; }
   .sku {
@@ -4622,8 +4635,8 @@ async function renderPromos() {
     };
 
     const columns = [
-      { key: 'suggested_discount_pct', label: 'Suggested Discount Tier',
-        tooltip: 'Recommended discount based on days since last received.',
+      { key: 'suggested_discount_pct', label: 'Tier',
+        tooltip: 'Recommended discount tier based on days since last received: 3MO→5%, 4MO→10%, 5MO→15%, 6MO+→20%.',
         render: r => tierTag(r.suggested_discount_pct, r.suggested_tier_label) },
       { key: 'product_name', label: 'Product',
         render: r => `${rebateBadgeHtml(r)}${escapeHtml(r.product_name)}<div class="sku">${r.sku} · ${r.brand || '—'}</div>` },
