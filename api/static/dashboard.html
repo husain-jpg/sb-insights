@@ -4543,7 +4543,23 @@ async function renderPromos() {
             <option value="no">No rebate only</option>
           </select>
           <input type="search" id="promos-search" placeholder="Search...">
-          <span class="tag tag-warning" id="promos-summary">…</span>
+        </div>
+      </div>
+
+      <div id="promos-kpis" style="display: grid; grid-template-columns: repeat(3, minmax(160px, 1fr)); gap: 10px; margin: 0 0 12px 0;">
+        <div class="card" style="padding: 12px 14px;">
+          <div style="font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">SKUs Eligible</div>
+          <div id="promos-kpi-count" style="font-size: 22px; font-weight: 600; margin-top: 2px;">—</div>
+        </div>
+        <div class="card" style="padding: 12px 14px;">
+          <div style="font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Retail Value at Risk</div>
+          <div id="promos-kpi-retail" style="font-size: 22px; font-weight: 600; margin-top: 2px;">—</div>
+          <div style="font-size: 10px; color: var(--text-faint); margin-top: 2px;">on-hand × current price</div>
+        </div>
+        <div class="card" style="padding: 12px 14px;">
+          <div style="font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Cost of Suggested Discount</div>
+          <div id="promos-kpi-disc" style="font-size: 22px; font-weight: 600; margin-top: 2px;">—</div>
+          <div style="font-size: 10px; color: var(--text-faint); margin-top: 2px;">if applied across all units</div>
         </div>
       </div>
 
@@ -4686,8 +4702,9 @@ async function renderPromos() {
       const data = await api(`/api/suggested-promos?${params.toString()}`);
       currentData = data.items;
       const t = data.totals;
-      document.getElementById("promos-summary").textContent =
-        `${data.count} SKUs · ${fmt$(t.retail_value_at_risk)} retail · ${fmt$(t.estimated_discount_total)} disc. cost`;
+      document.getElementById("promos-kpi-count").textContent  = data.count.toLocaleString();
+      document.getElementById("promos-kpi-retail").textContent = fmt$(t.retail_value_at_risk);
+      document.getElementById("promos-kpi-disc").textContent   = fmt$(t.estimated_discount_total);
       redraw();
     };
 
