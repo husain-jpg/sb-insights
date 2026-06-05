@@ -5205,11 +5205,18 @@ def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None =
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     with db() as conn:
         cur = conn.cursor()
+        # Category resolved via the SKU filter — OCS catalogue first (76%
+        # coverage on current deals), fall back to products.category. NULL
+        # when neither maps. Keeps the join in SQL so the frontend doesn't
+        # need a second round-trip.
         cur.execute(f"""
             SELECT d.id, d.brand_id, b.brand_name, d.start_date, d.end_date,
-                   d.percentage, d.basis, d.sku_filter, d.notes, d.created_at
+                   d.percentage, d.basis, d.sku_filter, d.notes, d.created_at,
+                   COALESCE(oc.category, p.category) AS category
             FROM data_revenue_deals d
             LEFT JOIN brand_partners b ON b.id = d.brand_id
+            LEFT JOIN ocs_catalog   oc ON oc.ocs_variant_number = d.sku_filter
+            LEFT JOIN products      p  ON p.ocs_variant_number  = d.sku_filter
             {where_sql}
             ORDER BY d.start_date DESC, d.id DESC
         """, params)
@@ -5221,6 +5228,7 @@ def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None =
                 "start_date": r[3], "end_date": r[4],
                 "percentage": r[5], "basis": r[6],
                 "sku_filter": r[7], "notes": r[8], "created_at": r[9],
+                "category": r[10],
                 "is_archived": is_archived,
             })
         return out

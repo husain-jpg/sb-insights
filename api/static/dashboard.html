@@ -3392,32 +3392,74 @@ async function renderDealsSection(container) {
     return String(createdAt).slice(0, 10) >= monthStartIso;
   };
 
-  // Read-only admin notice for non-admins; full add-deal form for admins
-  const addDealPanel = isAdmin ? `
-    <div class="card" style="padding: 16px; margin-bottom: 14px;">
-      <div style="display: flex; gap: 8px; align-items: end; flex-wrap: wrap;">
-        <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">Filter by Collective</label><br>
-          <select id="d-filter-brand" style="min-width: 180px;">
+  // Pre-parse notes onto each deal — cell renderers + filters read these
+  // instead of re-running the regex on every paint.
+  for (const d of deals) {
+    const parsed = parseDealNotes(d.notes);
+    d._product = parsed.product;
+    d._brand   = parsed.brand;
+    d._lp      = parsed.lp;
+  }
+
+  // Build distinct value lists for the filter dropdowns
+  const sortUnique = (arr) => [...new Set(arr.filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const distinctCats   = sortUnique(deals.map(d => d.category));
+  const distinctVend   = sortUnique(deals.map(d => d._brand));
+  const distinctLPs    = sortUnique(deals.map(d => d._lp));
+  const labelStyle = 'font-size: 10px; color: var(--text-dim); text-transform: uppercase;';
+
+  // Always-visible filter row (admin + non-admin both get the same filters)
+  const filtersCard = `
+    <div class="card" style="padding: 12px 16px; margin-bottom: 12px;">
+      <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: end;">
+        <div><label style="${labelStyle}">Collective</label><br>
+          <select id="d-filter-brand" style="min-width: 160px;">
             <option value="">All Collectives</option>
             ${brands.map(b => `<option value="${b.id}">${escapeHtml(b.brand_name)}</option>`).join("")}
           </select></div>
-        <div style="flex: 1;"></div>
-        <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">Add Deal: Collective</label><br>
+        <div><label style="${labelStyle}">Category</label><br>
+          <select id="d-filter-cat" style="min-width: 130px;">
+            <option value="">All Categories</option>
+            ${distinctCats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
+          </select></div>
+        <div><label style="${labelStyle}">Brand</label><br>
+          <select id="d-filter-vendor" style="min-width: 160px;">
+            <option value="">All Brands</option>
+            ${distinctVend.map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join("")}
+          </select></div>
+        <div><label style="${labelStyle}">LP</label><br>
+          <select id="d-filter-lp" style="min-width: 160px;">
+            <option value="">All LPs</option>
+            ${distinctLPs.map(l => `<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join("")}
+          </select></div>
+        <div style="flex: 1; min-width: 200px;"><label style="${labelStyle}">Search (product name or SKU)</label><br>
+          <input id="d-filter-text" type="text" placeholder="type to filter..." style="width: 100%;"></div>
+        <button id="d-filter-clear" class="btn-link" style="white-space: nowrap;">Clear filters</button>
+      </div>
+      <div id="d-filter-count" style="font-size: 11px; color: var(--text-dim); margin-top: 8px;"></div>
+    </div>`;
+
+  // Read-only admin notice for non-admins; full add-deal form for admins
+  const addDealPanel = isAdmin ? `
+    <div class="card" style="padding: 16px; margin-bottom: 14px;">
+      <div style="font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 8px;">Add a Manual Deal</div>
+      <div style="display: flex; gap: 8px; align-items: end; flex-wrap: wrap;">
+        <div><label style="${labelStyle}">Collective</label><br>
           <select id="d-brand">${brands.map(b => `<option value="${b.id}">${escapeHtml(b.brand_name)}</option>`).join("")}</select></div>
-        <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">Start</label><br>
+        <div><label style="${labelStyle}">Start</label><br>
           <input id="d-start" type="date" value="${today}"></div>
-        <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">End (blank = open)</label><br>
+        <div><label style="${labelStyle}">End (blank = open)</label><br>
           <input id="d-end" type="date"></div>
-        <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">%</label><br>
+        <div><label style="${labelStyle}">%</label><br>
           <input id="d-pct" type="number" step="0.1" min="0" max="100" placeholder="3.0" style="width: 80px;"></div>
-        <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">Basis</label><br>
+        <div><label style="${labelStyle}">Basis</label><br>
           <select id="d-basis">
             <option value="retail_sales">% of retail sales</option>
             <option value="wholesale_cost">% of wholesale cost</option>
             <option value="gross_profit">% of gross profit</option>
             <option value="units_sold">% of units sold</option>
           </select></div>
-        <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">SKU filter (optional)</label><br>
+        <div><label style="${labelStyle}">SKU filter (optional)</label><br>
           <input id="d-skus" type="text" placeholder="comma-sep, blank = all" style="width: 220px;"></div>
         <button id="d-add-btn">+ Add deal</button>
       </div>
@@ -3425,67 +3467,99 @@ async function renderDealsSection(container) {
         Notes: <input id="d-notes" type="text" placeholder="optional context — e.g. SKU #, LP, product name" style="width: 400px;">
       </div>
     </div>` : `
-    <div class="card" style="padding: 12px 16px; margin-bottom: 14px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap;">
-      <div><label style="font-size: 10px; color: var(--text-dim); text-transform: uppercase;">Filter by Collective</label><br>
-        <select id="d-filter-brand" style="min-width: 180px;">
-          <option value="">All Collectives</option>
-          ${brands.map(b => `<option value="${b.id}">${escapeHtml(b.brand_name)}</option>`).join("")}
-        </select></div>
-      <div style="flex: 1; font-size: 11px; color: var(--text-dim);">
-        <strong style="color: var(--text);">Read-only view.</strong>
-        Editing collective deals is restricted to admin users — contact an admin if changes are needed.
-      </div>
+    <div class="card" style="padding: 10px 16px; margin-bottom: 14px; font-size: 11px; color: var(--text-dim);">
+      <strong style="color: var(--text);">Read-only view.</strong>
+      Editing collective deals is restricted to admin users — contact an admin if changes are needed.
     </div>`;
 
   container.innerHTML = `
+    ${filtersCard}
     ${addDealPanel}
     <div class="card"><div id="deals-table"></div></div>
   `;
 
-  // Column set. Notes column is split into Product Name / Brand / LP.
+  // Column set. Notes column is split into Product Name / Brand / LP / Category.
   // Delete action only present for admins; non-admins see no actions column.
+  // Row renderers read the pre-parsed _product/_brand/_lp set above.
   const cols = [
     { key: 'brand_name', label: 'Collective Name', render: r => escapeHtml(r.brand_name || '?') },
+    { key: 'category',   label: 'Category',
+      render: r => `<span style="font-size: 11px;">${escapeHtml(r.category || '—')}</span>` },
     { key: 'start_date', label: 'Active Period Start',
       render: r => fmtDealDate(r.start_date) },
-    { key: 'end_date', label: 'Active Period End',
+    { key: 'end_date',   label: 'Active Period End',
       render: r => r.end_date ? fmtDealDate(r.end_date) : '<em style="color: var(--text-faint);">open</em>' },
     { key: 'percentage', label: '%', type: 'number', align: 'right',
       render: r => `${(r.percentage).toFixed(2)}%` },
-    { key: 'basis', label: 'Basis',
+    { key: 'basis',      label: 'Basis',
       render: r => {
         const txt = ({ retail_sales: 'Retail $', wholesale_cost: 'Wholesale $',
                        gross_profit: 'GP', units_sold: 'Units' })[r.basis] || r.basis;
         return `<span style="white-space: nowrap;">${escapeHtml(txt)}</span>`;
       } },
-    { key: 'product', label: 'Product Name',
+    { key: '_product',   label: 'Product Name',
       render: r => {
-        const { product } = parseDealNotes(r.notes);
         const newTag = isNewThisMonth(r.created_at)
           ? `<span style="display: inline-block; background: var(--accent, #4ea1f3); color: #fff; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-right: 6px; vertical-align: 1px; letter-spacing: 0.04em;">NEW</span>`
           : '';
-        return `<div style="max-width: 260px; font-size: 11px;">${newTag}${escapeHtml(product || '—')}</div>`;
+        return `<div style="max-width: 260px; font-size: 11px;">${newTag}${escapeHtml(r._product || '—')}</div>`;
       } },
-    { key: 'brand', label: 'Brand',
-      render: r => `<span style="font-size: 11px;">${escapeHtml(parseDealNotes(r.notes).brand || '—')}</span>` },
-    { key: 'lp', label: 'LP',
-      render: r => `<span style="font-size: 11px;">${escapeHtml(parseDealNotes(r.notes).lp || '—')}</span>` },
+    { key: '_brand',     label: 'Brand',
+      render: r => `<span style="font-size: 11px;">${escapeHtml(r._brand || '—')}</span>` },
+    { key: '_lp',        label: 'LP',
+      render: r => `<span style="font-size: 11px;">${escapeHtml(r._lp || '—')}</span>` },
   ];
   if (isAdmin) {
     cols.push({ key: '__actions', label: '', sortable: false,
       render: r => `<button class="btn-link" data-act="del-deal" data-id="${r.id}">Delete</button>` });
   }
 
-  // Render with filter applied
+  // Apply ALL filters (Collective + Category + Brand + LP + free-text search)
   const renderFiltered = () => {
-    const filterId = document.getElementById("d-filter-brand").value;
-    const filtered = filterId
-      ? deals.filter(d => String(d.brand_id) === filterId)
-      : deals;
-    renderTable('deals-table', filtered, cols, { defaultSort: 'start_date', emptyText: 'No deals match.' });
+    const brandId = document.getElementById("d-filter-brand").value;
+    const cat     = document.getElementById("d-filter-cat").value;
+    const vendor  = document.getElementById("d-filter-vendor").value;
+    const lp      = document.getElementById("d-filter-lp").value;
+    const q       = (document.getElementById("d-filter-text").value || '').trim().toLowerCase();
+
+    const filtered = deals.filter(d => {
+      if (brandId && String(d.brand_id) !== brandId) return false;
+      if (cat    && (d.category || '') !== cat)     return false;
+      if (vendor && (d._brand   || '') !== vendor)  return false;
+      if (lp     && (d._lp      || '') !== lp)      return false;
+      if (q) {
+        const hay = `${d._product || ''} ${d.sku_filter || ''} ${d._brand || ''} ${d._lp || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    // Surface filter result count so users see when filters cut deep
+    const totalN = deals.length;
+    const filtCount = document.getElementById("d-filter-count");
+    if (filtCount) {
+      filtCount.textContent = (filtered.length === totalN)
+        ? `Showing all ${totalN} deals`
+        : `Showing ${filtered.length} of ${totalN} deals`;
+    }
+    renderTable('deals-table', filtered, cols,
+      { defaultSort: 'start_date', emptyText: 'No deals match these filters.' });
   };
   renderFiltered();
-  document.getElementById("d-filter-brand").addEventListener("change", renderFiltered);
+
+  // Wire each filter input — change for selects, input for the search box
+  for (const id of ['d-filter-brand', 'd-filter-cat', 'd-filter-vendor', 'd-filter-lp']) {
+    document.getElementById(id).addEventListener('change', renderFiltered);
+  }
+  document.getElementById('d-filter-text').addEventListener('input', renderFiltered);
+  document.getElementById('d-filter-clear').addEventListener('click', () => {
+    document.getElementById('d-filter-brand').value  = '';
+    document.getElementById('d-filter-cat').value    = '';
+    document.getElementById('d-filter-vendor').value = '';
+    document.getElementById('d-filter-lp').value     = '';
+    document.getElementById('d-filter-text').value   = '';
+    renderFiltered();
+  });
 
   // Admin-only handlers: the add-deal form + delete action only exist for
   // admin viewers, so guard the wiring (querySelector returns null otherwise).
