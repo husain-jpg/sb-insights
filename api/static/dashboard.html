@@ -4577,7 +4577,8 @@ async function renderPromos() {
       </div>
 
       <div class="card">
-        <div class="table-scroll sticky-cols-4" id="promos-table"></div>
+        <div class="table-scroll sticky-cols-4" id="promos-table"
+             style="max-height: 70vh; overflow-y: auto;"></div>
       </div>
 
       <div class="hint-box">
@@ -4641,8 +4642,9 @@ async function renderPromos() {
       { key: 'product_name', label: 'Product',
         render: r => `${rebateBadgeHtml(r)}${escapeHtml(r.product_name)}<div class="sku">${r.sku} · ${r.brand || '—'}</div>` },
       { key: 'location_id', label: 'Store', render: r => storeLabel(r.location_id) },
+      { key: 'on_hand', label: 'Qty on Hand', type: 'number', align: 'right',
+        tooltip: 'Current on-hand units at this store.' },
       { key: 'category', label: 'Category', render: r => r.category || '—' },
-      { key: 'on_hand', label: 'On hand', type: 'number', align: 'right' },
       { key: 'regular_price', label: 'Current Price', type: 'number', align: 'right',
         tooltip: 'Current regular retail price at this store.',
         render: r => r.regular_price ? fmt$2(r.regular_price) : '—' },
@@ -4667,14 +4669,14 @@ async function renderPromos() {
           return m == null ? '—' : `${(m * 100).toFixed(1)}%`;
         },
         sortValue: r => grossMarginAfterDiscountAndRebates(r) ?? -999 },
-      { key: 'days_since_last_received', label: 'Since received', type: 'number', align: 'right',
-        tooltip: 'Days since most recent receive at this store (from Cova). Drives the tier cascade.',
+      { key: 'days_since_last_received', label: 'Days since last received', type: 'number', align: 'right',
+        tooltip: 'Days since stock was LAST RESTOCKED at this store (from Cova receipts). Drives the discount tier cascade — older stock gets a bigger discount suggestion.',
         render: r => fmtDays(r.days_since_last_received) },
-      { key: 'days_since_first_received', label: 'First received', type: 'number', align: 'right',
-        tooltip: 'Days since this SKU was FIRST stocked at this store.',
+      { key: 'days_since_first_received', label: 'Days since first stocked', type: 'number', align: 'right',
+        tooltip: 'Days since this SKU was FIRST stocked at this store (overall age, regardless of restocks).',
         render: r => fmtDays(r.days_since_first_received) },
-      { key: 'days_since_last_sold', label: 'Since sold', type: 'number', align: 'right',
-        tooltip: 'Days since this SKU last sold at this store.',
+      { key: 'days_since_last_sold', label: 'Days since last sold', type: 'number', align: 'right',
+        tooltip: 'Days since the LAST SALE of this SKU at this store. Different from "Days since last received" — that measures restock recency, this measures demand recency.',
         render: r => fmtDays(r.days_since_last_sold) },
       { key: 'daily_velocity', label: 'Units/day', type: 'number', align: 'right',
         render: r => (r.daily_velocity || 0).toFixed(2) },
