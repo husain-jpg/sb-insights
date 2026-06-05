@@ -293,18 +293,39 @@
   .sticky-cols-4 thead th:nth-child(4),
   .sticky-cols-4 tbody td:nth-child(4) { left: 400px; }
 
-  /* Promos table override — col 1 is just a small tier badge so the default
-     220px col-2 left offset leaves a giant gap. Tighten offsets to match
-     the actual column widths. Dead-stock table (#ds-table) keeps the
-     default offsets since its col 1 is wider. */
-  #promos-table.sticky-cols-4 thead th:nth-child(1),
-  #promos-table.sticky-cols-4 tbody td:nth-child(1) { left: 0; min-width: 70px; max-width: 80px; text-align: center; }
-  #promos-table.sticky-cols-4 thead th:nth-child(2),
-  #promos-table.sticky-cols-4 tbody td:nth-child(2) { left: 80px; }
-  #promos-table.sticky-cols-4 thead th:nth-child(3),
-  #promos-table.sticky-cols-4 tbody td:nth-child(3) { left: 320px; }
-  #promos-table.sticky-cols-4 thead th:nth-child(4),
-  #promos-table.sticky-cols-4 tbody td:nth-child(4) { left: 390px; }
+  /* Promos table — 15 columns, the global "table { width: 100% }" squeezed
+     them into the wrapper width so nothing scrolled and content got clipped.
+     Override: let the table size to its natural content (so the wrapper's
+     overflow-x:auto actually engages), nowrap cells by default, and pin
+     ONLY Tier + Product to the left so they stay visible while scrolling. */
+  #promos-table > table {
+    width: auto;        /* grow to fit content */
+    min-width: 100%;    /* but fill the wrapper if natural width is smaller */
+    table-layout: auto;
+  }
+  #promos-table th, #promos-table td {
+    white-space: nowrap;  /* default: keep on one line so columns don't get tall */
+  }
+  /* Column 1 — Tier badge: narrow, fixed-ish, sticky, centered */
+  #promos-table th:nth-child(1),
+  #promos-table td:nth-child(1) {
+    position: sticky; left: 0; z-index: 4;
+    min-width: 70px; text-align: center;
+    background: var(--bg-elev);
+  }
+  #promos-table thead th:nth-child(1) { z-index: 6; background: var(--bg-elev-2); }
+  #promos-table tbody tr:hover td:nth-child(1) { background: var(--bg-elev-2); }
+  /* Column 2 — Product: sticky, allowed to wrap (name + SKU line), bounded
+     so it doesn't sprawl. left:70 must match col 1's min-width. */
+  #promos-table th:nth-child(2),
+  #promos-table td:nth-child(2) {
+    position: sticky; left: 70px; z-index: 4;
+    min-width: 240px; max-width: 320px;
+    white-space: normal;
+    background: var(--bg-elev);
+  }
+  #promos-table thead th:nth-child(2) { z-index: 6; background: var(--bg-elev-2); }
+  #promos-table tbody tr:hover td:nth-child(2) { background: var(--bg-elev-2); }
 
   /* Tables in sticky-col mode need horizontal scroll on their wrapper. */
   .table-scroll { overflow-x: auto; }
@@ -4577,7 +4598,7 @@ async function renderPromos() {
       </div>
 
       <div class="card">
-        <div class="table-scroll sticky-cols-4" id="promos-table"
+        <div class="table-scroll" id="promos-table"
              style="max-height: 70vh; overflow-y: auto;"></div>
       </div>
 
