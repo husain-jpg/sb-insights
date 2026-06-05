@@ -4518,7 +4518,7 @@ async function renderCrossStore() {
 
 async function renderPromos() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING SUGGESTED PROMOS...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> LOADING SUGGESTED PROMOS...</div>`;
   try {
     const locs = await api("/api/locations");
 
@@ -4714,13 +4714,28 @@ async function renderPromos() {
       else params.delete("top_level");  // both
       if (age) params.set("min_age_days", age);
       if (vel) params.set("max_velocity", vel);
-      const data = await api(`/api/suggested-promos?${params.toString()}`);
-      currentData = data.items;
-      const t = data.totals;
-      document.getElementById("promos-kpi-count").textContent  = data.count.toLocaleString();
-      document.getElementById("promos-kpi-retail").textContent = fmt$(t.retail_value_at_risk);
-      document.getElementById("promos-kpi-disc").textContent   = fmt$(t.estimated_discount_total);
-      redraw();
+
+      // Show loading state — spinner in the table area, fade the KPI cards.
+      // Same pattern as the Reorder Report so the UX is consistent.
+      const tableBox = document.getElementById("promos-table");
+      const kpisBox  = document.getElementById("promos-kpis");
+      if (tableBox) tableBox.innerHTML = `<div class="loading"><span class="spinner"></span> Updating…</div>`;
+      if (kpisBox)  kpisBox.classList.add("is-loading");
+
+      try {
+        const data = await api(`/api/suggested-promos?${params.toString()}`);
+        currentData = data.items;
+        const t = data.totals;
+        document.getElementById("promos-kpi-count").textContent  = data.count.toLocaleString();
+        document.getElementById("promos-kpi-retail").textContent = fmt$(t.retail_value_at_risk);
+        document.getElementById("promos-kpi-disc").textContent   = fmt$(t.estimated_discount_total);
+        redraw();
+      } finally {
+        // redraw() already replaced the table contents on success; only clear
+        // the KPI fade. On failure, the loading text remains so the user sees
+        // the request didn't complete — matches showError behavior elsewhere.
+        if (kpisBox) kpisBox.classList.remove("is-loading");
+      }
     };
 
     document.getElementById("promos-search").addEventListener("input", redraw);
