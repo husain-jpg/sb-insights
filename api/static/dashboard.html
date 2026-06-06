@@ -4901,8 +4901,10 @@ async function renderOcsCatalogue() {
     };
 
     const columns = [
+      { key: 'brand', label: 'Brand',
+        render: r => escapeHtml(r.brand || '—') },
       { key: 'product_name', label: 'Product',
-        render: r => `${rebateBadgeHtml(r)}${escapeHtml(r.product_name)}<div class="sku">${r.brand || '—'} · ${r.ocs_variant_number}</div>` },
+        render: r => `${rebateBadgeHtml(r)}${escapeHtml(r.product_name)}<div class="sku">${r.ocs_variant_number}</div>` },
       { key: 'category', label: 'Category',
         render: r => r.subcategory ? `${r.category}<div class="sku">${r.subcategory}</div>` : (r.category || '—') },
       { key: 'size', label: 'Size', render: r => r.size || '—' },
