@@ -4175,10 +4175,15 @@ def get_ocs_catalogue(
         cur.execute("SELECT DISTINCT brand FROM ocs_catalog WHERE brand IS NOT NULL ORDER BY brand")
         brands = [r[0] for r in cur.fetchall()]
 
+        # Latest catalogue refresh — drives the "as of" header on the page.
+        cur.execute("SELECT MAX(as_of) FROM ocs_catalog")
+        catalogue_as_of = cur.fetchone()[0]
+
     return {
         "count": len(items),
         "items": items,
         "filters": {"categories": categories, "brands": brands},
+        "catalogue_as_of": catalogue_as_of,
     }
 
 

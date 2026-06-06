@@ -4815,6 +4815,23 @@ function ratingDisplay(avg, count) {
   return `<span class="${cls}" style="font-size: 11px; padding: 2px 6px;" title="Average across ${count} ratings">${score.toFixed(1)} <span style="opacity:0.6;">(${count})</span></span>`;
 }
 
+// Format the OCS catalogue's MAX(as_of) for the kicker line. The DB column
+// is a SQLite-style datetime string (e.g. "2026-06-04 23:12:41") — render
+// as "Jun 4, 2026, 11:12 PM" so freshness is at a glance.
+function fmtCatalogueAsOf(ts) {
+  if (!ts) return '—';
+  try {
+    // Normalize space → 'T' so Date parses across browsers.
+    const iso = String(ts).replace(' ', 'T');
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return ts;
+    return d.toLocaleString('en-US', {
+      month: 'short', day: 'numeric', year: 'numeric',
+      hour: 'numeric', minute: '2-digit',
+    });
+  } catch { return ts; }
+}
+
 async function renderOcsCatalogue() {
   const main = document.getElementById("main");
   main.innerHTML = `<div class="loading">LOADING OCS CATALOGUE...</div>`;
@@ -4827,7 +4844,7 @@ async function renderOcsCatalogue() {
       <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
         <div style="display: flex; justify-content: space-between; align-items: baseline;">
           <div>
-            <div class="kicker">OCS Catalogue · Manager Ratings</div>
+            <div class="kicker">OCS Catalogue · Manager Ratings ${data.catalogue_as_of ? `· Latest catalogue update: <strong style="color: var(--text);">${fmtCatalogueAsOf(data.catalogue_as_of)}</strong>` : ''}</div>
             <h2 style="white-space: nowrap;">Searchable product list</h2>
           </div>
           <div style="font-size: 11px; color: var(--text-dim);">
