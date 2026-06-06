@@ -72,10 +72,12 @@ app = FastAPI(title="SB Insights", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     # Allow same-origin (browser visiting the dashboard) + localhost in dev.
-    # In production, this should be the actual domain (sbinsights.ca).
+    # Production lives on app.sbinsights.co — keep .co root + www in case
+    # we later host a marketing landing on the apex.
     allow_origins=[
         "http://127.0.0.1:8000", "http://localhost:8000",
-        "https://sbinsights.ca", "https://www.sbinsights.ca",
+        "https://app.sbinsights.co",
+        "https://sbinsights.co", "https://www.sbinsights.co",
     ],
     allow_credentials=True,  # required to send cookies
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],

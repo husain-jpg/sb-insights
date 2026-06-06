@@ -1,0 +1,26 @@
+[Unit]
+Description=SB Insights (terroir-ops) FastAPI service
+After=network.target
+
+[Service]
+Type=simple
+User=terroir
+Group=terroir
+WorkingDirectory=/opt/terroir-ops
+EnvironmentFile=/opt/terroir-ops/.env
+# Bind to localhost only — nginx is the public-facing edge with TLS.
+ExecStart=/opt/terroir-ops/.venv/bin/uvicorn api.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1 \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Modest memory hint — SQLite + Python comfortably fits in 1GB with the 1.35GB DB
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
