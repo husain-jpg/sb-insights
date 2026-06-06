@@ -4136,6 +4136,48 @@ def get_ocs_catalogue(
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, row)) for row in cur.fetchall()]
 
+        # Order Fill availability — OCS's stock_status='NO' often misses
+        # flow-through SKUs (ships from LP, not OCS warehouse). Aggregate
+        # across stores: if any store sees this variant as flow_thru or
+        # back_in_stock in the latest Order Fill run, mark it available.
+        # Same data source as the Reorder Report's "OCS Avail." column for
+        # consistency.
+        try:
+            from jobs.import_order_fill import get_latest_order_fill_skus
+            of_map = get_latest_order_fill_skus(conn)  # keyed by (loc, variant_lower)
+            # Aggregate per variant (drop the location dimension for the
+            # catalogue's chain-wide view).
+            of_by_variant: dict = {}
+            for (loc, variant), info in of_map.items():
+                if not variant:
+                    continue
+                agg = of_by_variant.setdefault(variant, {
+                    "flow_thru": False, "back_in_stock": False,
+                    "available_quantity": 0, "stores_seen": 0,
+                })
+                if info.get("flow_thru"):     agg["flow_thru"] = True
+                if info.get("back_in_stock"): agg["back_in_stock"] = True
+                aq = info.get("available_quantity") or 0
+                if aq > agg["available_quantity"]:
+                    agg["available_quantity"] = aq
+                agg["stores_seen"] += 1
+            for it in items:
+                v = (it.get("ocs_variant_number") or "").lower()
+                agg = of_by_variant.get(v)
+                if agg:
+                    it["order_fill_flow_thru"]     = bool(agg["flow_thru"])
+                    it["order_fill_back_in_stock"] = bool(agg["back_in_stock"])
+                    it["order_fill_avail_qty"]     = int(agg["available_quantity"])
+                else:
+                    it["order_fill_flow_thru"]     = None
+                    it["order_fill_back_in_stock"] = False
+                    it["order_fill_avail_qty"]     = 0
+        except Exception:
+            for it in items:
+                it.setdefault("order_fill_flow_thru", None)
+                it.setdefault("order_fill_back_in_stock", False)
+                it.setdefault("order_fill_avail_qty", 0)
+
         # Attach data revenue / rebate info via the resolver so the OCS
         # Catalogue tab shows the same badges as the Reorder Report.
         # Match on both Cova SKU and OCS variant — the resolver accepts either.

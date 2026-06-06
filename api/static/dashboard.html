@@ -4915,11 +4915,21 @@ async function renderOcsCatalogue() {
         render: r => r.unit_price ? fmt$2(r.unit_price) : '—' },
       { key: 'pack_size', label: 'Case Size', type: 'number', align: 'right',
         render: r => r.pack_size || '—' },
-      { key: 'stock_status', label: 'OCS In Stock', align: 'right',
-        tooltip: "Whether OCS currently has this SKU available to order. 'Yes' = in stock, 'No' = OCS is out, '?' = unknown / SKU not currently in OCS catalog.",
-        render: r => r.stock_status === 'YES'
-          ? '<span class="tag tag-accent">Yes</span>'
-          : (r.stock_status === 'NO' ? '<span class="tag tag-critical" style="font-weight:600;">No</span>' : '<span class="tag">?</span>') },
+      { key: 'stock_status', label: 'OCS Avail.', align: 'right',
+        tooltip: "Order availability from OCS. 'Flow-Through' = ships from LP (OCS warehouse may show 0 but you can still order). 'Back in Stock' = recently restocked. 'Yes' = OCS warehouse stocked. 'No' = unavailable everywhere. '?' = SKU not in current OCS catalog.",
+        render: r => {
+          // Flow-through wins over a raw 'NO' — the SKU is genuinely orderable
+          // from the LP even when OCS warehouse stock is zero.
+          if (r.order_fill_flow_thru) {
+            return '<span class="tag" style="background: rgba(70, 140, 90, 0.18); color: #6dab84; border-color: rgba(80, 160, 100, 0.45); font-weight: 600;" title="Flow-Through: ships from LP — orderable regardless of OCS warehouse stock">Flow-Through</span>';
+          }
+          if (r.order_fill_back_in_stock) {
+            return '<span class="tag" style="background: rgba(80, 140, 200, 0.18); color: #6da2d6; border-color: rgba(100, 160, 220, 0.45); font-weight: 600;" title="Back in stock at OCS this Order Fill run">Back in Stock</span>';
+          }
+          if (r.stock_status === 'YES') return '<span class="tag tag-accent">Yes</span>';
+          if (r.stock_status === 'NO')  return '<span class="tag tag-critical" style="font-weight:600;">No</span>';
+          return '<span class="tag">?</span>';
+        } },
       { key: 'avg_rating', label: 'Rating', type: 'number', align: 'right',
         tooltip: 'Average rating across all managers (1-10).',
         render: r => ratingDisplay(r.avg_rating, r.rating_count) },
