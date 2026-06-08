@@ -1296,11 +1296,13 @@ def inventory_summary(store: str | None = None) -> dict:
         cost_value = float(cost_value or 0)
 
         # Breakdown by top level — same source so Cannabis vs Accessories
-        # totals reconcile exactly with the headline numbers above.
+        # totals reconcile exactly with the headline numbers above. Now also
+        # carries total_units so weeks_of_inventory can be computed per-type.
         cur.execute(f"""
             SELECT
                 COALESCE(p.top_level, 'Unknown') AS top_level,
                 SUM(CASE WHEN ci.on_hand > 0 THEN 1 ELSE 0 END) AS skus_in_stock,
+                SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand ELSE 0 END) AS units,
                 SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand * COALESCE(pr.regular_price, 0) ELSE 0 END) AS retail_value,
                 SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand *
                     COALESCE(ci.avg_unit_cost, oc.unit_price, pr.regular_price * 0.60, 0)
@@ -1313,19 +1315,18 @@ def inventory_summary(store: str | None = None) -> dict:
             GROUP BY top_level
         """, params)
         by_top = {}
-        for top, skus, rev, cost in cur.fetchall():
+        for top, skus, units, rev, cost in cur.fetchall():
             by_top[top or "Unknown"] = {
                 "skus_in_stock": skus or 0,
+                "units": int(units or 0),
                 "retail_value": round(float(rev or 0), 2),
                 "cost_value": round(float(cost or 0), 2),
             }
 
         # Weeks of inventory: total_units ÷ avg weekly units sold over last 30d
-        # Honest caveat: this is an aggregate across all SKUs. Hides the
-        # distribution (you might be 2 weeks on Heroes and 80 weeks on slow
-        # movers, averaging to ~14 weeks which hides both extremes).
-        # The Reorder Report's per-SKU days-of-cover is the diagnostic version;
-        # this is a single number for the Overview KPI.
+        # Computed TWICE — once combined (back-compat) and once per top_level
+        # so Cannabis WOI isn't diluted by slow-moving Accessories (which can
+        # have ~50 weeks of cover while cannabis runs at ~4-6).
         from datetime import datetime, timedelta as _td
         win_end = datetime.now().date()
         win_start = win_end - _td(days=30)
@@ -1333,21 +1334,35 @@ def inventory_summary(store: str | None = None) -> dict:
         woi_params = [win_start.isoformat(), win_end.isoformat()]
         if store:
             woi_params.append(store)
+
+        # Per-top-level units sold in last 30 days
         cur.execute(f"""
-            SELECT COALESCE(SUM(s.units_sold), 0) AS units_30d
+            SELECT COALESCE(p.top_level, 'Unknown') AS top_level,
+                   COALESCE(SUM(s.units_sold), 0) AS units_30d
             FROM sales_daily s
             LEFT JOIN products p ON p.sku = s.sku
             WHERE s.sale_date >= ? AND s.sale_date <= ?
               AND COALESCE(p.top_level, '') != 'Other'
               {woi_store_clause}
+            GROUP BY top_level
         """, woi_params)
-        units_30d_row = cur.fetchone()
-        units_30d = float(units_30d_row[0] or 0)
-        # Convert to weekly rate, compute weeks of cover
+        units_30d_by_top = {row[0]: float(row[1] or 0) for row in cur.fetchall()}
+        units_30d = sum(units_30d_by_top.values())
+
+        # Combined weeks_of_inventory (back-compat for any caller)
         weekly_units = units_30d / (30.0 / 7.0)  # = units_30d × 7/30
-        weeks_of_inventory = None
-        if weekly_units > 0 and total_units:
-            weeks_of_inventory = round(total_units / weekly_units, 1)
+        weeks_of_inventory = (round(total_units / weekly_units, 1)
+                              if weekly_units > 0 and total_units else None)
+
+        # Per-top-level weeks_of_inventory + attach into the by_top dict
+        weeks_by_top: dict[str, float | None] = {}
+        for top, info in by_top.items():
+            u30 = units_30d_by_top.get(top, 0.0)
+            wk = u30 / (30.0 / 7.0)
+            woi = round(info["units"] / wk, 1) if wk > 0 and info["units"] else None
+            info["weeks_of_inventory"] = woi
+            info["units_sold_30d"] = int(u30)
+            weeks_by_top[top] = woi
 
     result = {
         "total_skus": total_skus or 0,
@@ -1356,7 +1371,8 @@ def inventory_summary(store: str | None = None) -> dict:
         "total_stock_value_retail": round(retail_value, 2),
         "total_stock_value_cost": round(cost_value, 2),
         "by_top_level": by_top,
-        "weeks_of_inventory": weeks_of_inventory,
+        "weeks_of_inventory": weeks_of_inventory,            # combined (legacy)
+        "weeks_of_inventory_by_top": weeks_by_top,           # new — per type
         "units_sold_30d": int(units_30d),
     }
     overview_cache_set(cache_key, result)

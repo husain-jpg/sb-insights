@@ -763,10 +763,34 @@ async function renderOverview() {
           <div class="kpi-value">${fmtN(inv.skus_in_stock)}</div>
           <div class="kpi-detail">of ${fmtN(inv.total_skus)} carried</div>
         </div>
-        <div class="kpi-card purple" data-clickable data-goto="inventory" title="Estimated weeks of cover at the chain (or store) level: total units on hand ÷ avg weekly units sold over the last 30 days. Aggregate metric — hides the per-SKU distribution.">
+        <div class="kpi-card purple" data-clickable data-goto="inventory" title="Estimated weeks of cover: units on hand ÷ avg weekly units sold over the last 30 days. Split by Cannabis vs Accessories because they move at very different rates (accessories can sit for months while cannabis turns weekly).">
           <div class="kpi-label"><span>Weeks of Inventory</span><span class="kpi-link-arrow">→</span></div>
-          <div class="kpi-value">${inv.weeks_of_inventory != null ? inv.weeks_of_inventory.toFixed(1) : '—'}</div>
-          <div class="kpi-detail">Based on last 30 days of sales</div>
+          ${(() => {
+            const byT = inv.weeks_of_inventory_by_top || {};
+            const cann = byT["Cannabis"];
+            const acc  = byT["Accessories"];
+            const fmt = v => (v == null) ? '—' : v.toFixed(1);
+            // If we have the per-type split, show both stacked; otherwise fall
+            // back to the combined number for backward compatibility.
+            if (cann != null || acc != null) {
+              return `
+                <div style="display: flex; gap: 14px; align-items: baseline; margin-top: 4px;">
+                  <div>
+                    <div class="kpi-value" style="font-size: 22px;">${fmt(cann)}</div>
+                    <div style="font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Cannabis</div>
+                  </div>
+                  <div style="width: 1px; align-self: stretch; background: var(--border);"></div>
+                  <div>
+                    <div class="kpi-value" style="font-size: 22px;">${fmt(acc)}</div>
+                    <div style="font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Accessories</div>
+                  </div>
+                </div>
+                <div class="kpi-detail" style="margin-top: 6px;">Based on last 30 days of sales</div>`;
+            }
+            return `
+              <div class="kpi-value">${inv.weeks_of_inventory != null ? inv.weeks_of_inventory.toFixed(1) : '—'}</div>
+              <div class="kpi-detail">Based on last 30 days of sales</div>`;
+          })()}
         </div>
       </div>
 
