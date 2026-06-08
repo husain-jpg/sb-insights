@@ -86,6 +86,49 @@ app.add_middleware(
 
 
 # ============================================================================
+# Tiny in-memory TTL cache for Overview endpoints
+# ============================================================================
+# Overview tab fires several heavy queries on every page load — reorder engine
+# (kpis), store-performance, inventory-summary. These results change at most
+# every few minutes (after a sales/inventory import). A 60s TTL means at worst
+# managers see 60s-stale numbers, but repeat loads inside that window are
+# essentially free instead of 5-10s.
+#
+# Cache is per-process — with our single uvicorn worker that's the whole app.
+# Cleared on any successful data import via reset_overview_cache().
+
+import time as _time
+from threading import Lock as _Lock
+
+_overview_cache: dict[str, tuple[float, object]] = {}
+_overview_cache_lock = _Lock()
+_OVERVIEW_TTL_SECONDS = 60
+
+
+def overview_cache_get(key: str):
+    with _overview_cache_lock:
+        item = _overview_cache.get(key)
+        if item is None:
+            return None
+        ts, val = item
+        if _time.time() - ts > _OVERVIEW_TTL_SECONDS:
+            _overview_cache.pop(key, None)
+            return None
+        return val
+
+
+def overview_cache_set(key: str, val) -> None:
+    with _overview_cache_lock:
+        _overview_cache[key] = (_time.time(), val)
+
+
+def reset_overview_cache() -> None:
+    """Call after any data import to invalidate stale Overview numbers."""
+    with _overview_cache_lock:
+        _overview_cache.clear()
+
+
+# ============================================================================
 # Background backup scheduler
 # ============================================================================
 # Runs a daily DB backup in a background thread. Backup happens once per
@@ -1166,6 +1209,10 @@ def get_reorder(
 
 @app.get("/api/kpis")
 def get_kpis(store: str | None = None) -> dict:
+    cache_key = f"kpis:{store or ''}"
+    cached = overview_cache_get(cache_key)
+    if cached is not None:
+        return cached
     with db() as conn:
         as_of = get_latest_sale_date(conn)
         recs = compute_all_reorders(conn, location_id=store, as_of_date=as_of)
@@ -1195,7 +1242,7 @@ def get_kpis(store: str | None = None) -> dict:
         if r.urgency == "overstock": overstock_value += stock_value
         if r.urgency == "dead_stock": dead_value += stock_value
 
-    return {
+    result = {
         "reorder_value_pending": round(total_reorder_cost, 2),
         "reorder_sku_count": sum(1 for r in recs if r.urgency in ("stockout", "critical", "high", "medium") and r.reorder_qty > 0),
         "critical_stockouts": critical + stockouts,
@@ -1204,6 +1251,8 @@ def get_kpis(store: str | None = None) -> dict:
         "overstock_value": round(overstock_value, 2),
         "as_of": as_of.isoformat(),
     }
+    overview_cache_set(cache_key, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1214,6 +1263,10 @@ def get_kpis(store: str | None = None) -> dict:
 def inventory_summary(store: str | None = None) -> dict:
     """Headline inventory numbers. Store filter optional.
     Excludes 'Other' category by default."""
+    cache_key = f"invsum:{store or ''}"
+    cached = overview_cache_get(cache_key)
+    if cached is not None:
+        return cached
     # Use the materialized current_inventory table (~40k rows) instead of
     # the window-scan over inventory_snapshots (~470k rows even post-cleanup).
     # Cost prefers the per-row avg_unit_cost from Cova (actual landed cost),
@@ -1296,7 +1349,7 @@ def inventory_summary(store: str | None = None) -> dict:
         if weekly_units > 0 and total_units:
             weeks_of_inventory = round(total_units / weekly_units, 1)
 
-    return {
+    result = {
         "total_skus": total_skus or 0,
         "skus_in_stock": skus_in_stock or 0,
         "total_units": total_units or 0,
@@ -1306,6 +1359,8 @@ def inventory_summary(store: str | None = None) -> dict:
         "weeks_of_inventory": weeks_of_inventory,
         "units_sold_30d": int(units_30d),
     }
+    overview_cache_set(cache_key, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1316,6 +1371,10 @@ def inventory_summary(store: str | None = None) -> dict:
 def store_performance(store: str | None = None) -> list[dict]:
     """For each store: last 7d revenue, prior 7d, MTD, prior-year MTD, last 30d.
     Can be filtered to a single store."""
+    cache_key = f"storeperf:{store or ''}"
+    cached = overview_cache_get(cache_key)
+    if cached is not None:
+        return cached
     with db() as conn:
         as_of = get_latest_sale_date(conn)
         as_of_iso = as_of.isoformat()
@@ -1387,6 +1446,7 @@ def store_performance(store: str | None = None) -> list[dict]:
             "revenue_mtd_prior_year": float(r_mtd_py or 0),
             "mtd_yoy_delta_pct": yoy,
         })
+    overview_cache_set(cache_key, result)
     return result
 
 
