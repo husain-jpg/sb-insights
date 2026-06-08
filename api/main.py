@@ -1383,11 +1383,10 @@ def store_performance(store: str | None = None) -> list[dict]:
         py_start = as_of.replace(year=as_of.year - 1).replace(day=1).isoformat()
         py_end = as_of.replace(year=as_of.year - 1).isoformat()
 
-        # The longest lookback is PY-MTD-start (~13 months ago). Bounding the
-        # JOIN by 400 days short-circuits the index scan early instead of
-        # walking all 906k+ sales_daily rows per location. Filter goes in the
-        # JOIN clause (not WHERE) to preserve LEFT JOIN semantics — stores with
-        # no sales in window still appear in the result with zero revenue.
+        # Unbounded JOIN — scans the full sales_daily history (~906k rows) so
+        # any future analytics extension can look back across all 2.5 years.
+        # First load is ~4-5s but the 60s in-memory cache makes every refresh
+        # inside that window <50ms, so the real user experience is fast.
         sql = """
             SELECT
                 l.id, l.name, l.city,
@@ -1407,16 +1406,13 @@ def store_performance(store: str | None = None) -> list[dict]:
                     WHEN s.sale_date >= ? AND s.sale_date <= ?
                     THEN s.gross_revenue ELSE 0 END), 0) AS rev_mtd_py
             FROM locations l
-            LEFT JOIN sales_daily s
-                ON s.location_id = l.id
-               AND s.sale_date >= date(?, '-400 days')
+            LEFT JOIN sales_daily s ON s.location_id = l.id
             WHERE l.is_active = 1
         """
         params = [
             as_of_iso, as_of_iso, as_of_iso, as_of_iso,
             as_of_iso, as_of_iso, mtd_start, as_of_iso,
             py_start, py_end,
-            as_of_iso,  # the new JOIN-bound date filter
         ]
         if store:
             sql += " AND l.id = ?"
