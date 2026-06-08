@@ -1214,29 +1214,26 @@ def get_kpis(store: str | None = None) -> dict:
 def inventory_summary(store: str | None = None) -> dict:
     """Headline inventory numbers. Store filter optional.
     Excludes 'Other' category by default."""
-    store_clause = "AND l.location_id = ?" if store else ""
+    # Use the materialized current_inventory table (~40k rows) instead of
+    # the window-scan over inventory_snapshots (~470k rows even post-cleanup).
+    # Cost prefers the per-row avg_unit_cost from Cova (actual landed cost),
+    # falling back to OCS wholesale price, then 60% of retail.
+    store_clause = "AND ci.location_id = ?" if store else ""
     params = [store] if store else []
     with db() as conn:
         cur = conn.cursor()
         cur.execute(f"""
-            WITH latest AS (
-                SELECT sku, location_id, on_hand FROM (
-                    SELECT sku, location_id, on_hand,
-                           ROW_NUMBER() OVER (PARTITION BY sku, location_id ORDER BY as_of DESC) rn
-                    FROM inventory_snapshots
-                ) WHERE rn = 1
-            )
             SELECT
                 COUNT(*) AS total_skus,
-                SUM(CASE WHEN l.on_hand > 0 THEN 1 ELSE 0 END) AS skus_in_stock,
-                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand ELSE 0 END) AS total_units,
-                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand * COALESCE(pr.regular_price, 0) ELSE 0 END) AS retail_value,
-                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand *
-                    COALESCE(oc.unit_price, pr.regular_price * 0.60, 0)
+                SUM(CASE WHEN ci.on_hand > 0 THEN 1 ELSE 0 END) AS skus_in_stock,
+                SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand ELSE 0 END) AS total_units,
+                SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand * COALESCE(pr.regular_price, 0) ELSE 0 END) AS retail_value,
+                SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand *
+                    COALESCE(ci.avg_unit_cost, oc.unit_price, pr.regular_price * 0.60, 0)
                 ELSE 0 END) AS cost_value
-            FROM latest l
-            LEFT JOIN products p ON p.sku = l.sku
-            LEFT JOIN prices pr ON pr.sku = l.sku AND pr.location_id = l.location_id
+            FROM current_inventory ci
+            LEFT JOIN products p ON p.sku = ci.sku
+            LEFT JOIN prices pr ON pr.sku = ci.sku AND pr.location_id = ci.location_id
             LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
             WHERE COALESCE(p.top_level, '') != 'Other' {store_clause}
         """, params)
@@ -1245,26 +1242,19 @@ def inventory_summary(store: str | None = None) -> dict:
         retail_value = float(retail_value or 0)
         cost_value = float(cost_value or 0)
 
-        # Breakdown by top level — now includes cost_value too so the
-        # Overview can show "Cost of Cannabis Inventory" alongside retail.
+        # Breakdown by top level — same source so Cannabis vs Accessories
+        # totals reconcile exactly with the headline numbers above.
         cur.execute(f"""
-            WITH latest AS (
-                SELECT sku, location_id, on_hand FROM (
-                    SELECT sku, location_id, on_hand,
-                           ROW_NUMBER() OVER (PARTITION BY sku, location_id ORDER BY as_of DESC) rn
-                    FROM inventory_snapshots
-                ) WHERE rn = 1
-            )
             SELECT
                 COALESCE(p.top_level, 'Unknown') AS top_level,
-                SUM(CASE WHEN l.on_hand > 0 THEN 1 ELSE 0 END) AS skus_in_stock,
-                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand * COALESCE(pr.regular_price, 0) ELSE 0 END) AS retail_value,
-                SUM(CASE WHEN l.on_hand > 0 THEN l.on_hand *
-                    COALESCE(oc.unit_price, pr.regular_price * 0.60, 0)
+                SUM(CASE WHEN ci.on_hand > 0 THEN 1 ELSE 0 END) AS skus_in_stock,
+                SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand * COALESCE(pr.regular_price, 0) ELSE 0 END) AS retail_value,
+                SUM(CASE WHEN ci.on_hand > 0 THEN ci.on_hand *
+                    COALESCE(ci.avg_unit_cost, oc.unit_price, pr.regular_price * 0.60, 0)
                 ELSE 0 END) AS cost_value
-            FROM latest l
-            LEFT JOIN products p ON p.sku = l.sku
-            LEFT JOIN prices pr ON pr.sku = l.sku AND pr.location_id = l.location_id
+            FROM current_inventory ci
+            LEFT JOIN products p ON p.sku = ci.sku
+            LEFT JOIN prices pr ON pr.sku = ci.sku AND pr.location_id = ci.location_id
             LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
             WHERE COALESCE(p.top_level, '') != 'Other' {store_clause}
             GROUP BY top_level
@@ -1334,6 +1324,11 @@ def store_performance(store: str | None = None) -> list[dict]:
         py_start = as_of.replace(year=as_of.year - 1).replace(day=1).isoformat()
         py_end = as_of.replace(year=as_of.year - 1).isoformat()
 
+        # The longest lookback is PY-MTD-start (~13 months ago). Bounding the
+        # JOIN by 400 days short-circuits the index scan early instead of
+        # walking all 906k+ sales_daily rows per location. Filter goes in the
+        # JOIN clause (not WHERE) to preserve LEFT JOIN semantics — stores with
+        # no sales in window still appear in the result with zero revenue.
         sql = """
             SELECT
                 l.id, l.name, l.city,
@@ -1353,13 +1348,16 @@ def store_performance(store: str | None = None) -> list[dict]:
                     WHEN s.sale_date >= ? AND s.sale_date <= ?
                     THEN s.gross_revenue ELSE 0 END), 0) AS rev_mtd_py
             FROM locations l
-            LEFT JOIN sales_daily s ON s.location_id = l.id
+            LEFT JOIN sales_daily s
+                ON s.location_id = l.id
+               AND s.sale_date >= date(?, '-400 days')
             WHERE l.is_active = 1
         """
         params = [
             as_of_iso, as_of_iso, as_of_iso, as_of_iso,
             as_of_iso, as_of_iso, mtd_start, as_of_iso,
             py_start, py_end,
+            as_of_iso,  # the new JOIN-bound date filter
         ]
         if store:
             sql += " AND l.id = ?"
