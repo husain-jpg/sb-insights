@@ -116,17 +116,38 @@ def _filename_from_response(resp, default: str) -> str:
     return (m.group(1).strip() if m else default)
 
 
+def _looks_like_maintenance(text: str) -> bool:
+    return "maintenance" in (text or "").lower()
+
+
+def _assert_authenticated(session, account: OcsAccount) -> None:
+    """Definitive post-login probe. GET the SelectStore page and require the
+    per-store blocks that _parse_store_blocks needs — only an authenticated
+    session sees those. Raises with a precise reason otherwise.
+
+    This exists because the portal answers EVERYTHING with HTTP 200: a failed
+    login, a maintenance page, a sign-in bounce. Without this probe, runs
+    reported 'ok' for days while saving HTML pages as .xlsx (June 7-12 2026)."""
+    base = account.base_url.rstrip("/")
+    resp = session.get(f"{base}/Admin/SelectStore", timeout=30)
+    body = (resp.text or "").lower()
+    if _looks_like_maintenance(body):
+        raise RuntimeError("OCS portal is in maintenance mode — try again later")
+    if "storediv" not in body and "hdnstorenumber" not in body:
+        raise RuntimeError(
+            "OCS login did not reach the store picker — wrong credentials, "
+            "or the portal layout changed")
+
+
 def login(session, account: OcsAccount) -> None:
     """Authenticate the session. GET the sign-in page to pick up hidden form
-    fields, then POST /Admin/Login. Confirms a session by checking we no longer
-    bounce to the sign-in page. Raises on failure.
-
-    NEEDS LIVE VALIDATION: the success signal (the Login response is small JSON)
-    and the exact sign-in page path may need adjusting once we see real bodies.
-    """
+    fields, then POST /Admin/Login. Success is verified by probing an
+    authenticated-only page (see _assert_authenticated). Raises on failure."""
     base = account.base_url.rstrip("/")
     session.get(f"{base}/Admin/LoginPreReq", timeout=30)  # mirror the browser precheck
     signin = session.get(f"{base}/Admin/Signin", timeout=30)
+    if _looks_like_maintenance(signin.text):
+        raise RuntimeError("OCS portal is in maintenance mode — try again later")
     form = _hidden_fields(signin.text)
     form.update({
         "Email": account.username,
@@ -135,13 +156,10 @@ def login(session, account: OcsAccount) -> None:
     })
     resp = session.post(f"{base}/Admin/Login", data=form, timeout=30,
                         headers={"Referer": f"{base}/Admin/Signin"})
-    # Heuristic success check until we confirm the JSON shape live.
-    ok = resp.ok and "Admin/Signin" not in (resp.url or "")
     body = (resp.text or "").lower()
-    if '"success":false' in body or "invalid" in body and "password" in body:
-        ok = False
-    if not ok:
-        raise RuntimeError(f"OCS login failed (status {resp.status_code})")
+    if not resp.ok or '"success":false' in body or ("invalid" in body and "password" in body):
+        raise RuntimeError(f"OCS login failed (status {resp.status_code}) — check credentials")
+    _assert_authenticated(session, account)
 
 
 def select_store(session, account: OcsAccount, retailer_id: str) -> None:
@@ -199,11 +217,26 @@ def _store_tokens(session, account: OcsAccount) -> dict:
     return {b["store_number"]: b["token"] for b in _parse_store_blocks(html) if b["store_number"]}
 
 
+# Excel magic bytes: .xlsx is a zip (PK\x03\x04); legacy .xls is OLE2.
+_EXCEL_MAGICS = (b"PK\x03\x04", b"\xd0\xcf\x11\xe0")
+
+
 def fetch_catalogue(session, account: OcsAccount) -> tuple[bytes, str]:
-    """Download the OCS catalogue export (chain-wide; same for all stores)."""
+    """Download the OCS catalogue export (chain-wide; same for all stores).
+    Validates the payload is actually an Excel file — the portal returns
+    HTML (sign-in / maintenance page) with HTTP 200 when not authenticated,
+    which previously got saved as OCS_Catalogue.xlsx and silently skipped
+    by the importer."""
     base = account.base_url.rstrip("/")
     resp = session.get(f"{base}/sales/GenerateCatelogue", timeout=120, allow_redirects=True)
     resp.raise_for_status()
+    if not resp.content or not resp.content.startswith(_EXCEL_MAGICS):
+        if _looks_like_maintenance(resp.text if "html" in (resp.headers.get("content-type") or "") else ""):
+            raise RuntimeError("OCS portal is in maintenance mode — catalogue download returned the maintenance page")
+        raise RuntimeError(
+            f"OCS catalogue download is not an Excel file "
+            f"(content-type {resp.headers.get('content-type')!r}, {len(resp.content)} bytes) — "
+            f"login likely failed or the portal is down")
     fname = _filename_from_response(resp, "OCS_Catalogue.xlsx")
     return resp.content, fname
 
@@ -223,6 +256,10 @@ def fetch_order_fill(session, account: OcsAccount, pack_type: int = 1) -> tuple[
     # No form available → portal returns HTML/JSON/empty rather than a spreadsheet.
     if not resp.ok or not resp.content or "spreadsheet" not in ct and "octet-stream" not in ct \
             and "excel" not in ct and ".xls" not in (resp.headers.get("content-disposition", "").lower()):
+        return None
+    # Belt-and-braces: even with a spreadsheet content-type, require real
+    # Excel magic bytes so an HTML error page can never be saved as .xlsx.
+    if not resp.content.startswith(_EXCEL_MAGICS):
         return None
     fname = _filename_from_response(resp, "OrderExport.xlsx")
     return resp.content, fname
