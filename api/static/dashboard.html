@@ -293,6 +293,20 @@
   .sticky-cols-4 thead th:nth-child(4),
   .sticky-cols-4 tbody td:nth-child(4) { left: 400px; }
 
+  /* Dead Stock / Overstock table — 12 columns. Same treatment as Promos:
+     natural table width (wrapper scrolls horizontally) instead of squeezing
+     everything into 100%, nowrap cells, bounded wrapping Product column. */
+  #ds-table > table {
+    width: auto;
+    min-width: 100%;
+    table-layout: auto;
+  }
+  #ds-table th, #ds-table td { white-space: nowrap; }
+  #ds-table th:nth-child(1), #ds-table td:nth-child(1) { text-align: center; }
+  #ds-table th:nth-child(2), #ds-table td:nth-child(2) {
+    white-space: normal; min-width: 200px; max-width: 280px;
+  }
+
   /* Promos table — 15 columns, the global "table { width: 100% }" squeezed
      them into the wrapper width so nothing scrolled and content got clipped.
      Override: let the table size to its natural content (so the wrapper's
@@ -671,6 +685,24 @@ function _drawTable(tableId) {
       <tbody>${tbody}</tbody>
     </table>
   `;
+
+  // Sticky-column offsets: .sticky-cols-N pins the first N columns, but each
+  // pinned column needs a `left` matching the REAL rendered width of the
+  // columns before it. The CSS only has fallback offsets tuned for one table
+  // shape — measure and set inline so any column layout pins correctly.
+  const stickyCls = [...container.classList].find(c => /^sticky-cols-\d+$/.test(c));
+  if (stickyCls) {
+    const n = +stickyCls.match(/\d+$/)[0];
+    const headRow = container.querySelector('thead tr:last-child');
+    if (headRow) {
+      let left = 0;
+      for (let i = 1; i <= n && headRow.children[i - 1]; i++) {
+        container.querySelectorAll(`thead tr:last-child th:nth-child(${i}), tbody td:nth-child(${i})`)
+          .forEach(el => { el.style.left = left + 'px'; });
+        left += headRow.children[i - 1].getBoundingClientRect().width;
+      }
+    }
+  }
 
   // Wire up header clicks
   container.querySelectorAll('th.sortable').forEach(th => {
@@ -1997,7 +2029,7 @@ async function renderStockouts() {
 
 async function renderDeadStock() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING SLOW MOVERS & OVERSTOCK...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading slow movers &amp; overstock…</div>`;
   try {
     const [locs, initialData] = await Promise.all([
       api("/api/locations"),
@@ -2057,9 +2089,10 @@ async function renderDeadStock() {
     };
 
     const fmtDate = (d) => {
-      if (!d) return '—';
-      // d is ISO YYYY-MM-DD; render compact
-      try { return new Date(d).toLocaleDateString('en-CA'); } catch { return d; }
+      // d is ISO YYYY-MM-DD (already compact). Don't round-trip through
+      // new Date(): it parses date-only strings as UTC midnight, which
+      // displays as the PREVIOUS day in any western timezone.
+      return d ? String(d).slice(0, 10) : '—';
     };
 
     const fmtDays = (n) => n == null ? '—' : (typeof n === 'number' ? Math.round(n) : n);
@@ -2082,10 +2115,11 @@ async function renderDeadStock() {
       { key: 'last_received_date', label: 'Last received',
         tooltip: 'Most recent date this SKU was received at this store (from OCS invoices).',
         render: r => fmtDate(r.last_received_date) },
-      { key: 'units_window', label: 'Units sold (window)', type: 'number', align: 'right',
+      { key: 'units_window', label: 'Sold in window', type: 'number', align: 'right',
         tooltip: 'Units sold within the dead-stock window selected above.',
         render: r => r.units_window || 0 },
-      { key: 'daily_velocity', label: 'Units Sold/Day', type: 'number', align: 'right',
+      { key: 'daily_velocity', label: 'Units/day', type: 'number', align: 'right',
+        tooltip: 'Average units sold per day over the selected window.',
         render: r => (r.daily_velocity || 0).toFixed(2) },
       { key: 'cost_tied_up', label: 'Cost tied up', type: 'number', align: 'right',
         render: r => fmt$2(r.cost_tied_up) },
@@ -2119,7 +2153,14 @@ async function renderDeadStock() {
       if (window) params.set("window_days", window);
       if (nearly) params.set("nearly_dead", "true");
       const url = `/api/dead-stock-overstock?${params.toString()}`;
-      data = await api(url);
+      const tableBox = document.getElementById("ds-table");
+      if (tableBox) tableBox.innerHTML = `<div class="loading"><span class="spinner"></span> Updating…</div>`;
+      try {
+        data = await api(url);
+      } catch (e) {
+        if (tableBox) tableBox.innerHTML = `<div class="error"><strong>Couldn't load dead stock / overstock</strong>${escapeHtml(e.message || String(e))}</div>`;
+        return;
+      }
       currentData = data.items;
       document.getElementById("ds-totals").textContent = `${fmt$(data.totals.combined_value)} tied up`;
       document.getElementById("ds-summary").innerHTML =
