@@ -47,6 +47,11 @@ from datetime import date, timedelta
 ORDER_CYCLE_DAYS = 7
 LEAD_TIME_DAYS = 4
 VELOCITY_WINDOW_DAYS = 30
+# Floor for the stockout-adjusted velocity denominator: a SKU stocked out for
+# most of the window has its velocity measured over the days it could actually
+# sell (window start → last sale), never fewer than this many days. Guards
+# against a 1-2 day sales blip reading as huge velocity.
+MIN_VELOCITY_BASIS_DAYS = 7
 COVERAGE_DAYS = ORDER_CYCLE_DAYS + LEAD_TIME_DAYS  # legacy global, recomputed per call
 CEILING_DAYS_DEFAULT = 10
 MIN_VELOCITY_DEFAULT = 0.0
@@ -132,6 +137,12 @@ class ReorderRec:
     successor_tier: str | None = None            # 'HIGH' | 'MEDIUM'
     successor_in_stock: bool | None = None       # successor stock_status == YES at OCS?
     successor_on_hand_legacy: int | None = None  # successor SKU's own on_hand (usually 0)
+
+    # Transparency fields (no math impact). raw_qty is the pre-case-rounding
+    # demand; velocity_basis_days is the denominator used for daily_velocity
+    # (30 normally; fewer when a stocked-out SKU's dead tail is excluded).
+    raw_qty: int = 0
+    velocity_basis_days: int = VELOCITY_WINDOW_DAYS
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -447,7 +458,7 @@ def compute_top_skus_per_store(
                            ORDER BY SUM(gross_revenue) DESC
                        ) AS rn
                 FROM sales_daily
-                WHERE sale_date >= ? AND sale_date < ?
+                WHERE sale_date >= ? AND sale_date <= ?
                 GROUP BY sku, location_id
             )
             SELECT sku, location_id FROM ranked WHERE rn <= ? AND rev > 0
@@ -465,7 +476,7 @@ def compute_top_skus_per_store(
                    SUM(s.gross_revenue) AS rev
             FROM sales_daily s
             LEFT JOIN products p ON p.sku = s.sku
-            WHERE s.sale_date >= ? AND s.sale_date < ?
+            WHERE s.sale_date >= ? AND s.sale_date <= ?
               AND p.top_level = 'Cannabis'  -- Only Cannabis gets Hero treatment
             GROUP BY s.sku, s.location_id, p.category, p.size
             HAVING SUM(s.gross_revenue) > 0
@@ -557,8 +568,12 @@ def compute_all_reorders(
     stockout_days = float(settings["reorder.stockout_imminent_days"])
     stockout_min_vel = float(settings["reorder.stockout_min_velocity"])
 
-    as_of = (as_of_date or date.today()).isoformat()
-    window_start = ((as_of_date or date.today()) - timedelta(days=VELOCITY_WINDOW_DAYS)).isoformat()
+    # Velocity window: the 30 complete days ENDING ON as_of (inclusive). The
+    # old `< as_of` bound silently excluded the most recent day of sales.
+    _as_of_d = as_of_date or date.today()
+    as_of = _as_of_d.isoformat()
+    _window_start_d = _as_of_d - timedelta(days=VELOCITY_WINDOW_DAYS - 1)
+    window_start = _window_start_d.isoformat()
 
     top_skus_by_loc: dict[str, set[str]] = {}
     if use_top_sku_tier:
@@ -572,9 +587,10 @@ def compute_all_reorders(
     WITH velocity_30d AS (
         SELECT sku, location_id,
                SUM(units_sold) AS units_30d,
-               SUM(gross_revenue) AS revenue_30d
+               SUM(gross_revenue) AS revenue_30d,
+               MAX(sale_date) AS last_sale_date
         FROM sales_daily
-        WHERE sale_date >= ? AND sale_date < ?
+        WHERE sale_date >= ? AND sale_date <= ?
         GROUP BY sku, location_id
     ),
     universe AS (
@@ -593,6 +609,7 @@ def compute_all_reorders(
         COALESCE(li.on_hand, 0) AS on_hand,
         COALESCE(v.units_30d, 0) AS units_30d,
         COALESCE(v.revenue_30d, 0.0) AS revenue_30d,
+        v.last_sale_date,
         p.ocs_variant_number,
         oc.pack_size AS ocs_pack_size,
         oc.unit_price AS ocs_unit_price,
@@ -621,12 +638,27 @@ def compute_all_reorders(
         from jobs.successor_detection import detect_successor
     for row in rows:
         (sku, loc_id, name, category, category_path, top_level, brand,
-         on_hand, units_30d, revenue_30d,
+         on_hand, units_30d, revenue_30d, last_sale_date,
          ocs_variant, ocs_pack_size, ocs_unit_price, ocs_stock_status) = row
 
         on_hand = int(on_hand or 0)
         effective_on_hand = max(0, on_hand)
-        velocity = float(units_30d or 0) / VELOCITY_WINDOW_DAYS
+
+        # Stockout-adjusted velocity. Plain units/30 dilutes the velocity of a
+        # SKU that spent part of the window stocked out (it can't sell at zero
+        # on-hand), which then suppresses its own reorder — the engine starves
+        # exactly the SKUs that proved they sell. For currently stocked-out
+        # SKUs, measure over the sellable span instead: window start → last
+        # sale (≈ the day it ran dry), floored at MIN_VELOCITY_BASIS_DAYS so a
+        # short blip can't read as huge velocity. In-stock SKUs keep the plain
+        # 30-day denominator (mid-window gaps are accepted as-is).
+        units_30d = float(units_30d or 0)
+        basis_days = VELOCITY_WINDOW_DAYS
+        if effective_on_hand == 0 and units_30d > 0 and last_sale_date:
+            sellable_days = (date.fromisoformat(last_sale_date) - _window_start_d).days + 1
+            basis_days = max(MIN_VELOCITY_BASIS_DAYS,
+                             min(VELOCITY_WINDOW_DAYS, sellable_days))
+        velocity = units_30d / basis_days
 
         days_supply = effective_on_hand / velocity if velocity > 0 else None
         urgency = classify_urgency(
@@ -753,6 +785,8 @@ def compute_all_reorders(
             successor_tier=succ_tier,
             successor_in_stock=succ_in_stock,
             successor_on_hand_legacy=succ_oh_legacy,
+            raw_qty=raw_qty,
+            velocity_basis_days=basis_days,
         ))
 
     urgency_order = {

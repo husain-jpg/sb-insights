@@ -25,6 +25,7 @@ from datetime import date, timedelta
 
 
 VELOCITY_WINDOW_DAYS = 30
+MIN_VELOCITY_BASIS_DAYS = 7  # keep in sync with jobs/reorder_engine.py
 
 
 def diagnose_sku(conn: sqlite3.Connection,
@@ -54,7 +55,9 @@ def diagnose_sku(conn: sqlite3.Connection,
     if as_of is None:
         as_of = date.today()
     as_of_iso = as_of.isoformat()
-    window_start_iso = (as_of - timedelta(days=VELOCITY_WINDOW_DAYS)).isoformat()
+    # 30 complete days ENDING ON as_of, inclusive — must match the engine.
+    window_start_d = as_of - timedelta(days=VELOCITY_WINDOW_DAYS - 1)
+    window_start_iso = window_start_d.isoformat()
 
     cur = conn.cursor()
 
@@ -62,12 +65,16 @@ def diagnose_sku(conn: sqlite3.Connection,
     cur.execute("SELECT key, value FROM app_settings")
     settings = {k: v for k, v in cur.fetchall()}
 
-    hero_ceiling = int(settings.get("reorder.hero_ceiling_days", 14))
-    regular_ceiling = int(settings.get("reorder.regular_ceiling_days", 7))
+    hero_ceiling = int(float(settings.get("reorder.hero_ceiling_days", 14)))
+    regular_ceiling = int(float(settings.get("reorder.regular_ceiling_days", 7)))
     min_velocity = float(settings.get("reorder.min_velocity", 0.0))
     pack_min_raw = float(settings.get("reorder.pack_size_min_fraction", 50))
     pack_min_fraction = pack_min_raw / 100.0 if pack_min_raw > 1.0 else pack_min_raw
-    overstock_days = int(settings.get("reorder.overstock_days", 60))
+    overstock_days = int(float(settings.get("reorder.overstock_days", 50)))
+    coverage_days = (int(float(settings.get("reorder.order_cycle_days", 7)))
+                     + int(float(settings.get("reorder.lead_time_days", 4))))
+    stockout_days = float(settings.get("reorder.stockout_imminent_days", 3.0))
+    stockout_min_vel = float(settings.get("reorder.stockout_min_velocity", 0.3))
 
     # ----- Gather inputs -----
     # Product record
@@ -96,13 +103,21 @@ def diagnose_sku(conn: sqlite3.Connection,
     on_hand = float(inv_row[0]) if inv_row else 0.0
     inv_as_of = inv_row[1] if inv_row else None
 
-    # 30-day velocity
+    # 30-day velocity — stockout-adjusted, exactly like the engine: a SKU at
+    # zero on-hand has its velocity measured over the days it could actually
+    # sell (window start → last sale), not over the dead tail after it ran dry.
     cur.execute("""
-        SELECT COALESCE(SUM(units), 0) FROM sales_daily
+        SELECT COALESCE(SUM(units_sold), 0), MAX(sale_date) FROM sales_daily
         WHERE location_id = ? AND sku = ? AND sale_date >= ? AND sale_date <= ?
     """, (location_id, sku, window_start_iso, as_of_iso))
-    units_30d = float(cur.fetchone()[0] or 0)
-    velocity = units_30d / VELOCITY_WINDOW_DAYS
+    vrow = cur.fetchone()
+    units_30d = float(vrow[0] or 0)
+    last_sale = vrow[1]
+    basis_days = VELOCITY_WINDOW_DAYS
+    if on_hand <= 0 and units_30d > 0 and last_sale:
+        sellable = (date.fromisoformat(last_sale) - window_start_d).days + 1
+        basis_days = max(MIN_VELOCITY_BASIS_DAYS, min(VELOCITY_WINDOW_DAYS, sellable))
+    velocity = units_30d / basis_days
 
     # OCS catalog data
     cur.execute("""
@@ -116,15 +131,24 @@ def diagnose_sku(conn: sqlite3.Connection,
     category = ocs[3] if ocs else None
     subcategory = ocs[4] if ocs else None
 
-    # Min/max overrides if any
+    # Hero (anchor) override, if any. NOTE: the previous version queried
+    # min_qty/max_qty columns that don't exist in anchor_overrides — that (and
+    # SUM(units) vs units_sold) made every diagnose call crash since launch.
     cur.execute("""
-        SELECT min_qty, max_qty FROM anchor_overrides
-        WHERE sku = ? AND (location_id = ? OR location_id IS NULL)
-        ORDER BY location_id DESC LIMIT 1
+        SELECT mode FROM anchor_overrides
+        WHERE sku = ? AND location_id = ?
     """, (sku, location_id))
     anchor = cur.fetchone()
-    min_qty = int(anchor[0]) if anchor and anchor[0] is not None else None
-    max_qty = int(anchor[1]) if anchor and anchor[1] is not None else None
+    anchor_override = anchor[0] if anchor else None  # 'include' | 'exclude' | None
+
+    # Hero membership — same (cached) ranking the engine uses, so the ceiling
+    # in the math below matches what the report actually ran.
+    from jobs.reorder_engine import compute_top_skus_per_store
+    try:
+        is_hero = sku in compute_top_skus_per_store(conn, as_of_date=as_of).get(location_id, set())
+    except Exception:
+        is_hero = False
+    ceiling_used = hero_ceiling if is_hero else regular_ceiling
 
     inputs = {
         "name": name,
@@ -138,17 +162,22 @@ def diagnose_sku(conn: sqlite3.Connection,
         "inventory_as_of": inv_as_of,
         "units_sold_30d": units_30d,
         "velocity_per_day": round(velocity, 3),
+        "velocity_basis_days": basis_days,
         "pack_size": pack_size,
         "ocs_stock_status": ocs_stock,
         "ocs_unit_price": ocs_price,
-        "min_qty_anchor": min_qty,
-        "max_qty_anchor": max_qty,
+        "anchor_override": anchor_override,
+        "is_hero": is_hero,
         "settings_applied": {
             "hero_ceiling_days": hero_ceiling,
             "regular_ceiling_days": regular_ceiling,
+            "ceiling_used": ceiling_used,
+            "coverage_days": coverage_days,
             "min_velocity": min_velocity,
             "pack_size_min_pct": pack_min_raw,
             "overstock_days": overstock_days,
+            "stockout_imminent_days": stockout_days,
+            "stockout_min_velocity": stockout_min_vel,
         }
     }
 
@@ -227,27 +256,56 @@ def diagnose_sku(conn: sqlite3.Connection,
                        "overstock_days": overstock_days},
         })
 
-    # CHECK 5: Pack-size threshold
-    # The engine computes: target = velocity * ceiling, shortfall = target - on_hand
-    # then asks: shortfall / pack_size >= pack_min_fraction?
-    # We use regular_ceiling here unless we have strong reason to think it's a Hero
-    # (which we'd need top-SKU data for; we use regular as a safe default in diagnostic)
-    target = velocity * regular_ceiling
-    shortfall = max(0, target - on_hand)
+    # CHECK 5: Reorder trigger (min-max). The engine only orders when days of
+    # cover has dropped to the trigger (order_cycle + lead_time). Above it,
+    # reorder_qty = 0 even though urgency may read "ok": not at trigger yet.
+    days_cover_num = on_hand / velocity if velocity > 0 else 0.0
+    if velocity > 0 and days_cover_num > coverage_days:
+        checks.append({
+            "name": "reorder_trigger",
+            "passed": False,
+            "explanation": (f"{days_cover_num:.1f} days of cover is above the reorder "
+                            f"trigger of {coverage_days} days (order cycle + lead time). "
+                            f"Not due for reorder yet."),
+            "values": {"days_of_cover": round(days_cover_num, 1), "coverage_days": coverage_days},
+        })
+    else:
+        checks.append({
+            "name": "reorder_trigger",
+            "passed": True,
+            "explanation": (f"{days_cover_num:.1f} days of cover ≤ trigger of "
+                            f"{coverage_days} days — due for reorder"
+                            if velocity > 0 else "Zero velocity — trigger check N/A"),
+            "values": {"days_of_cover": round(days_cover_num, 1), "coverage_days": coverage_days},
+        })
+
+    # CHECK 6: Pack-size threshold (uses the Hero ceiling when the SKU is a
+    # Hero at this store — same as the engine — and mirrors the engine's
+    # stockout-imminent override: an active seller about to hit zero gets one
+    # full case even when demand is below the case threshold).
+    import math as _math
+    target = velocity * ceiling_used
+    shortfall = max(0, _math.ceil(target) - on_hand)
     cases_needed_raw = shortfall / pack_size if pack_size > 0 else 0
-    if velocity > 0 and shortfall > 0 and cases_needed_raw < pack_min_fraction:
+    override_fires = (days_cover_num < stockout_days and velocity >= stockout_min_vel
+                      and shortfall > 0)
+    if (velocity > 0 and shortfall > 0 and cases_needed_raw < pack_min_fraction
+            and not override_fires):
         checks.append({
             "name": "pack_size_threshold",
             "passed": False,
-            "explanation": (f"Engine would want {shortfall:.2f} units; that's only "
+            "explanation": (f"Engine would want {shortfall:.0f} units; that's only "
                             f"{cases_needed_raw:.2f} of a {pack_size}-pack case "
                             f"({(cases_needed_raw*100):.0f}%), below the {(pack_min_fraction*100):.0f}% threshold. "
-                            f"Skipped to avoid ordering a near-empty case."),
+                            f"Skipped to avoid ordering a near-empty case. (Stockout-imminent "
+                            f"override needs < {stockout_days:.0f} days cover AND velocity ≥ "
+                            f"{stockout_min_vel}/day; velocity here is {velocity:.2f}.)"),
             "values": {
                 "shortfall_units": round(shortfall, 2),
                 "pack_size": pack_size,
                 "case_fraction_needed": round(cases_needed_raw, 3),
                 "pack_min_fraction": pack_min_fraction,
+                "ceiling_used": ceiling_used,
             },
         })
     else:
@@ -255,8 +313,12 @@ def diagnose_sku(conn: sqlite3.Connection,
             note = "Zero velocity — pack-size check N/A"
         elif shortfall <= 0:
             note = "No shortfall — already have enough"
+        elif override_fires and cases_needed_raw < pack_min_fraction:
+            note = (f"Below case threshold, but stockout-imminent override fires "
+                    f"({days_cover_num:.1f} days cover < {stockout_days:.0f} and velocity "
+                    f"{velocity:.2f} ≥ {stockout_min_vel}/day) → one full case")
         else:
-            note = (f"Engine wants {shortfall:.2f} units = {cases_needed_raw:.2f} "
+            note = (f"Engine wants {shortfall:.0f} units = {cases_needed_raw:.2f} "
                     f"of a {pack_size}-pack ≥ {(pack_min_fraction*100):.0f}% threshold")
         checks.append({
             "name": "pack_size_threshold",
@@ -266,6 +328,7 @@ def diagnose_sku(conn: sqlite3.Connection,
                 "shortfall_units": round(shortfall, 2),
                 "pack_size": pack_size,
                 "case_fraction_needed": round(cases_needed_raw, 3) if velocity > 0 else None,
+                "ceiling_used": ceiling_used,
             },
         })
 

@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jobs.reorder_engine import (
     compute_all_reorders, compute_mix_multipliers,
     CEILING_DAYS_DEFAULT, MIN_VELOCITY_DEFAULT,
+    _load_settings as load_engine_settings,
 )
 from jobs.auth import (
     hash_password, verify_password,
@@ -941,8 +942,12 @@ def get_reorder(
     top_level: str | None = None,
     urgency: str | None = None,              # stockout | critical | high | medium | all
     include_ocs_out: bool = False,
-    ceiling_days: int = CEILING_DAYS_DEFAULT,
-    min_velocity: float = MIN_VELOCITY_DEFAULT,
+    # None = use the live values from app_settings (Settings tab). Passing a
+    # value here overrides settings for this request only. These MUST default
+    # to None: hardcoded defaults silently overrode the Settings tab, so the
+    # report ran different math than the configured (and diagnosed) values.
+    ceiling_days: int | None = None,
+    min_velocity: float | None = None,
     mix_aware: bool = False,                 # NEW: apply category mix multipliers
     mix_days: int = 90,                      # window for mix signal (default 90d)
 ) -> dict:
@@ -1041,6 +1046,14 @@ def get_reorder(
         # connection block; reorder totals + stockout count are added at return.
         kpis_inv = compute_reorder_kpis(conn, store=store, top_level=tl, as_of=as_of)
 
+        # Resolve the effective engine knobs for the settings echo, so the UI
+        # reports the values the engine actually ran with (settings or override).
+        eng = load_engine_settings(conn)
+        resolved_ceiling = (ceiling_days if ceiling_days is not None
+                            else int(eng["reorder.regular_ceiling_days"]))
+        resolved_min_velocity = (min_velocity if min_velocity is not None
+                                 else float(eng["reorder.min_velocity"]))
+
     recs = filter_by_top_level(recs, tl, default_exclude_other=True)
 
     payload = []
@@ -1124,9 +1137,19 @@ def get_reorder(
     # Actionable = has a reorder qty > 0 AND urgency is not "ok"/"overstock"/etc.
     # With the new min-max model, recs below min_velocity or above COVERAGE_DAYS
     # already have reorder_qty=0, so this naturally filters them out.
+    #
+    # EXCEPTION — stockouts stay visible even at qty 0. A selling SKU at zero
+    # on-hand whose demand rounds below the case threshold used to vanish from
+    # the report entirely (while the Active Stockouts KPI still counted it),
+    # so it could never be reordered until someone noticed by hand. Keep the
+    # row, flag it needs_review, and let the manager decide.
     actionable = [p for p in payload
                   if p["urgency"] in ("stockout", "critical", "high", "medium")
-                  and p["reorder_qty"] > 0]
+                  and (p["reorder_qty"] > 0 or p["urgency"] == "stockout")]
+    for p in actionable:
+        p["needs_review"] = (p["urgency"] == "stockout" and p["reorder_qty"] == 0)
+        if p["needs_review"]:
+            p["notes"] = "Manual review — stocked out, demand below case threshold"
 
     # Exclude OCS-out-of-stock items unless explicitly requested. Two exemptions
     # keep genuinely-orderable items from being hidden by a stale catalogue NO:
@@ -1165,7 +1188,9 @@ def get_reorder(
         if p.get("urgency") in REBATE_PROMOTE_TIERS:
             has_rebate = bool(p.get("data_fee_pct") or p.get("data_fee_is_direct"))
             rebate_bump = 0 if has_rebate else 1
-        return (u, rebate_bump, -(p.get("line_total") or 0))
+        # Zero-qty needs_review stockouts sort after ordered stockouts
+        review_bump = 1 if p.get("needs_review") else 0
+        return (u, review_bump, rebate_bump, -(p.get("line_total") or 0))
     actionable.sort(key=_sort_key)
 
     # Assemble header KPIs: inventory-derived metrics + this week's reorder
@@ -1174,7 +1199,10 @@ def get_reorder(
         **kpis_inv,
         "reorder_cost": round(sum(p["line_total"] for p in actionable), 2),
         "reorder_units": sum(p["reorder_qty"] for p in actionable),
-        "reorder_skus": len(actionable),
+        # Count only rows with an actual order — needs_review rows (qty 0) are
+        # visible in the table but aren't "SKUs being reordered".
+        "reorder_skus": sum(1 for p in actionable if p["reorder_qty"] > 0),
+        "needs_review_skus": sum(1 for p in actionable if p.get("needs_review")),
         "active_stockouts": sum(1 for r in recs if r.urgency == "stockout"),
         # Cost share of the order that's just filling stockouts (genuine missed
         # demand). Used by Highlights to tell "you're over-ordering" apart from
@@ -1193,8 +1221,8 @@ def get_reorder(
         "kpis": kpis,
         "top_level": tl,
         "settings": {
-            "ceiling_days": ceiling_days,
-            "min_velocity": min_velocity,
+            "ceiling_days": resolved_ceiling,
+            "min_velocity": resolved_min_velocity,
             "include_ocs_out": include_ocs_out,
             "mix_aware": mix_aware,
             "mix_days": mix_days if mix_aware else None,

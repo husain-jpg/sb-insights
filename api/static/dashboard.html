@@ -1090,6 +1090,7 @@ function showReorderLegend() {
           ${row(tag("background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4);", "critical"), "Critical", "Days of cover is less than lead time. Will hit stockout before next delivery.")}
           ${row(tag("background: rgba(214, 180, 70, 0.15); color: #c89b32; border-color: rgba(220, 190, 80, 0.4);", "high"), "High", "Days of cover is less than lead time + safety buffer. Could stock out before the next order cycle.")}
           ${row(tag("background: rgba(106, 166, 214, 0.15); color: #6aa6d6; border-color: rgba(116, 176, 224, 0.4);", "medium"), "Medium", "Will need a reorder soon but not urgently.")}
+          ${row(tag("background: rgba(200,155,50,.15); color: #c89b32;", "manual"), "Manual review", "Stocked out, but 30-day demand is below the minimum case fraction — the engine won't auto-order a case. Shown (instead of hidden) so you can decide: order one case anyway, or let it go. Diagnose shows the math.")}
         </table>
 
         <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Sale Status</h4>
@@ -1192,11 +1193,12 @@ async function showReorderDiagnose() {
         <tr><td style="padding: 4px 8px; color: var(--text-dim);">Category</td><td>${escapeHtml(inp.category || '?')} → ${escapeHtml(inp.subcategory || '?')}</td></tr>
         <tr><td style="padding: 4px 8px; color: var(--text-dim);">Top-level</td><td>${escapeHtml(inp.top_level_classification || '?')}</td></tr>
         <tr><td style="padding: 4px 8px; color: var(--text-dim);">On hand</td><td>${inp.on_hand} units (as of ${inp.inventory_as_of || '?'})</td></tr>
-        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Velocity</td><td>${inp.velocity_per_day} units/day (${inp.units_sold_30d} units over last 30 days)</td></tr>
+        <tr><td style="padding: 4px 8px; color: var(--text-dim);">Velocity</td><td>${inp.velocity_per_day} units/day (${inp.units_sold_30d} units ÷ ${inp.velocity_basis_days || 30} sellable days${(inp.velocity_basis_days || 30) < 30 ? ' — stockout-adjusted' : ''})</td></tr>
         <tr><td style="padding: 4px 8px; color: var(--text-dim);">Days of cover</td><td>${inp.days_of_cover}</td></tr>
         <tr><td style="padding: 4px 8px; color: var(--text-dim);">Pack size</td><td>${inp.pack_size}</td></tr>
         <tr><td style="padding: 4px 8px; color: var(--text-dim);">OCS stock</td><td>${escapeHtml(inp.ocs_stock_status || '?')} · price ${inp.ocs_unit_price ? '$' + inp.ocs_unit_price.toFixed(2) : '?'}</td></tr>
-        ${inp.min_qty_anchor != null || inp.max_qty_anchor != null ? `<tr><td style="padding: 4px 8px; color: var(--text-dim);">Min/Max override</td><td>min: ${inp.min_qty_anchor ?? '—'}, max: ${inp.max_qty_anchor ?? '—'}</td></tr>` : ''}
+        ${inp.is_hero ? `<tr><td style="padding: 4px 8px; color: var(--text-dim);">Hero</td><td><span style="color: #c89b32;">★ Hero at this store</span> (ceiling ${inp.settings_applied?.ceiling_used ?? '?'}d)</td></tr>` : ''}
+        ${inp.anchor_override ? `<tr><td style="padding: 4px 8px; color: var(--text-dim);">Manager override</td><td>${escapeHtml(inp.anchor_override)} (anchor)</td></tr>` : ''}
       </table>
     `;
 
@@ -1519,6 +1521,12 @@ async function renderReorder() {
           : '<span class="muted" title="SKU not in current OCS catalog">—</span>' },
       { key: 'reorder_qty', label: 'Order qty', type: 'number', align: 'right',
         render: r => {
+          // Stocked out but demand below the case threshold — engine won't
+          // auto-order; surfaced for a manual call instead of hidden.
+          if (r.needs_review) {
+            return `<span class="tag" style="background: rgba(200,155,50,.15); color: #c89b32; font-weight: 600;"
+              title="Stocked out, but 30-day demand is below the minimum case fraction, so the engine won't auto-order a case. Decide manually — click Diagnose for the math.">manual</span>`;
+          }
           const casesText = r.reorder_cases ? `<div class="sku">${r.reorder_cases} case${r.reorder_cases === 1 ? '' : 's'}</div>` : '';
           // Show mix multiplier tag if it diverges from 1.0
           let mixTag = '';
