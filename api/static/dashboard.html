@@ -371,6 +371,52 @@
     border-radius: 50%; animation: spin 0.7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Spliff loader (Overview) — a little joint with a pulsing cherry and
+     smoke wisps drifting up. Pure CSS, no assets. */
+  .spliff-loader { display: inline-flex; align-items: center; gap: 16px; }
+  .spliff { position: relative; display: inline-block; width: 78px; height: 30px; }
+  .spliff-body {
+    position: absolute; left: 0; bottom: 6px; width: 62px; height: 9px;
+    background: linear-gradient(90deg, #b8a37e 0%, #e8dcc0 25%, #f2ead6 100%);
+    border-radius: 4px 2px 2px 4px;
+  }
+  /* twisted paper tip at the mouth end */
+  .spliff-body::before {
+    content: ''; position: absolute; left: -5px; top: 2px; width: 7px; height: 5px;
+    background: #a08c66; border-radius: 3px 1px 1px 3px; transform: rotate(-14deg);
+  }
+  /* burn line where paper meets cherry */
+  .spliff-body::after {
+    content: ''; position: absolute; right: -1px; top: 0; width: 3px; height: 9px;
+    background: #4a4039; border-radius: 1px;
+  }
+  .spliff-ember {
+    position: absolute; left: 62px; bottom: 6px; width: 9px; height: 9px;
+    background: radial-gradient(circle, #ffd27a 0%, #ff7a3c 45%, #c23616 85%);
+    border-radius: 50%;
+    animation: emberPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes emberPulse {
+    0%, 100% { opacity: .65; box-shadow: 0 0 4px 1px rgba(255, 122, 60, .35); }
+    50%      { opacity: 1;   box-shadow: 0 0 10px 3px rgba(255, 122, 60, .7); }
+  }
+  .spliff-smoke { position: absolute; left: 66px; bottom: 16px; width: 6px; height: 6px; }
+  .spliff-smoke span {
+    position: absolute; bottom: 0; left: 0; width: 6px; height: 6px;
+    background: rgba(165, 165, 175, .4); border-radius: 50%;
+    opacity: 0;
+    animation: smokeRise 2.4s ease-out infinite;
+  }
+  .spliff-smoke span:nth-child(2) { animation-delay: .8s; }
+  .spliff-smoke span:nth-child(3) { animation-delay: 1.6s; }
+  @keyframes smokeRise {
+    0%   { transform: translate(0, 0) scale(.5); opacity: 0; }
+    15%  { opacity: .85; }
+    60%  { transform: translate(-7px, -16px) scale(1.6); opacity: .45; }
+    100% { transform: translate(4px, -30px) scale(2.6); opacity: 0; }
+  }
+
   /* dim a panel while it's refreshing */
   .is-loading { opacity: 0.45; pointer-events: none; transition: opacity 120ms; }
   .error {
@@ -726,7 +772,16 @@ let _overviewStore = "";  // "" = all stores
 
 async function renderOverview() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING...</div>`;
+  main.innerHTML = `<div class="loading">
+    <span class="spliff-loader">
+      <span class="spliff">
+        <span class="spliff-body"></span>
+        <span class="spliff-ember"></span>
+        <span class="spliff-smoke"><span></span><span></span><span></span></span>
+      </span>
+      Loading…
+    </span>
+  </div>`;
   try {
     const locs = await api("/api/locations");
     const params = _overviewStore ? `?store=${_overviewStore}` : "";
