@@ -46,9 +46,16 @@ COLLECTIVE_PRIORITY = {
 }
 
 
-def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = None) -> dict:
+def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = None,
+                              extra_meta: dict | None = None) -> dict:
     """
     For each SKU in `skus`, return the active deal(s) that apply.
+
+    extra_meta: optional {sku: {"brand":, "lp":, "category":, "subcategory":}}
+    fallback used for SKUs missing from the products table (e.g. Suggested
+    Additions — SKUs no store carries yet). Without meta, brand/LP-scoped
+    deals (Data LP Partners, LTOs) can't match those SKUs; SKU-scoped
+    collective deals always match either way.
 
     Returns (preserving backward-compat as much as possible):
         {sku: {
@@ -107,6 +114,12 @@ def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = No
                 sku_meta[cova_sku] = meta
             if ocs_var and ocs_var in sku_set:
                 sku_meta[ocs_var] = meta
+
+    # Caller-provided fallback meta for SKUs the products table doesn't know.
+    if extra_meta:
+        for k, m in extra_meta.items():
+            if k in sku_set and k not in sku_meta:
+                sku_meta[k] = m
 
     # 2) Load active Data LP Partner agreements. These are LP/brand-scoped,
     #    not SKU-scoped. We'll match each SKU against the partner list by

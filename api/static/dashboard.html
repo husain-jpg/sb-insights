@@ -946,7 +946,7 @@ async function loadSuggestedAdditions(locationId) {
       <div style="padding: 10px 16px; cursor: pointer; display: flex; justify-content: space-between; align-items: center;" id="sa-header">
         <div style="font-size: 12px;">
           <strong style="color: #c89b32;">⭐ Suggested Additions</strong>
-          <span style="color: var(--text-dim); margin-left: 8px;">${data.count} peer-popular SKU${data.count === 1 ? '' : 's'} you don't carry · trial cost ~${fmt$(totalCost)}</span>
+          <span style="color: var(--text-dim); margin-left: 8px;">${data.count} peer-popular SKU${data.count === 1 ? '' : 's'} you don't carry · trial cost ~${fmt$(totalCost)}${(() => { const n = data.items.filter(it => it.data_fee_pct && !it.data_fee_is_direct).length; return n ? ` · <span style=\"color: #6dab84;\">${n} with rebates</span>` : ''; })()}</span>
           ${stale ? '<span class="tag" style="background: rgba(214, 100, 100, 0.15); color: #d66464; font-size: 10px; margin-left: 8px;">STALE DATA</span>' : ''}
         </div>
         <div style="font-size: 11px; color: var(--text-dim);">
@@ -980,12 +980,24 @@ function renderSuggestedTable(items, locationId) {
     const stockTag = it.stock_status === "YES"
       ? '<span class="tag tag-accent" style="font-size: 9px;">In stock</span>'
       : '<span class="tag tag-critical" style="font-size: 9px;">Out</span>';
+    // Rebate badge — same semantics as the reorder table tags.
+    const rebateTag = (() => {
+      if (it.data_fee_is_direct) {
+        return `<span class="tag" style="background: rgba(140, 100, 180, 0.15); color: #a78bd9; border-color: rgba(160, 110, 200, 0.4); font-size: 9px; padding: 1px 5px; margin-left: 6px;" title="Direct deal with ${escapeHtml(it.data_fee_partner || '')} — excluded from collective rebate programs">DIRECT</span>`;
+      }
+      if (it.data_fee_pct) {
+        const basis = it.data_fee_basis === 'wholesale_cost' ? 'WS' : it.data_fee_basis === 'retail_sales' ? 'RT' : '';
+        const partnerShort = it.data_fee_partner === 'Canna Collective' ? 'CC' : (it.data_fee_partner || '');
+        return `<span class="tag" style="background: rgba(70, 140, 90, 0.15); color: #6dab84; border-color: rgba(80, 160, 100, 0.4); font-size: 9px; padding: 1px 5px; margin-left: 6px;" title="Qualifies for a rebate: ${escapeHtml(it.data_fee_partner || '')} pays ${it.data_fee_pct}% of ${it.data_fee_basis === 'wholesale_cost' ? 'wholesale cost' : 'retail sales'}">${escapeHtml(partnerShort)}: ${it.data_fee_pct}% ${basis}</span>`;
+      }
+      return '';
+    })();
     return `
       <tr>
         <td style="font-variant-numeric: tabular-nums; color: var(--text-dim);">${idx + 1}</td>
         <td>
           <strong>${escapeHtml(it.item_name || it.sku)}</strong>
-          <div class="sku">${escapeHtml(it.brand || '—')} · ${escapeHtml(it.subcategory || '—')} · ${escapeHtml(it.size || '—')}</div>
+          <div class="sku">${escapeHtml(it.brand || '—')} · ${escapeHtml(it.subcategory || '—')} · ${escapeHtml(it.size || '—')}${rebateTag}</div>
         </td>
         <td class="num" title="Avg units sold per peer store during the period">${it.municipality_units ? it.municipality_units.toFixed(0) : '—'}</td>
         <td class="num" title="Avg units sold per day at peer stores when SKU sells">${it.municipality_velocity ? it.municipality_velocity.toFixed(2) : '—'}</td>
@@ -1276,8 +1288,9 @@ async function renderReorder() {
         ${card('green','Suggested Reorder', fmt$(k.reorder_cost),
           `${fmtN(k.reorder_units)} u · ${fmtN(k.reorder_skus)} SKUs`,
           "This week's suggested reorder at OCS wholesale cost.")}
-        ${card('red','Active Stockouts', fmtN(k.active_stockouts), 'Selling SKUs at 0 qty',
-          'SKUs that are selling but currently at 0 on-hand.')}
+        ${card('red','Active Stockouts', fmtN(k.active_stockouts),
+          `Selling SKUs at 0 qty${k.needs_review_skus ? ` · ${fmtN(k.needs_review_skus)} manual` : ''}`,
+          'SKUs that are selling but currently at 0 on-hand. Manual = stockouts below the case threshold; the engine will not auto-order them — they are listed in the table for a manual call.')}
         ${card('amber','Slow + Dead', fmt$(k.slow_dead_total_value),
           `Slow ${fmt$(k.slow_stock_value)} · Dead ${fmt$(k.dead_stock_value)}`,
           `On-hand value not sold in ${k.slow_days}+ days. Slow = sold ${slowRange}d ago (${fmtN(k.slow_stock_skus)} SKUs); Dead = ${k.dead_days}+d ago (${fmtN(k.dead_stock_skus)} SKUs).`)}
@@ -1405,9 +1418,7 @@ async function renderReorder() {
 
       <div class="card">
         <div class="summary-bar" id="reorder-summary">
-          <div>SKUs<strong>${data.count}</strong></div>
-          <div>Total units<strong>${fmtN(data.total_units)}</strong></div>
-          <div>Est. wholesale<strong>${fmt$(data.total_wholesale_cost)}</strong></div>
+          ${reorderSummaryHTML(data.recommendations)}
         </div>
         <div id="mix-multiplier-summary" style="display: none; padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text-dim);"></div>
         <div id="suggested-additions-panel" style="display: none;"></div>
@@ -1415,8 +1426,8 @@ async function renderReorder() {
       </div>
 
       <div class="hint-box">
-        <strong>Tiered min-max model.</strong> Long-tail SKUs: skipped if selling &lt; 3.5/week; otherwise restocked to 21-day supply when under 11 days. <strong>Hero SKUs</strong> (top 50 per store by trailing 90-day revenue, shown as <span class="tag" style="background: rgba(180, 140, 40, 0.15); color: #c89b32; border-color: rgba(200, 155, 50, 0.4); font-size: 9px; padding: 1px 5px;">★ HERO</span>) get protective treatment: no velocity floor, wider 28-day ceiling.
-        Toggle <strong>Mix-aware</strong> to let category drift adjust the ceiling per-SKU. Toggle <strong>Heroes only</strong> to see just the Top 50 Hero items.
+        <strong>Tiered min-max model.</strong> A SKU is restocked up to its ceiling (currently ${data.settings?.ceiling_days ?? '—'} days of supply) once stock drops to the reorder trigger. <strong>Hero SKUs</strong> (<span style="color: #c89b32;">★</span> — top sellers per format at each store by trailing revenue) get protective treatment with their own ceiling. <span class="tag" style="background: rgba(200,155,50,.15); color: #c89b32; font-size: 9px; padding: 1px 5px;">manual</span> rows are stockouts whose demand is below the minimum case fraction — the engine won't auto-order a case, so make the call yourself (Diagnose shows the math).
+        All thresholds are tunable in <strong>Settings → Reorder Engine</strong> and apply on the next load.
       </div>
     `;
 
@@ -1441,6 +1452,20 @@ async function renderReorder() {
     }
     let excludedSkus = loadExclusions();
 
+    // Summary-bar numbers. "SKUs to order" counts only rows with an actual
+    // quantity; zero-qty manual-review stockouts get their own count so the
+    // headline isn't inflated by rows that aren't really being ordered.
+    function reorderSummaryHTML(rows, badges = []) {
+      const orderedCount = rows.filter(r => r.reorder_qty > 0).length;
+      const manualCount = rows.filter(r => r.needs_review).length;
+      return `
+        <div>SKUs to order<strong>${orderedCount}</strong> ${badges.join(' ')}</div>
+        ${manualCount > 0 ? `<div title="Stockouts below the case threshold — engine won't auto-order; decide manually.">Manual review<strong style="color: #c89b32;">${manualCount}</strong></div>` : ''}
+        <div>Total units<strong>${fmtN(rows.reduce((s, r) => s + r.reorder_qty, 0))}</strong></div>
+        <div>Est. wholesale<strong>${fmt$(rows.reduce((s, r) => s + (r.line_total || 0), 0))}</strong></div>
+      `;
+    }
+
     const columns = [
       { key: '__include', label: 'Include / Exclude', sortable: false,
         tooltip: "Checked = include in this week's order. Uncheck to exclude.",
@@ -1454,7 +1479,9 @@ async function renderReorder() {
         render: r => `<span class="tag ${urgencyTagClass(r.urgency)}">${r.urgency}</span>` },
       { key: 'product_name', label: 'Product',
         render: r => {
-          const anchor = r.is_top_sku ? `<span class="tag" style="background: rgba(180, 140, 40, 0.15); color: #c89b32; border-color: rgba(200, 155, 50, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Top 50 SKU by trailing 90-day revenue — protected by tiered reorder logic">★ HERO</span>` : '';
+          // Name on line 1 (just a slim ★ for Heroes); everything else lives
+          // on the small line 2 so the product name stays scannable.
+          const anchor = r.is_top_sku ? `<span style="color: #c89b32; margin-right: 4px;" title="Hero — top seller in its format at this store by trailing revenue; protected by tiered reorder logic">★</span>` : '';
           const dataFee = (() => {
             if (r.data_fee_is_direct) {
               return `<span class="tag" style="background: rgba(140, 100, 180, 0.15); color: #a78bd9; border-color: rgba(160, 110, 200, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Direct deal with ${r.data_fee_partner} — this SKU is excluded from collective rebate programs">DIRECT</span>`;
@@ -1495,17 +1522,18 @@ async function renderReorder() {
             if (r.sale_flag === 'active') {
               const d = r.sale_flag_detail || {};
               const tip = `Active Sale: ${d.active_days_in_7 || '?'} of last 7 days had >30% of units discounted (avg ${d.avg_discount_pct || '?'}% off). Velocity may be inflated — be cautious about ordering as if this rate is steady-state.`;
-              return `<span class="tag" style="background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="${tip}">🏷️ Active Sale</span>`;
+              return `<span class="tag" style="background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="${tip}">🏷️ Sale</span>`;
             }
             if (r.sale_flag === 'recent') {
               const d = r.sale_flag_detail || {};
               const since = d.days_since_last_promo != null ? `${d.days_since_last_promo}d ago` : 'recent';
               const tip = `Recently Ended Sale: last promo ${since}. Velocity over the past 30 days reflects sale conditions and may revert downward.`;
-              return `<span class="tag" style="background: rgba(150, 150, 150, 0.15); color: #999; border-color: rgba(160, 160, 160, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="${tip}">↘️ Recently Ended Sale</span>`;
+              return `<span class="tag" style="background: rgba(150, 150, 150, 0.15); color: #999; border-color: rgba(160, 160, 160, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="${tip}">↘️ Post-sale</span>`;
             }
             return '';
           })();
-          return `${anchor}${dataFee}${ofBadges}${saleTag}${escapeHtml(r.product_name)}<div class="sku">${r.sku} · ${r.category || "—"}</div>`;
+          const badges = `${dataFee}${ofBadges}${saleTag}`;
+          return `${anchor}${escapeHtml(r.product_name)}<div class="sku">${r.sku} · ${r.category || "—"}${badges ? `<span style="margin-left: 6px;">${badges}</span>` : ''}</div>`;
         } },
       { key: 'location_id', label: 'Store', render: r => storeLabel(r.location_id) },
       { key: 'on_hand', label: 'On hand', type: 'number', align: 'right',
@@ -1658,11 +1686,7 @@ async function renderReorder() {
       if (dataFeeCount > 0 && !dataFeesOnly) badges.push(`<span style="color: #6dab84; font-size: 10px;">(${dataFeeCount} rebate)</span>`);
       if (saleCount > 0 && !saleFlaggedOnly) badges.push(`<span style="color: #d6b446; font-size: 10px;">(${saleCount} on sale)</span>`);
       if (excludedCount > 0 && !showExcluded) badges.push(`<span style="color: var(--text-dim); font-size: 10px;">(${excludedCount} excluded hidden)</span>`);
-      document.getElementById("reorder-summary").innerHTML = `
-        <div>SKUs<strong>${filtered.length}</strong> ${badges.join(' ')}</div>
-        <div>Total units<strong>${fmtN(filtered.reduce((s, r) => s + r.reorder_qty, 0))}</strong></div>
-        <div>Est. wholesale<strong>${fmt$(filtered.reduce((s, r) => s + (r.line_total || 0), 0))}</strong></div>
-      `;
+      document.getElementById("reorder-summary").innerHTML = reorderSummaryHTML(filtered, badges);
     }
 
     async function refetch() {
@@ -1739,11 +1763,10 @@ async function renderReorder() {
       if (categoryFilter) visible = visible.filter(r => r.category === categoryFilter);
       if (!showExcluded) visible = visible.filter(r => !excludedSkus.has(excludeKey(r)));
       const anchorCount = visible.filter(r => r.is_top_sku).length;
-      summary.innerHTML = `
-        <div>SKUs<strong>${visible.length}</strong>${anchorCount > 0 && !anchorsOnly ? ` <span style="color: #c89b32; font-size: 10px;">(${anchorCount} Hero)</span>` : ''}${excludedCount > 0 && !showExcluded ? ` <span style="color: var(--text-dim); font-size: 10px;">(${excludedCount} excluded hidden)</span>` : ''}</div>
-        <div>Total units<strong>${fmtN(visible.reduce((s, r) => s + r.reorder_qty, 0))}</strong></div>
-        <div>Est. wholesale<strong>${fmt$(visible.reduce((s, r) => s + (r.line_total || 0), 0))}</strong></div>
-      `;
+      const cbBadges = [];
+      if (anchorCount > 0 && !anchorsOnly) cbBadges.push(`<span style="color: #c89b32; font-size: 10px;">(${anchorCount} Hero)</span>`);
+      if (excludedCount > 0 && !showExcluded) cbBadges.push(`<span style="color: var(--text-dim); font-size: 10px;">(${excludedCount} excluded hidden)</span>`);
+      summary.innerHTML = reorderSummaryHTML(visible, cbBadges);
     });
 
     // Clear exclusions button

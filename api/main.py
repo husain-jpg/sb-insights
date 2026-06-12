@@ -5088,6 +5088,26 @@ def get_suggested_additions(
             it["suggested_units"] = suggested_units
             it["suggested_cost"] = round(unit_price * suggested_units, 2)
 
+        # Rebate qualification — same resolver + field names as the reorder
+        # rows, so the UI badge logic carries over. These SKUs usually aren't
+        # in the products table (no store carries them), so pass the market-
+        # intel brand/supplier as fallback meta — without it, brand-scoped
+        # direct deals can't match and a blocked collective could show as
+        # active.
+        from jobs.data_revenue_resolver import get_active_deals_for_skus
+        extra_meta = {
+            it["sku"]: {"brand": it.get("brand"), "lp": it.get("supplier"),
+                        "category": None, "subcategory": it.get("subcategory")}
+            for it in items
+        }
+        deal_map = get_active_deals_for_skus(conn, set(extra_meta), extra_meta=extra_meta)
+        for it in items:
+            deal = deal_map.get(it["sku"])
+            it["data_fee_pct"] = round(deal["percentage"], 2) if deal else None
+            it["data_fee_partner"] = deal["partner"] if deal else None
+            it["data_fee_basis"] = deal["basis"] if deal else None
+            it["data_fee_is_direct"] = bool(deal and deal["is_direct"])
+
     return {
         "count": len(items),
         "items": items,
