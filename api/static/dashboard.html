@@ -1241,8 +1241,7 @@ function showReorderLegend() {
         <table style="font-size: 13px; margin-bottom: 20px;">
           ${row(tag("background: rgba(80, 180, 100, 0.18); color: #6fcf85; border-color: rgba(90, 200, 110, 0.45);", "BACK IN STOCK"), "Back in stock", "Back in stock at OCS as of the latest Order Fill template.")}
           ${row(tag("background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45);", "NEW"), "New arrival", "Newly listed in OCS's latest Order Fill.")}
-          ${row(tag("background: rgba(106, 166, 214, 0.15); color: #6aa6d6; border-color: rgba(116, 176, 224, 0.4);", "CTB"), "Click-to-Buy", "Ships directly from OCS warehouse. Shortest lead time (~5 days).")}
-          ${row(tag("background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4);", "FT-EXP"), "Flow Through Expedited", "Cova-managed Flow Through, expedited tier. Mid lead time (~12 days).")}
+          ${row(tag("background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4);", "FT-EXP"), "Flow Through Expedited", "Cova-managed Flow Through, expedited tier. Mid lead time (~12 days). (Click-to-Buy isn't tagged — see the OCS Avail. column.)")}
           ${row(tag("background: rgba(180, 130, 100, 0.15); color: #c08560; border-color: rgba(190, 140, 110, 0.4);", "FT-STD"), "Flow Through Standard", "Cova-managed Flow Through, standard tier. Longest lead time (~19 days).")}
         </table>
 
@@ -1647,11 +1646,11 @@ async function renderReorder() {
             if (r.order_fill_new_arrival) {
               out.push(`<span class="tag" style="background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Newly listed in the latest Order Fill">NEW</span>`);
             }
-            // Flow Through tier badge — only if SKU is in latest Order Fill
-            if (r.order_fill_flow_thru === false) {
-              const eta = r.order_fill_estimated_delivery ? ` (delivery ${r.order_fill_estimated_delivery})` : '';
-              out.push(`<span class="tag" style="background: rgba(106, 166, 214, 0.15); color: #6aa6d6; border-color: rgba(116, 176, 224, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Click-to-Buy: ships direct from OCS warehouse${eta}">CTB</span>`);
-            } else if (r.order_fill_flow_thru === true) {
+            // Flow Through tier badge — only for the Flow-Through tiers, which
+            // carry delivery-tier detail the OCS Avail column doesn't show.
+            // (Click-to-Buy has no badge: the OCS Avail column already labels
+            // it "Click-to-Buy", so a CTB tag here was pure duplication.)
+            if (r.order_fill_flow_thru === true) {
               const tier = r.order_fill_delivery_tier;
               const eta = r.order_fill_estimated_delivery ? ` (delivery ${r.order_fill_estimated_delivery})` : '';
               if (tier === 'Expedited') {
