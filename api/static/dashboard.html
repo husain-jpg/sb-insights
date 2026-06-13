@@ -2562,91 +2562,103 @@ async function updateStatus() {
 // ========================================================================
 // MIX ANALYSIS
 // ========================================================================
-// Color palette for category slices. Repeats predictably so the legend can
-// match. Colors chosen to be distinguishable on dark background.
-const MIX_PALETTE = [
-  '#6aa6d6', '#dc965a', '#6dab84', '#c89b32', '#a78bd9',
-  '#d6b446', '#e88246', '#7fb3a8', '#c08560', '#9d7fb8',
-  '#5e88a8', '#b89455', '#7a9d6f', '#a87456', '#8c7eb0',
-];
+// Plain-English takeaways from the mix data: where you're under/over-stocked
+// in dollars, and where cash is parked in slow categories. Replaces "stare at
+// 33 rows and do the math yourself".
+function mixTakeawaysHTML(d) {
+  const items = d.items || [];
+  // Only categories big enough to matter (≥1% of either side).
+  const meaningful = items.filter(i => (i.inv_pct >= 1 || i.sales_pct >= 1));
+  const unders = meaningful.filter(i => i.drift <= -1.5).sort((a, b) => a.drift - b.drift);
+  const overs = meaningful.filter(i => i.drift >= 1.5).sort((a, b) => b.drift - a.drift);
+  const slow = meaningful
+    .filter(i => i.inv_pct >= 1 && ((i.days_of_supply != null && i.days_of_supply > 90) || (i.days_of_supply == null && i.inv_cost > 500)))
+    .sort((a, b) => (b.days_of_supply ?? 9999) - (a.days_of_supply ?? 9999));
 
-// Draw an SVG donut chart for a list of {label, pct} slices.
-// pct values should sum to 100 (or close to it).
-function drawMixDonut(slices, labelToColor) {
-  if (!slices || slices.length === 0) {
-    return '<div style="font-size: 11px; color: var(--text-faint); padding: 32px;">No data</div>';
+  const dollars = v => fmt$(Math.abs(v || 0));
+  const dosText = i => i.days_of_supply == null ? 'no sales in window' : `${i.days_of_supply} days of supply`;
+  const bullets = [];
+
+  if (unders.length) {
+    const top = unders[0];
+    const also = unders.slice(1, 3).map(i => `${escapeHtml(i.category)} (${i.drift.toFixed(1)})`).join(', ');
+    bullets.push(`<span style="color: var(--critical);">●</span> <strong>Under-stocked: ${escapeHtml(top.category)}</strong> — ${top.sales_pct.toFixed(1)}% of sales but only ${top.inv_pct.toFixed(1)}% of inventory. Matching demand means roughly <strong>+${dollars(top.rebalance_dollars)}</strong> more stock (${dosText(top)} on hand).${also ? ` Also under: ${also}.` : ''}`);
   }
-  const total = slices.reduce((sum, s) => sum + (s.pct || 0), 0);
-  if (total <= 0) {
-    return '<div style="font-size: 11px; color: var(--text-faint); padding: 32px;">All zero</div>';
+  if (overs.length) {
+    const top = overs[0];
+    const also = overs.slice(1, 3).map(i => `${escapeHtml(i.category)} (+${i.drift.toFixed(1)})`).join(', ');
+    bullets.push(`<span style="color: var(--warning);">●</span> <strong>Over-stocked: ${escapeHtml(top.category)}</strong> — ${top.inv_pct.toFixed(1)}% of inventory (${fmt$(top.inv_cost)}) vs ${top.sales_pct.toFixed(1)}% of sales — about <strong>${dollars(top.rebalance_dollars)}</strong> more than demand supports (${dosText(top)}).${also ? ` Also over: ${also}.` : ''}`);
   }
-  const size = 180;
-  const cx = size / 2, cy = size / 2;
-  const outerR = 80, innerR = 50;
-  let cumulative = 0;
-  const arcs = slices.map(s => {
-    const fraction = (s.pct || 0) / total;
-    if (fraction <= 0) return '';
-    const startAngle = cumulative * 2 * Math.PI - Math.PI / 2;
-    const endAngle = (cumulative + fraction) * 2 * Math.PI - Math.PI / 2;
-    cumulative += fraction;
-    // Single-slice 100%: draw full circle (path arc can't span 360°)
-    if (Math.abs(fraction - 1) < 0.0001) {
-      return `<circle cx="${cx}" cy="${cy}" r="${outerR}" fill="${labelToColor[s.label]}" />
-              <circle cx="${cx}" cy="${cy}" r="${innerR}" fill="var(--bg-elev)" />`;
-    }
-    const x1 = cx + outerR * Math.cos(startAngle);
-    const y1 = cy + outerR * Math.sin(startAngle);
-    const x2 = cx + outerR * Math.cos(endAngle);
-    const y2 = cy + outerR * Math.sin(endAngle);
-    const x3 = cx + innerR * Math.cos(endAngle);
-    const y3 = cy + innerR * Math.sin(endAngle);
-    const x4 = cx + innerR * Math.cos(startAngle);
-    const y4 = cy + innerR * Math.sin(startAngle);
-    const largeArc = fraction > 0.5 ? 1 : 0;
-    const path = `M ${x1} ${y1} A ${outerR} ${outerR} 0 ${largeArc} 1 ${x2} ${y2}
-                  L ${x3} ${y3} A ${innerR} ${innerR} 0 ${largeArc} 0 ${x4} ${y4} Z`;
-    const tooltip = `${s.label}: ${(s.pct || 0).toFixed(1)}%`;
-    return `<path d="${path}" fill="${labelToColor[s.label]}" stroke="var(--bg-elev)" stroke-width="1"><title>${tooltip}</title></path>`;
-  }).join('');
-  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${arcs}</svg>`;
+  if (slow.length) {
+    const parts = slow.slice(0, 3).map(i =>
+      `<strong>${escapeHtml(i.category)}</strong> (${dosText(i)}, ${fmt$(i.inv_cost)} on hand)`);
+    bullets.push(`<span style="color: var(--text-dim);">●</span> <strong>Cash parked:</strong> ${parts.join(' · ')} — discount or transfer candidates; see Dead Stock / Overstock.`);
+  }
+  if (!unders.length && !overs.length) {
+    bullets.push(`<span style="color: #6dab84;">●</span> <strong>Mix is healthy</strong> — no meaningful category drifts more than ±1.5pts from its sales share.`);
+  }
+  bullets.push(`<span style="color: var(--text-faint);">●</span> The Reorder Report's <strong>Mix-aware</strong> toggle nudges order quantities toward the sales mix automatically — these numbers are what it corrects.`);
+
+  return `
+    <div style="padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);">
+      <strong>What this says</strong>
+      <span style="font-size: 11px; color: var(--text-dim); margin-left: 8px;">${d.window_days}-day sales window · categories under 1% share excluded</span>
+    </div>
+    <div style="padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; line-height: 1.5;">
+      ${bullets.map(b => `<div>${b}</div>`).join('')}
+    </div>
+  `;
 }
 
-// Render both donuts + a shared legend below them, given the mix data.
-function drawMixCharts(data) {
-  const items = data.items || [];
-  // Stable color assignment by category name so legend matches
-  const labelToColor = {};
-  items.forEach((it, idx) => {
-    labelToColor[it.category] = MIX_PALETTE[idx % MIX_PALETTE.length];
-  });
-  const invSlices = items.map(it => ({ label: it.category, pct: it.inv_pct || 0 }));
-  const salesSlices = items.map(it => ({ label: it.category, pct: it.sales_pct || 0 }));
-  const invEl = document.getElementById('mix-chart-inv');
-  const salesEl = document.getElementById('mix-chart-sales');
-  const legendEl = document.getElementById('mix-chart-legend');
-  if (invEl) invEl.innerHTML = drawMixDonut(invSlices, labelToColor);
-  if (salesEl) salesEl.innerHTML = drawMixDonut(salesSlices, labelToColor);
-  if (legendEl) {
-    legendEl.innerHTML = items.map(it => `
-      <div style="display: flex; align-items: center; gap: 6px; font-size: 11px;">
-        <span style="display: inline-block; width: 12px; height: 12px; border-radius: 2px; background: ${labelToColor[it.category]};"></span>
-        <span>${escapeHtml(it.category)}</span>
-        <span style="color: var(--text-faint);">(inv ${(it.inv_pct||0).toFixed(1)}% / sales ${(it.sales_pct||0).toFixed(1)}%)</span>
-      </div>
-    `).join('');
+// Paired horizontal bars (inventory share vs sales share) for the categories
+// big enough to matter, sorted most-under → most-over. One readable chart
+// instead of two 33-slice donuts.
+function mixBarsHTML(d) {
+  const items = (d.items || [])
+    .filter(i => i.inv_pct >= 2 || i.sales_pct >= 2)
+    .sort((a, b) => a.drift - b.drift);
+  if (!items.length) {
+    return '<div style="font-size: 11px; color: var(--text-faint); padding: 24px;">No categories above 2% share.</div>';
   }
+  const maxPct = Math.max(...items.map(i => Math.max(i.inv_pct, i.sales_pct)));
+  const bar = (pct, color) => `
+    <div style="height: 7px; border-radius: 2px; width: ${Math.max(0.5, pct / maxPct * 100)}%; background: ${color};"></div>`;
+  const driftBadge = (drift) => {
+    const color = drift <= -3 ? 'var(--critical)' : drift >= 3 ? 'var(--warning)' : 'var(--text-dim)';
+    return `<span style="color: ${color}; font-family: ui-monospace, Menlo, monospace; font-size: 11px;">${drift >= 0 ? '+' : ''}${drift.toFixed(1)}</span>`;
+  };
+  const rows = items.map(i => `
+    <div style="display: grid; grid-template-columns: 150px 1fr 48px; gap: 10px; align-items: center; padding: 5px 0;"
+         title="${escapeHtml(i.category)}: inventory ${i.inv_pct.toFixed(1)}% (${fmt$(i.inv_cost)}) vs sales ${i.sales_pct.toFixed(1)}% — ${i.days_of_supply != null ? i.days_of_supply + ' days of supply' : 'no sales in window'}">
+      <div style="font-size: 11px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(i.category)}</div>
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        ${bar(i.inv_pct, '#6aa6d6')}
+        ${bar(i.sales_pct, '#6dab84')}
+      </div>
+      <div style="text-align: right;">${driftBadge(i.drift)}</div>
+    </div>
+  `).join('');
+  return `
+    <div style="display: flex; gap: 16px; font-size: 10px; color: var(--text-dim); margin-bottom: 8px; justify-content: flex-end;">
+      <span><span style="display: inline-block; width: 10px; height: 7px; border-radius: 2px; background: #6aa6d6; margin-right: 4px;"></span>Inventory share</span>
+      <span><span style="display: inline-block; width: 10px; height: 7px; border-radius: 2px; background: #6dab84; margin-right: 4px;"></span>Sales share</span>
+      <span style="margin-left: 8px;">drift →</span>
+    </div>
+    ${rows}
+    <div style="font-size: 10px; color: var(--text-faint); margin-top: 8px;">Sorted most under-stocked → most over-stocked. Categories above 2% share. Hover a row for dollars.</div>
+  `;
 }
 
 async function renderMixAnalysis() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING MIX ANALYSIS...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading mix analysis…</div>`;
   try {
     const [locs, initialData] = await Promise.all([
       api("/api/locations"),
       api("/api/mix-analysis"),
     ]);
     let data = initialData;
+    let showSmall = false;
 
     const signalTag = sig => {
       if (sig === 'overweight_major') return '<span class="tag tag-warning">OVER</span>';
@@ -2656,11 +2668,15 @@ async function renderMixAnalysis() {
       return '<span class="tag">≈</span>';
     };
 
-    const renderSummary = (d) => `
-      <div>Categories<strong>${d.items.length}</strong></div>
+    const renderSummary = (d) => {
+      const small = d.items.filter(i => i.inv_pct < 1 && i.sales_pct < 1).length;
+      return `
+      <div>Categories<strong>${d.items.length}</strong> ${small && !showSmall ? `<span style="color: var(--text-dim); font-size: 10px;">(${small} small hidden)</span>` : ''}</div>
       <div>Inventory cost<strong>${fmt$(d.totals.inv_cost)}</strong></div>
       <div>Sales (${d.window_days}d)<strong>${fmt$(d.totals.sales_revenue)}</strong></div>
+      <div style="margin-left: auto;"><label style="font-size: 11px; color: var(--text-dim); cursor: pointer; user-select: none; font-weight: normal;"><input type="checkbox" id="mix-show-small" ${showSmall ? 'checked' : ''} style="vertical-align: -2px;"> Show small categories (&lt;1%)</label></div>
     `;
+    };
 
     main.innerHTML = `
       <div class="section-header">
@@ -2687,31 +2703,23 @@ async function renderMixAnalysis() {
         </div>
       </div>
 
+      <div class="card" style="margin-bottom: 14px;" id="mix-takeaways"></div>
+
       <div class="card" style="padding: 16px; margin-bottom: 14px;">
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start;">
-          <div>
-            <div style="font-size: 10px; font-family: ui-monospace, Menlo, monospace; letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; margin-bottom: 8px; text-align: center;">Inventory Mix (cost $)</div>
-            <div id="mix-chart-inv" style="display: flex; justify-content: center;"></div>
-          </div>
-          <div>
-            <div style="font-size: 10px; font-family: ui-monospace, Menlo, monospace; letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; margin-bottom: 8px; text-align: center;">Sales Mix (revenue $)</div>
-            <div id="mix-chart-sales" style="display: flex; justify-content: center;"></div>
-          </div>
-        </div>
-        <div id="mix-chart-legend" style="margin-top: 16px; display: flex; flex-wrap: wrap; gap: 12px; justify-content: center;"></div>
+        <div style="font-size: 10px; font-family: ui-monospace, Menlo, monospace; letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; margin-bottom: 10px;">Inventory share vs sales share — by category</div>
+        <div id="mix-chart"></div>
       </div>
 
       <div class="card">
-        <div class="summary-bar" id="mix-summary">${renderSummary(data)}</div>
+        <div class="summary-bar" id="mix-summary"></div>
         <div id="mix-table"></div>
       </div>
 
       <div class="hint-box">
-        <strong>Drift = Inventory % − Sales %.</strong> Positive = overweight (holding too much). Negative = underweight (not enough stock for demand).<br>
-        <span style="color: var(--critical)">UNDER</span> = drift ≤ −3pts &nbsp;·&nbsp;
-        <span style="color: var(--warning)">OVER</span> = drift ≥ +3pts &nbsp;·&nbsp;
-        <span style="color: var(--text-dim)">≈</span> = within ±1.5pts (balanced) <br>
-        <em>This surfaces hypotheses, not answers — seasonality, promos, and new-product ramps can create legitimate temporary drift.</em>
+        <strong>Drift = Inventory % − Sales %.</strong> Positive = over-stocked relative to demand; negative = under-stocked.
+        <strong>Days of supply</strong> = on-hand units ÷ daily units sold over the window ("—" = nothing sold).
+        <strong>Rebalance ≈$</strong> = inventory dollars to add (+) or trim (−) for the category to match its sales share — approximate, directional.
+        <em>Drift surfaces hypotheses, not verdicts — seasonality, promos, and new-product ramps create legitimate temporary drift.</em>
       </div>
     `;
 
@@ -2741,30 +2749,52 @@ async function renderMixAnalysis() {
           const color = r.drift >= 3 ? 'var(--warning)' : r.drift <= -3 ? 'var(--critical)' : 'inherit';
           return `<span style="color: ${color}; font-family: Georgia, serif; font-size: 15px;">${sign}${r.drift.toFixed(1)}</span>`;
         } },
-      { key: 'inv_units', label: 'Inv. units', type: 'number', align: 'right',
-        tooltip: 'Current units on hand in this category.' },
-      { key: 'sales_units', label: 'Units sold', type: 'number', align: 'right',
-        tooltip: 'Units sold over the report time period.' },
+      { key: 'days_of_supply', label: 'Days supply', type: 'number', align: 'right',
+        tooltip: 'On-hand units ÷ daily units sold over the window. "—" = nothing sold in window. High numbers = cash parked.',
+        render: r => {
+          if (r.days_of_supply == null) return '<span class="muted">—</span>';
+          const color = r.days_of_supply > 90 ? 'var(--warning)' : 'inherit';
+          return `<span style="color: ${color};">${fmtN(r.days_of_supply)}</span>`;
+        } },
+      { key: 'rebalance_dollars', label: 'Rebalance ≈$', type: 'number', align: 'right',
+        tooltip: 'Inventory dollars to add (+) or trim (−) for this category to match its sales share. Approximate and directional.',
+        render: r => {
+          const v = r.rebalance_dollars || 0;
+          if (Math.abs(v) < 500) return '<span class="muted">—</span>';
+          const color = v > 0 ? 'var(--critical)' : 'var(--warning)';
+          return `<span style="color: ${color};">${v > 0 ? '+' : '−'}${fmt$(Math.abs(v))}</span>`;
+        } },
     ];
 
-    // Sort: UNDER and OVER signals first (most actionable), then balanced.
-    // Within signal group, sort by absolute drift magnitude.
+    // Sort: actionable signals first, then by absolute drift magnitude.
     const signalRank = {
       'underweight_major': 0, 'overweight_major': 1,
       'underweight_minor': 2, 'overweight_minor': 3, 'balanced': 4,
     };
-    const sortedItems = [...data.items].sort((a, b) => {
+    const sortItems = (items) => [...items].sort((a, b) => {
       const ra = signalRank[a.signal] ?? 5;
       const rb = signalRank[b.signal] ?? 5;
       if (ra !== rb) return ra - rb;
       return Math.abs(b.drift) - Math.abs(a.drift);
     });
 
-    renderTable('mix-table', sortedItems, columns, {
-      defaultSort: null,
-      emptyText: 'No data for this selection.'
-    });
-    drawMixCharts(data);
+    const redraw = () => {
+      document.getElementById("mix-takeaways").innerHTML = mixTakeawaysHTML(data);
+      document.getElementById("mix-chart").innerHTML = mixBarsHTML(data);
+      document.getElementById("mix-summary").innerHTML = renderSummary(data);
+      const rows = showSmall
+        ? data.items
+        : data.items.filter(i => i.inv_pct >= 1 || i.sales_pct >= 1 || i.signal !== 'balanced');
+      renderTable('mix-table', sortItems(rows), columns, {
+        defaultSort: null,
+        emptyText: 'No data for this selection.'
+      });
+      document.getElementById("mix-show-small").addEventListener("change", (e) => {
+        showSmall = e.target.checked;
+        redraw();
+      });
+    };
+    redraw();
 
     const refetch = async () => {
       const params = new URLSearchParams();
@@ -2774,16 +2804,15 @@ async function renderMixAnalysis() {
       if (type) params.set("top_level", type);
       if (store) params.set("store", store);
       if (days) params.set("days", days);
-      data = await api(`/api/mix-analysis?${params.toString()}`);
-      document.getElementById("mix-summary").innerHTML = renderSummary(data);
-      const sortedRefetched = [...data.items].sort((a, b) => {
-        const ra = signalRank[a.signal] ?? 5;
-        const rb = signalRank[b.signal] ?? 5;
-        if (ra !== rb) return ra - rb;
-        return Math.abs(b.drift) - Math.abs(a.drift);
-      });
-      renderTable('mix-table', sortedRefetched, columns, { defaultSort: null });
-      drawMixCharts(data);
+      const tableBox = document.getElementById("mix-table");
+      if (tableBox) tableBox.innerHTML = `<div class="loading"><span class="spinner"></span> Updating…</div>`;
+      try {
+        data = await api(`/api/mix-analysis?${params.toString()}`);
+      } catch (e) {
+        if (tableBox) tableBox.innerHTML = `<div class="error"><strong>Couldn't load mix analysis</strong>${escapeHtml(e.message || String(e))}</div>`;
+        return;
+      }
+      redraw();
     };
 
     ["mix-type-filter", "mix-store-filter", "mix-days-filter"].forEach(id => {

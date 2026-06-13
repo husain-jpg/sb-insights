@@ -2955,6 +2955,17 @@ def mix_analysis(
         else:
             signal = "underweight_minor"
 
+        # Days of supply: on-hand units ÷ daily sales rate over the window.
+        # None = no sales in window (dead weight if there's stock).
+        daily_units = (sales_units / days) if days > 0 else 0
+        days_supply = round(inv_units / daily_units) if daily_units > 0 and inv_units > 0 else None
+
+        # Rebalance ≈$: inventory dollars to add (+) or trim (−) for this
+        # category's inventory share to match its sales share. Approximate —
+        # shares mix cost and revenue bases — but turns abstract drift points
+        # into a number a buyer can act on.
+        rebalance = round((sales_pct - inv_pct) / 100 * total_inv) if total_inv else 0
+
         items.append({
             "category": cat,
             "inv_units": inv_units,
@@ -2965,6 +2976,8 @@ def mix_analysis(
             "sales_pct": round(sales_pct, 1),
             "drift": round(drift, 1),
             "signal": signal,
+            "days_of_supply": days_supply,
+            "rebalance_dollars": rebalance,
         })
 
     # Sort by absolute drift, biggest signals first
@@ -3487,6 +3500,8 @@ def export_mix_analysis(
         {"key": "sales_revenue", "label": "Sales", "format": "currency"},
         {"key": "sales_pct", "label": "Sales %", "format": "decimal"},
         {"key": "drift", "label": "Drift (pts)", "format": "decimal"},
+        {"key": "days_of_supply", "label": "Days of Supply", "format": "int"},
+        {"key": "rebalance_dollars", "label": "Rebalance $", "format": "currency"},
         {"key": "inv_units", "label": "Inv. Units", "format": "int"},
         {"key": "sales_units", "label": "Units Sold", "format": "int"},
     ]
