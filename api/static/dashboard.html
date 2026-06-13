@@ -544,7 +544,7 @@
 </aside>
 
 <main id="main">
-  <div class="loading">Loading...</div>
+  <div class="loading"><span class="spinner"></span> Loading…</div>
 </main>
 
 <script>
@@ -1263,7 +1263,7 @@ async function showReorderDiagnose() {
         <button id="diagnose-close" class="btn" style="font-size: 11px;">Close</button>
       </div>
       <div id="diagnose-body" style="padding: 16px 20px;">
-        <div class="loading">Diagnosing...</div>
+        <div class="loading"><span class="spinner"></span> Diagnosing…</div>
       </div>
     </div>
   `;
@@ -1936,7 +1936,7 @@ function urgencyTagClass(u) {
 // ========================================================================
 async function renderStockouts() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING STOCKOUTS...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading stockouts…</div>`;
   try {
     const [locs, initialData] = await Promise.all([
       api("/api/locations"),
@@ -2258,7 +2258,7 @@ async function renderOverstock() { return renderDeadStock(); }
 // ========================================================================
 async function renderTransfers() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading…</div>`;
   try {
     const [locs, data] = await Promise.all([
       api("/api/locations"),
@@ -2384,7 +2384,7 @@ async function renderTransfers() {
 // ========================================================================
 async function renderInventory() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING INVENTORY...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading inventory…</div>`;
   try {
     const [locs, data] = await Promise.all([
       api("/api/locations"),
@@ -2838,7 +2838,7 @@ async function renderMixAnalysis() {
 // ========================================================================
 async function renderCompetitors() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING COMPETITOR PRICES...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading competitor prices…</div>`;
   try {
     const initialData = await api("/api/competitor-prices");
 
@@ -2970,7 +2970,7 @@ async function renderCompetitors() {
 // ========================================================================
 async function renderOutcomes() {
   const main = document.querySelector("main");
-  main.innerHTML = `<div class="loading">Loading...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading…</div>`;
   try {
     const locs = await api("/api/locations");
 
@@ -2999,7 +2999,7 @@ async function renderOutcomes() {
       </div>
 
       <div id="oo-content">
-        <div class="loading">Loading...</div>
+        <div class="loading"><span class="spinner"></span> Loading…</div>
       </div>
 
       <div class="hint-box">
@@ -3016,7 +3016,7 @@ async function renderOutcomes() {
     const content = document.getElementById("oo-content");
 
     async function refetch() {
-      content.innerHTML = `<div class="loading">Loading...</div>`;
+      content.innerHTML = `<div class="loading"><span class="spinner"></span> Loading…</div>`;
       const w = windowDays.value;
       const store = storeFilter.value;
       if (viewMode.value === "invoice") {
@@ -3065,7 +3065,7 @@ async function renderInvoiceMode(container, store, windowDays) {
   const detail = document.getElementById("oo-invoice-detail");
 
   async function loadDetail() {
-    detail.innerHTML = `<div class="loading">Loading invoice analysis...</div>`;
+    detail.innerHTML = `<div class="loading"><span class="spinner"></span> Loading invoice analysis…</div>`;
     const r = await api(`/api/order-outcomes/invoice/${encodeURIComponent(pick.value)}?window_days=${windowDays}`);
     renderInvoiceDetail(detail, r);
   }
@@ -3287,7 +3287,7 @@ async function renderAnalytics() {
     params.set("yoy", yoyToggle.checked ? "true" : "false");
 
     document.getElementById("an-period-info").innerHTML = `<div style="font-size: 11px; color: var(--text-dim);">Loading...</div>`;
-    document.getElementById("an-table").innerHTML = `<div class="loading">Loading...</div>`;
+    document.getElementById("an-table").innerHTML = `<div class="loading"><span class="spinner"></span> Loading…</div>`;
     try {
       const data = await api(`/api/analytics/sales-performance?${params.toString()}`);
       renderAnalyticsResult(data);
@@ -3467,7 +3467,7 @@ async function renderPartners() {
       </div>
     </div>
     <div id="partners-content">
-      <div class="loading">Loading...</div>
+      <div class="loading"><span class="spinner"></span> Loading…</div>
     </div>
     <div class="hint-box">
       <strong>Brands</strong> are your commercial partners (IRCC, Canna Collective, Seeker, etc.). <strong>Data revenue deals</strong> are per-SKU rebate agreements managed by these collectives. For brand-specific or LP-specific LTOs and direct rebate agreements, use the <strong>LTOs</strong> and <strong>Data LP Partners</strong> tabs.
@@ -3480,7 +3480,7 @@ async function renderPartners() {
     t.classList.add("active");
     const section = t.dataset.section;
     const c = document.getElementById("partners-content");
-    c.innerHTML = `<div class="loading">Loading...</div>`;
+    c.innerHTML = `<div class="loading"><span class="spinner"></span> Loading…</div>`;
     try {
       if (section === "brands") await renderBrandsSection(c);
       else if (section === "deals") await renderDealsSection(c);
@@ -4564,7 +4564,7 @@ let _csMinStores = 1;
 
 async function renderCrossStore() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING CROSS-STORE OPPORTUNITIES...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading cross-store opportunities…</div>`;
   try {
     const locs = await api("/api/locations");
     if (locs.length < 2) {
@@ -5015,7 +5015,7 @@ function fmtCatalogueAsOf(ts) {
 
 async function renderOcsCatalogue() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING OCS CATALOGUE...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading ocs catalogue…</div>`;
   try {
     const data = await api("/api/ocs-catalogue?limit=500");
     const cats = data.filters.categories;
@@ -5173,7 +5173,7 @@ async function renderOcsCatalogue() {
 async function loadOcsDetail(sku) {
   if (!sku) return;
   const panel = document.getElementById("ocs-detail");
-  panel.innerHTML = `<div class="loading">Loading...</div>`;
+  panel.innerHTML = `<div class="loading"><span class="spinner"></span> Loading…</div>`;
   try {
     const data = await api(`/api/ocs-catalogue/${encodeURIComponent(sku)}`);
     const p = data.product;
@@ -5321,7 +5321,7 @@ async function loadOcsDetail(sku) {
 
 async function renderDataLpPartners() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING DATA LP PARTNERS...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading data lp partners…</div>`;
   try {
     const data = await api("/api/data-lp-partners?include_inactive=true");
     const RATE_TYPE_LABELS = {
@@ -5574,7 +5574,7 @@ async function renderDataLpPartners() {
 
 async function renderMonthlyReports() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING MONTHLY REPORTS...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading monthly reports…</div>`;
   try {
     const data = await api("/api/monthly-reports/months");
 
@@ -5740,7 +5740,7 @@ let _miCurrentView = "gap";  // 'gap' | 'comparison' | 'imports'
 
 async function renderMarketIntel() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING MARKET INTELLIGENCE...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading market intelligence…</div>`;
   try {
     // Fetch imports list to populate store dropdown
     const data = await api("/api/market-intelligence/imports");
@@ -5860,7 +5860,7 @@ async function loadMiContent() {
 
 async function loadMiGapView() {
   const container = document.getElementById("mi-content");
-  container.innerHTML = `<div class="loading">Loading gap report...</div>`;
+  container.innerHTML = `<div class="loading"><span class="spinner"></span> Loading gap report…</div>`;
   try {
     const data = await api(`/api/market-intelligence/gap-report?location_id=${encodeURIComponent(_miCurrentStore)}&limit=200`);
     if (!data.items || data.items.length === 0) {
@@ -5920,7 +5920,7 @@ async function loadMiGapView() {
 
 async function loadMiComparisonView() {
   const container = document.getElementById("mi-content");
-  container.innerHTML = `<div class="loading">Loading performance comparison...</div>`;
+  container.innerHTML = `<div class="loading"><span class="spinner"></span> Loading performance comparison…</div>`;
   try {
     const data = await api(`/api/market-intelligence/performance-comparison?location_id=${encodeURIComponent(_miCurrentStore)}&limit=500`);
     if (!data.items || data.items.length === 0) {
@@ -5985,7 +5985,7 @@ async function loadMiComparisonView() {
 
 async function loadMiImportsView() {
   const container = document.getElementById("mi-content");
-  container.innerHTML = `<div class="loading">Loading imports...</div>`;
+  container.innerHTML = `<div class="loading"><span class="spinner"></span> Loading imports…</div>`;
   try {
     const [imports, folders] = await Promise.all([
       api("/api/market-intelligence/imports"),
@@ -6183,7 +6183,7 @@ function renderUserPane(data) {
 // ========================================================================
 async function renderUsers() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING USERS...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading users…</div>`;
   try {
     const data = await api("/api/users");
     main.innerHTML = `
@@ -6310,7 +6310,7 @@ async function renderUsers() {
 // ========================================================================
 async function renderOcsConnector() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING OCS CONNECTOR...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading ocs connector…</div>`;
   try {
     const [cfg, locs] = await Promise.all([api("/api/ocs/config"), api("/api/locations")]);
     window._ocsLocs = locs;
@@ -6511,7 +6511,7 @@ function renderOcsRetailerMap(retailers, existing) {
 // ========================================================================
 async function renderEmailScraper() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING EMAIL SCRAPER...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading email scraper…</div>`;
   try {
     const [accts, logs] = await Promise.all([
       api("/api/email-scraper/accounts"),
@@ -6655,7 +6655,7 @@ async function renderEmailScraper() {
 
 async function renderSystemHealth() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">CHECKING SYSTEM HEALTH...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Checking system health…</div>`;
   try {
     const data = await api("/api/system/health");
 
