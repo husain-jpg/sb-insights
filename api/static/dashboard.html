@@ -1342,7 +1342,7 @@ async function showReorderDiagnose() {
 
 async function renderReorder() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading"><span class="spinner"></span> LOADING REORDER QUEUE...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading reorder queue…</div>`;
   try {
     const [locs, data] = await Promise.all([
       api("/api/locations"),
