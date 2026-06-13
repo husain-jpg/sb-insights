@@ -718,7 +718,9 @@ function _drawTable(tableId) {
   const tbody = displayRows.length === 0
     ? `<tr><td colspan="${s.columns.length}" class="loading">${s.opts.emptyText || 'No rows.'}</td></tr>`
     : displayRows.map(row => {
-        return '<tr>' + s.columns.map(c => {
+        // Optional per-row attributes (e.g. greyed-out / excluded styling)
+        const attrs = s.opts.rowAttrs ? (s.opts.rowAttrs(row) || '') : '';
+        return `<tr ${attrs}>` + s.columns.map(c => {
           const align = c.align === 'right' ? 'num' : '';
           const val = c.render ? c.render(row) : (row[c.key] ?? '');
           return `<td class="${align}">${val}</td>`;
@@ -1539,6 +1541,30 @@ async function renderReorder() {
     }
     let excludedSkus = loadExclusions();
 
+    // Manual-review (needs_review) rows are EXCLUDED by default — they're
+    // sold-out SKUs the engine won't auto-size, so they shouldn't quietly
+    // ride along in the order. They stay visible but greyed; ticking the
+    // checkbox opts one in (persisted separately so the default-exclude and
+    // the normal exclude sets don't collide).
+    function reviewStorageKey() {
+      const sf = document.getElementById("store-filter");
+      return `reorder-review-incl::${(sf ? sf.value : '') || 'all'}`;
+    }
+    function loadReviewIncluded() {
+      try { return new Set(JSON.parse(localStorage.getItem(reviewStorageKey()) || "[]")); }
+      catch (e) { return new Set(); }
+    }
+    function saveReviewIncluded(set) {
+      try { localStorage.setItem(reviewStorageKey(), JSON.stringify([...set])); } catch (e) {}
+    }
+    let reviewIncludedSkus = loadReviewIncluded();
+
+    // Single source of truth for "is this row excluded from the order".
+    function isRowExcluded(r) {
+      if (r.needs_review) return !reviewIncludedSkus.has(excludeKey(r));
+      return excludedSkus.has(excludeKey(r));
+    }
+
     // Summary-bar numbers. "SKUs to order" counts only rows with an actual
     // quantity; zero-qty manual-review stockouts get their own count so the
     // headline isn't inflated by rows that aren't really being ordered.
@@ -1555,12 +1581,14 @@ async function renderReorder() {
 
     const columns = [
       { key: '__include', label: 'Include / Exclude', sortable: false,
-        tooltip: "Checked = include in this week's order. Uncheck to exclude.",
+        tooltip: "Checked = include in this week's order. Uncheck to exclude. Manual-review (sold-out) rows start excluded — tick to bring one in.",
         render: r => {
-          // Inverted: checked = INCLUDED (default). Unchecked = excluded.
-          // The underlying excludedSkus set still tracks exclusions.
-          const isExcluded = excludedSkus.has(excludeKey(r));
-          return `<input type="checkbox" class="exclude-cb" data-sku="${r.sku}" data-loc="${r.location_id}" ${isExcluded ? '' : 'checked'} title="Uncheck to exclude this SKU from this week's order (persists in this browser)">`;
+          // Inverted: checked = INCLUDED. Manual-review rows default excluded.
+          const isExcluded = isRowExcluded(r);
+          const tip = r.needs_review
+            ? "Manual review: stocked out, engine won't auto-size it. Tick to include in this week's order (you'll set the quantity manually)."
+            : "Uncheck to exclude this SKU from this week's order (persists in this browser)";
+          return `<input type="checkbox" class="exclude-cb" data-sku="${r.sku}" data-loc="${r.location_id}" data-review="${r.needs_review ? '1' : '0'}" ${isExcluded ? '' : 'checked'} title="${tip}">`;
         } },
       { key: 'urgency', label: 'Status',
         render: r => `<span class="tag ${urgencyTagClass(r.urgency)}">${r.urgency}</span>` },
@@ -1755,7 +1783,9 @@ async function renderReorder() {
         filtered = filtered.filter(r => r.category === categoryFilter);
       }
       if (!showExcluded) {
-        filtered = filtered.filter(r => !excludedSkus.has(excludeKey(r)));
+        // Hide excluded NORMAL rows; keep manual-review rows visible (greyed)
+        // so the manager can still see and opt them in.
+        filtered = filtered.filter(r => r.needs_review || !isRowExcluded(r));
       }
       if (q) {
         filtered = filtered.filter(r =>
@@ -1763,11 +1793,16 @@ async function renderReorder() {
           (r.sku || '').toLowerCase().includes(q)
         );
       }
-      renderTable('reorder-table', filtered, columns, { defaultSort: 'urgency' });
+      renderTable('reorder-table', filtered, columns, {
+        defaultSort: 'urgency',
+        rowAttrs: r => isRowExcluded(r)
+          ? 'style="opacity: 0.5;" title="Excluded from this week\'s order"'
+          : '',
+      });
       const anchorCount = filtered.filter(r => r.is_top_sku).length;
       const dataFeeCount = filtered.filter(r => r.data_fee_pct || r.data_fee_is_direct).length;
       const saleCount = filtered.filter(r => r.sale_flag === 'active' || r.sale_flag === 'recent').length;
-      const excludedCount = currentData.filter(r => excludedSkus.has(excludeKey(r))).length;
+      const excludedCount = currentData.filter(r => !r.needs_review && excludedSkus.has(excludeKey(r))).length;
       const badges = [];
       if (anchorCount > 0 && !anchorsOnly) badges.push(`<span style="color: #c89b32; font-size: 10px;">(${anchorCount} Hero)</span>`);
       if (dataFeeCount > 0 && !dataFeesOnly) badges.push(`<span style="color: #6dab84; font-size: 10px;">(${dataFeeCount} rebate)</span>`);
@@ -1812,8 +1847,9 @@ async function renderReorder() {
     }
 
     storeFilter.addEventListener("change", () => {
-      // When store changes, swap the exclusion set to the new store's
+      // When store changes, swap the exclusion sets to the new store's
       excludedSkus = loadExclusions();
+      reviewIncludedSkus = loadReviewIncluded();
       updateExcludedUI();
       refetch();
     });
@@ -1834,21 +1870,30 @@ async function renderReorder() {
       const cb = e.target;
       if (!cb.classList.contains("exclude-cb")) return;
       const key = `${cb.dataset.sku}|${cb.dataset.loc}`;
-      if (cb.checked) excludedSkus.delete(key);  // checked = include
-      else excludedSkus.add(key);                 // unchecked = exclude
-      saveExclusions(excludedSkus);
+      const isReview = cb.dataset.review === '1';
+      if (isReview) {
+        // Manual-review rows opt IN via reviewIncludedSkus (default excluded).
+        if (cb.checked) reviewIncludedSkus.add(key); else reviewIncludedSkus.delete(key);
+        saveReviewIncluded(reviewIncludedSkus);
+      } else {
+        if (cb.checked) excludedSkus.delete(key);  // checked = include
+        else excludedSkus.add(key);                 // unchecked = exclude
+        saveExclusions(excludedSkus);
+      }
       updateExcludedUI();
-      // Don't re-render immediately — keep the row visible so user can uncheck
-      // if they clicked by mistake. Recompute summary only.
+      // Re-grey the row in place without a full re-render.
+      const row = cb.closest('tr');
+      if (row) row.style.opacity = cb.checked ? '' : '0.5';
+      // Recompute summary.
       const summary = document.getElementById("reorder-summary");
-      const excludedCount = currentData.filter(r => excludedSkus.has(excludeKey(r))).length;
+      const excludedCount = currentData.filter(r => !r.needs_review && excludedSkus.has(excludeKey(r))).length;
       const showExcluded = document.getElementById("show-excluded").checked;
       const anchorsOnly = anchorsOnlyToggle.checked;
       let visible = currentData;
       if (anchorsOnly) visible = visible.filter(r => r.is_top_sku);
       const categoryFilter = document.getElementById("category-filter").value;
       if (categoryFilter) visible = visible.filter(r => r.category === categoryFilter);
-      if (!showExcluded) visible = visible.filter(r => !excludedSkus.has(excludeKey(r)));
+      if (!showExcluded) visible = visible.filter(r => r.needs_review || !isRowExcluded(r));
       const anchorCount = visible.filter(r => r.is_top_sku).length;
       const cbBadges = [];
       if (anchorCount > 0 && !anchorsOnly) cbBadges.push(`<span style="color: #c89b32; font-size: 10px;">(${anchorCount} Hero)</span>`);
