@@ -67,6 +67,7 @@ def fill_template(
     *,
     ceiling_days: int | None = None,
     min_velocity: float | None = None,
+    extra_order_units: dict[str, int] | None = None,
 ) -> tuple[list[OrderLine], pd.DataFrame, dict]:
     """
     Read the OCS template, compute engine recs for the store, fill quantities.
@@ -106,6 +107,20 @@ def fill_template(
     for r in recs:
         if r.ocs_variant:
             recs_by_variant[r.ocs_variant] = r
+
+    # Trial additions ('Added' in Suggested Additions): the store has no
+    # history for these so the engine won't produce them. Inject synthetic
+    # recs (units already trial-sized) so they fill into the template like
+    # any other order line. Don't clobber a real engine rec if one exists.
+    from types import SimpleNamespace
+    for variant, units in (extra_order_units or {}).items():
+        if variant not in recs_by_variant:
+            recs_by_variant[variant] = SimpleNamespace(
+                sku=variant, product_name="", ocs_variant=variant,
+                reorder_qty=int(units), reorder_cases=0,
+                is_top_sku=False, on_hand=0, daily_velocity=0.0,
+                days_supply=None, urgency="trial_add", category=None,
+            )
 
     # Walk every OCS template row, attach engine rec if any, decide quantity
     order_lines: list[OrderLine] = []

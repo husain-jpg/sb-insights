@@ -1081,8 +1081,21 @@ function renderSuggestedTable(items, locationId) {
       }
       return '';
     })();
+    const added = it.status === 'added';
+    // Green when added (it's going on the order); buttons reflect current state.
+    const rowStyle = added ? 'background: rgba(80, 160, 100, 0.10);' : '';
+    const actionCell = added
+      ? `<span style="font-size: 10px; color: #6dab84; font-weight: 600;" title="On this week's order — appears as a green trial-add row in the table below and fills into the OCS template.">✓ Added</span>
+         <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="reset" style="font-size: 10px; color: var(--text-dim); margin-left: 6px;">Undo</button>`
+      : `<button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="added"
+                 title="Add to this week's order — creates a green trial-add row in the reorder table and fills the OCS template at the suggested quantity."
+                 style="font-size: 10px; color: #6dab84;">Add</button>
+         <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="snooze"
+                 title="Hide for 90 days, then re-evaluate" style="font-size: 10px; color: var(--text-dim);">Snooze</button>
+         <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="dismiss"
+                 title="Dismiss — greys out, hidden on next load" style="font-size: 10px; color: #d66464;">Dismiss</button>`;
     return `
-      <tr>
+      <tr data-sku="${escapeHtml(it.sku)}" style="${rowStyle}">
         <td style="font-variant-numeric: tabular-nums; color: var(--text-dim);">${idx + 1}</td>
         <td>
           <strong>${escapeHtml(it.item_name || it.sku)}</strong>
@@ -1095,19 +1108,7 @@ function renderSuggestedTable(items, locationId) {
         <td class="num"><strong>${it.suggested_units}u</strong><div class="sku">${it.suggested_cases}c</div></td>
         <td class="num"><strong>${fmt$2(it.suggested_cost)}</strong></td>
         <td style="text-align: center;">${stockTag}</td>
-        <td>
-          <div style="display: flex; gap: 4px;">
-            <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="added"
-                    title="Mark as decided to add. Hides from this list. You'll need to place the order manually through your normal OCS workflow."
-                    style="font-size: 10px; color: #6dab84;">Add</button>
-            <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="snooze"
-                    title="Hide for 90 days, then re-evaluate"
-                    style="font-size: 10px; color: var(--text-dim);">Snooze</button>
-            <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="dismiss"
-                    title="Hide indefinitely"
-                    style="font-size: 10px; color: #d66464;">Dismiss</button>
-          </div>
-        </td>
+        <td><div style="display: flex; gap: 4px; align-items: center;">${actionCell}</div></td>
       </tr>
     `;
   }).join("");
@@ -1137,6 +1138,7 @@ function renderSuggestedTable(items, locationId) {
       const sku = btn.dataset.sku;
       const action = btn.dataset.action;
       const author = ensureAuthor() || "anonymous";
+      const row = btn.closest('tr');
       try {
         const res = await fetch(`${API}/api/reorder/suggested-additions/${encodeURIComponent(sku)}/action`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1150,8 +1152,31 @@ function renderSuggestedTable(items, locationId) {
           alert("Action failed: " + (err.detail || "unknown"));
           return;
         }
-        // Reload the panel to remove the actioned SKU
-        loadSuggestedAdditions(locationId);
+        if (action === 'added') {
+          // Green the row + flip to Added state, and refresh the reorder table
+          // so the new green trial-add row shows up below.
+          loadSuggestedAdditions(locationId);
+          if (window._reorderRefetch) window._reorderRefetch();
+        } else if (action === 'dismiss' || action === 'snooze') {
+          // Grey it out in place (it's gone on the next full load).
+          if (row) {
+            row.style.opacity = '0.4';
+            row.querySelector('td:last-child').innerHTML =
+              `<span style="font-size: 10px; color: var(--text-dim);">${action === 'snooze' ? 'Snoozed 90d' : 'Dismissed'}</span>
+               <button class="btn-link sa-undo-btn" data-sku="${escapeHtml(sku)}" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`;
+            row.querySelector('.sa-undo-btn').addEventListener('click', async () => {
+              await fetch(`${API}/api/reorder/suggested-additions/${encodeURIComponent(sku)}/action`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ location_id: locationId, action: 'reset', author_name: author }),
+              });
+              loadSuggestedAdditions(locationId);
+            });
+          }
+        } else {
+          // reset/undo
+          loadSuggestedAdditions(locationId);
+          if (window._reorderRefetch) window._reorderRefetch();
+        }
       } catch (e) {
         alert("Action failed: " + e.message);
       }
@@ -1191,7 +1216,8 @@ function showReorderLegend() {
           ${row(tag("background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4);", "critical"), "Critical", "Days of cover is less than lead time. Will hit stockout before next delivery.")}
           ${row(tag("background: rgba(214, 180, 70, 0.15); color: #c89b32; border-color: rgba(220, 190, 80, 0.4);", "high"), "High", "Days of cover is less than lead time + safety buffer. Could stock out before the next order cycle.")}
           ${row(tag("background: rgba(106, 166, 214, 0.15); color: #6aa6d6; border-color: rgba(116, 176, 224, 0.4);", "medium"), "Medium", "Will need a reorder soon but not urgently.")}
-          ${row(tag("background: rgba(200,155,50,.15); color: #c89b32;", "manual"), "Manual review", "Stocked out, but 30-day demand is below the minimum case fraction — the engine won't auto-order a case. Shown (instead of hidden) so you can decide: order one case anyway, or let it go. Diagnose shows the math.")}
+          ${row(tag("background: rgba(200,155,50,.15); color: #c89b32;", "manual"), "Manual review", "Stocked out, but 30-day demand is below the minimum case fraction — the engine won't auto-order a case. Excluded by default (greyed); tick the checkbox to bring it into the order and set the quantity by hand.")}
+          ${row(tag("background: rgba(80,160,100,.18); color: #6fcf85; border-color: rgba(90,200,110,.45);", "＋ trial add"), "Trial add", "A peer-popular SKU you don't carry, that you 'Added' from Suggested Additions. Ordered at a small trial quantity and pinned green at the top; fills into the OCS template. Once it sells at your store, the regular engine takes over. Click 'Undo' in Suggested Additions to remove it.")}
         </table>
 
         <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Sale Status</h4>
@@ -1591,7 +1617,11 @@ async function renderReorder() {
           return `<input type="checkbox" class="exclude-cb" data-sku="${r.sku}" data-loc="${r.location_id}" data-review="${r.needs_review ? '1' : '0'}" ${isExcluded ? '' : 'checked'} title="${tip}">`;
         } },
       { key: 'urgency', label: 'Status',
-        render: r => `<span class="tag ${urgencyTagClass(r.urgency)}">${r.urgency}</span>` },
+        sortValue: r => ({ trial_add: -1, stockout: 0, critical: 1, high: 2, medium: 3,
+                           ok: 4, overstock: 5, dead_stock: 6 }[r.urgency] ?? 9),
+        render: r => r.is_trial_add
+          ? `<span class="tag" style="background: rgba(80,160,100,.18); color: #6fcf85; border-color: rgba(90,200,110,.45);" title="Trial add from Suggested Additions — peer-popular SKU you don't carry yet. Ordering a small trial quantity; once it sells, the engine takes over.">＋ trial add</span>`
+          : `<span class="tag ${urgencyTagClass(r.urgency)}">${r.urgency}</span>` },
       { key: 'product_name', label: 'Product',
         render: r => {
           // Name on line 1 (just a slim ★ for Heroes); everything else lives
@@ -1797,7 +1827,7 @@ async function renderReorder() {
         defaultSort: 'urgency',
         rowAttrs: r => isRowExcluded(r)
           ? 'style="opacity: 0.5;" title="Excluded from this week\'s order"'
-          : '',
+          : (r.is_trial_add ? 'style="background: rgba(80,160,100,.08);"' : ''),
       });
       const anchorCount = filtered.filter(r => r.is_top_sku).length;
       const dataFeeCount = filtered.filter(r => r.data_fee_pct || r.data_fee_is_direct).length;
@@ -1820,6 +1850,9 @@ async function renderReorder() {
       }
       if (ocsOutToggle.checked) params.set("include_ocs_out", "true");
       if (mixAwareToggle.checked) params.set("mix_aware", "true");
+      // Exposed so the Suggested Additions panel can refresh the table after
+      // 'Add' (the new trial-add row needs to appear).
+      window._reorderRefetch = refetch;
       // Loading state: spinner in the table, dim the KPI/Highlights panels.
       const tableBox = document.getElementById("reorder-table");
       const kpiBox = document.getElementById("reorder-kpis");

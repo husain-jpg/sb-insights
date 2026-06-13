@@ -1180,6 +1180,14 @@ def get_reorder(
         # connection block; reorder totals + stockout count are added at return.
         kpis_inv = compute_reorder_kpis(conn, store=store, top_level=tl, as_of=as_of)
 
+        # Trial additions the manager 'Added' from Suggested Additions (single
+        # store only — suggestions are per-store). These have no on-hand/
+        # velocity so the engine can't produce them; we surface them as green
+        # synthetic rows. Resolve their rebates the same way.
+        added_gap = _added_gap_rows(conn, store) if store else []
+        gap_deal_map = (get_active_deals_for_skus(conn, {g["ocs_variant"] for g in added_gap})
+                        if added_gap else {})
+
         # Resolve the effective engine knobs for the settings echo, so the UI
         # reports the values the engine actually ran with (settings or override).
         eng = load_engine_settings(conn)
@@ -1326,6 +1334,37 @@ def get_reorder(
         review_bump = 1 if p.get("needs_review") else 0
         return (u, review_bump, rebate_bump, -(p.get("line_total") or 0))
     actionable.sort(key=_sort_key)
+
+    # Prepend trial-add rows (manager 'Added' from Suggested Additions). They
+    # carry an order quantity (trial_units) but no on-hand/velocity history, so
+    # they're flagged is_trial_add and pinned to the very top in green.
+    trial_rows = []
+    for g in added_gap:
+        deal = gap_deal_map.get(g["ocs_variant"])
+        units = g["trial_units"]
+        est_cost = round(g["unit_price"], 2) if g["unit_price"] else None
+        trial_rows.append({
+            "sku": g["ocs_variant"], "product_name": g["product_name"],
+            "category": g["category"], "category_path": None, "top_level": tl,
+            "brand": g["brand"], "location_id": store,
+            "on_hand": 0, "daily_velocity": 0.0, "days_supply": None,
+            "reorder_qty": units, "reorder_cases": g["trial_cases"],
+            "urgency": "trial_add", "revenue_30d": 0.0,
+            "ocs_variant": g["ocs_variant"], "ocs_pack_size": g["pack_size"],
+            "ocs_unit_price": est_cost, "ocs_stock_status": g["stock_status"],
+            "wholesale_cost_est": est_cost,
+            "line_total": round((est_cost or 0) * units, 2),
+            "mix_multiplier": 1.0, "is_top_sku": False, "needs_review": False,
+            "is_trial_add": True,
+            "data_fee_pct": round(deal["percentage"], 2) if deal else None,
+            "data_fee_partner": deal["partner"] if deal else None,
+            "data_fee_basis": deal["basis"] if deal else None,
+            "data_fee_is_direct": bool(deal and deal["is_direct"]),
+            "avg_rating": None, "rating_count": 0, "comment_count": 0,
+            "sale_flag": None, "sale_flag_detail": None,
+            "order_fill_flow_thru": None,
+        })
+    actionable = trial_rows + actionable
 
     # Assemble header KPIs: inventory-derived metrics + this week's reorder
     # totals + active stockout count (selling SKUs at 0 on-hand).
@@ -3983,7 +4022,12 @@ def export_ocs_template(store: str | None = None):
                 detail=f"Order Fill file for {store} is no longer on disk ({source_file}); "
                        f"re-run the OCS Connector to refresh it.")
         try:
-            _lines, filled_df, _summary = fill_template(conn, path, location_id=store)
+            # Include trial additions the manager 'Added' from Suggested
+            # Additions so they land in the OCS order too.
+            extra = {g["ocs_variant"]: g["trial_units"]
+                     for g in _added_gap_rows(conn, store)}
+            _lines, filled_df, _summary = fill_template(
+                conn, path, location_id=store, extra_order_units=extra)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         out = BytesIO()
@@ -5111,6 +5155,60 @@ def get_performance_comparison(
 #   - User actions (snooze/dismiss/add) per (location, sku) — Bradford might
 #     dismiss a SKU that Amherstview wants to consider.
 
+def _trial_order_qty(pack_size: int, peer_vel: float) -> tuple[int, int]:
+    """Conservative trial-order size for a SKU the store doesn't carry yet.
+    Returns (units, cases). Singles: cap at 7 units (or peer 7-day demand).
+    Cases: 1 case normally, 2 only if peer velocity would burn through 1 in
+    under 3 days. Once stocked, the regular reorder engine takes over.
+    Shared by the Suggested Additions list, the trial-add reorder rows, and
+    the OCS template fill so all three agree."""
+    pack_size = pack_size or 1
+    peer_vel = peer_vel or 0
+    if pack_size <= 1:
+        units = min(7, max(1, math.ceil(peer_vel * 7)))
+        return units, units
+    cases_for_three_day = math.ceil((peer_vel * 3) / pack_size) if pack_size > 0 else 1
+    cases = max(1, min(2, cases_for_three_day))
+    return cases * pack_size, cases
+
+
+def _added_gap_rows(conn, location_id: str) -> list[dict]:
+    """SKUs the manager 'Added' from Suggested Additions for this store —
+    trial additions that should flow into the reorder report (as green rows)
+    and the OCS order. Returns dicts keyed for both consumers. Empty if there's
+    no market-intel import or nothing has been added."""
+    if not location_id:
+        return []
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id FROM market_intelligence_imports
+        WHERE location_id = ? ORDER BY imported_at DESC LIMIT 1
+    """, (location_id,))
+    imp = cur.fetchone()
+    import_id = imp[0] if imp else None
+    cur.execute(f"""
+        SELECT gs.sku, oc.product_name, oc.pack_size, oc.unit_price,
+               oc.category, oc.stock_status, oc.brand,
+               {'mi.municipality_velocity' if import_id else 'NULL'} AS peer_vel
+        FROM gap_suggestions_status gs
+        JOIN ocs_catalog oc ON oc.ocs_variant_number = gs.sku
+        {('LEFT JOIN market_intelligence_data mi ON mi.sku = gs.sku AND mi.import_id = ?'
+          if import_id else '')}
+        WHERE gs.location_id = ? AND gs.status = 'added'
+    """, ([import_id, location_id] if import_id else [location_id]))
+    rows = []
+    for sku, name, pack_size, unit_price, category, stock_status, brand, peer_vel in cur.fetchall():
+        pack_size = int(pack_size or 1)
+        units, cases = _trial_order_qty(pack_size, float(peer_vel or 0))
+        rows.append({
+            "ocs_variant": sku, "product_name": name or sku,
+            "pack_size": pack_size, "unit_price": float(unit_price or 0),
+            "category": category, "stock_status": stock_status, "brand": brand,
+            "trial_units": units, "trial_cases": cases,
+        })
+    return rows
+
+
 @app.get("/api/reorder/suggested-additions")
 def get_suggested_additions(
     location_id: str,
@@ -5220,19 +5318,7 @@ def get_suggested_additions(
             pack_size = it.get("pack_size") or 1
             peer_vel = it.get("municipality_velocity") or 0
             unit_price = it.get("unit_price") or 0
-
-            if pack_size <= 1:
-                # Singles: cap at 7 units OR ceil(peer × 7) — whichever is smaller
-                seven_day_demand = math.ceil(peer_vel * 7)
-                suggested_units = min(7, max(1, seven_day_demand))
-                suggested_cases = suggested_units
-            else:
-                # Multi-unit cases: 1 case is the standard trial order.
-                # Only go to 2 cases if peer velocity is very high (would cover < 3 days).
-                cases_for_three_day = math.ceil((peer_vel * 3) / pack_size) if pack_size > 0 else 1
-                suggested_cases = max(1, min(2, cases_for_three_day))
-                suggested_units = suggested_cases * pack_size
-
+            suggested_units, suggested_cases = _trial_order_qty(pack_size, peer_vel)
             it["suggested_cases"] = suggested_cases
             it["suggested_units"] = suggested_units
             it["suggested_cost"] = round(unit_price * suggested_units, 2)
