@@ -29,7 +29,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File, Form, Cookie, Request, Response as FastAPIResponse, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, Response, StreamingResponse, RedirectResponse, JSONResponse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jobs.reorder_engine import (
@@ -69,7 +69,11 @@ _load_dotenv()
 DB_PATH = os.environ.get("TERROIR_DB", "terroir.db")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-app = FastAPI(title="SB Insights", version="0.3.0")
+# docs_url/openapi_url disabled: this is an internet-facing app and the
+# interactive docs would hand an attacker the full API surface. Re-enable
+# locally by editing here if ever needed for development.
+app = FastAPI(title="SB Insights", version="0.3.0",
+              docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     # Allow same-origin (browser visiting the dashboard) + localhost in dev.
@@ -496,8 +500,93 @@ def require_admin(request: Request) -> dict:
 
 
 # ============================================================================
+# Global API auth gate
+# ============================================================================
+# Every /api/* route requires a valid session, except the auth endpoints the
+# login flow itself needs. Individual require_admin gates still apply on top.
+# Before this middleware, most endpoints had NO server-side auth — the login
+# screen was purely client-side and anyone who could reach the host could
+# read data or call mutations directly.
+
+_PUBLIC_API_PATHS = {
+    "/api/auth/login",   # the way in
+    "/api/auth/me",      # drives the login screen; safely returns logged_in:false
+    "/api/auth/logout",  # harmless without a session; avoids weird stuck states
+}
+
+# One-way latch: once users exist, stop re-checking on every request.
+# (Bootstrap mode only matters until the first admin is created.)
+_USERS_EXIST_LATCH = False
+
+
+@app.middleware("http")
+async def _global_api_auth(request: Request, call_next):
+    path = request.url.path
+    if (request.method == "OPTIONS"
+            or not path.startswith("/api/")
+            or path in _PUBLIC_API_PATHS):
+        return await call_next(request)
+    global _USERS_EXIST_LATCH
+    try:
+        if not _USERS_EXIST_LATCH:
+            with db() as conn:
+                if not _has_any_users(conn):
+                    return await call_next(request)  # bootstrap mode — no users yet
+            _USERS_EXIST_LATCH = True
+        user = get_current_user(request)
+    except HTTPException as e:
+        # db() raises 503 when the DB file is missing; middleware-raised
+        # exceptions bypass FastAPI's handlers, so convert explicitly.
+        return JSONResponse({"detail": e.detail}, status_code=e.status_code)
+    if not user:
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    if request.url.path.startswith("/api/"):
+        # Authenticated data — keep it out of shared caches and disk caches.
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+# ============================================================================
 # Auth endpoints
 # ============================================================================
+
+# Brute-force throttle: per (client IP, email), allow at most
+# _LOGIN_MAX_FAILS failed attempts per _LOGIN_WINDOW_S, then 429.
+# In-memory is correct here: single uvicorn worker (see systemd unit).
+# Client IP is real behind nginx thanks to --proxy-headers.
+_LOGIN_FAILS: dict[tuple, list] = {}
+_LOGIN_WINDOW_S = 900
+_LOGIN_MAX_FAILS = 5
+
+
+def _login_throttle(request: Request, email: str, *, record_fail: bool = False,
+                    clear: bool = False) -> None:
+    import time as _t
+    ip = request.client.host if request and request.client else "?"
+    key = (ip, email)
+    now = _t.time()
+    fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < _LOGIN_WINDOW_S]
+    if clear:
+        _LOGIN_FAILS.pop(key, None)
+        return
+    if record_fail:
+        fails.append(now)
+        _LOGIN_FAILS[key] = fails
+        return
+    if len(fails) >= _LOGIN_MAX_FAILS:
+        raise HTTPException(status_code=429,
+                            detail="Too many failed attempts — try again in 15 minutes")
+    _LOGIN_FAILS[key] = fails  # store pruned list
+
 
 @app.post("/api/auth/login")
 def login(payload: dict = Body(...), request: Request = None) -> dict:
@@ -511,6 +600,7 @@ def login(payload: dict = Body(...), request: Request = None) -> dict:
     password = payload.get("password") or ""
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
+    _login_throttle(request, email)  # 429 if this IP+email is hammering
 
     with db() as conn:
         cur = conn.cursor()
@@ -524,12 +614,15 @@ def login(payload: dict = Body(...), request: Request = None) -> dict:
             # Slight timing protection: still hash a dummy password to even out
             # response time. Not perfect but discourages timing attacks.
             verify_password(password, "$2b$12$abcdefghijklmnopqrstuv")
+            _login_throttle(request, email, record_fail=True)
             raise HTTPException(status_code=401, detail="Invalid email or password")
         user_id, password_hash, role, is_active, must_change, name = row
         if not is_active:
             raise HTTPException(status_code=401, detail="Account disabled")
         if not verify_password(password, password_hash):
+            _login_throttle(request, email, record_fail=True)
             raise HTTPException(status_code=401, detail="Invalid email or password")
+        _login_throttle(request, email, clear=True)  # success — reset the counter
 
         # Create session
         ua = request.headers.get("user-agent") if request else None
@@ -547,7 +640,10 @@ def login(payload: dict = Body(...), request: Request = None) -> dict:
         value=token,
         max_age=SESSION_LIFETIME_DAYS * 86400,
         httponly=True,         # JS can't read it (XSS protection)
-        secure=False,          # CHANGE TO TRUE FOR PRODUCTION (HTTPS)
+        # Secure (HTTPS-only) whenever the app is served over HTTPS — i.e.
+        # production (PUBLIC_URL=https://app.sbinsights.co). Local dev on
+        # http://127.0.0.1 keeps a non-secure cookie so login still works.
+        secure=os.environ.get("PUBLIC_URL", "").startswith("https"),
         samesite="lax",
     )
     return response
