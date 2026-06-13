@@ -6322,14 +6322,21 @@ def sales_performance(
       - rows: list of per-store metrics with current + prior + diffs
     """
     today = date.today()
-    p_start, p_end = _resolve_date_range(preset, start, end, today)
-    if p_start > p_end:
-        raise HTTPException(status_code=400, detail="start must be <= end")
 
     with db() as conn:
-        # Get latest available sale_date — clamp the period to it
+        # Anchor relative presets ("today", "last 30 days", MTD, …) to the most
+        # recent day of SALES DATA, not the calendar date. The old approach
+        # resolved from the calendar and then clamped only the END to the data
+        # — so with imports lagging 2 days, "Last 30 days" silently became a
+        # 28-day window still labeled 30. Now the whole window shifts with the
+        # data, so a 30-day preset is always 30 data-days.
         latest = get_latest_sale_date(conn)
-        actual_end = min(p_end, latest) if latest else p_end
+        anchor = min(today, latest) if latest else today
+        p_start, p_end = _resolve_date_range(preset, start, end, anchor)
+        if p_start > p_end:
+            raise HTTPException(status_code=400, detail="start must be <= end")
+        # Custom ranges can still name an end beyond the data — clamp those.
+        actual_end = min(p_end, anchor)
 
         current = _query_period_metrics(conn, p_start, actual_end, store)
 
@@ -6388,6 +6395,8 @@ def sales_performance(
             "start": p_start.isoformat(),
             "end": actual_end.isoformat(),
             "preset": preset,
+            "days": (actual_end - p_start).days + 1,
+            "data_through": latest.isoformat() if latest else None,
             "clamped": actual_end < p_end,
         },
         "rows": rows,

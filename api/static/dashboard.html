@@ -3215,12 +3215,12 @@ async function renderSkuMode(container, store, windowDays) {
 async function renderAnalytics() {
   const main = document.querySelector("main");
   main.innerHTML = `
-    <div class="section-header">
+    <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
       <div>
         <div class="kicker">Analytics · Sales Performance</div>
-        <h2 style="white-space:nowrap;">Revenue, units, transactions, margin & discount % with year-over-year</h2>
+        <h2 style="white-space:nowrap;">Revenue, margin &amp; discounts by store</h2>
       </div>
-      <div class="controls-row">
+      <div class="controls-row" style="flex-wrap: wrap;">
         <select id="an-preset">
           <option value="today">Today</option>
           <option value="yesterday">Yesterday</option>
@@ -3310,9 +3310,10 @@ function renderAnalyticsResult(data) {
   _analyticsLastData = data;
   const p = data.period;
   const pp = data.prior_period;
-  const clampNote = p.clamped ? ` <span style="color: var(--warning, #c89b32);">(period end clamped to latest available data)</span>` : '';
-  let info = `<div style="font-size: 12px;"><strong>Current:</strong> ${p.start} → ${p.end}${clampNote}`;
+  const clampNote = p.clamped ? ` <span style="color: var(--warning, #c89b32);">(end clamped to available data)</span>` : '';
+  let info = `<div style="font-size: 12px;"><strong>Current:</strong> ${p.start} → ${p.end}${p.days ? ` <span style="color: var(--text-dim);">(${p.days} day${p.days === 1 ? '' : 's'})</span>` : ''}${clampNote}`;
   if (pp) info += ` &nbsp;·&nbsp; <strong>Prior year:</strong> ${pp.start} → ${pp.end}`;
+  if (p.data_through) info += ` &nbsp;·&nbsp; <span style="color: var(--text-dim);">Sales data through <strong>${p.data_through}</strong></span>`;
   info += `</div>`;
   // Compute coverage from chain total
   const total = data.rows.find(r => r.is_total);
