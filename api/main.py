@@ -514,25 +514,32 @@ _PUBLIC_API_PATHS = {
     "/api/auth/logout",  # harmless without a session; avoids weird stuck states
 }
 
-# Admin-only API surface. Store Managers are blocked from these entirely
-# (see AND change) — both the Settings group (system config, users, scrapers,
-# connector) and the Admin group (financials, collectives, LTOs, LP partners,
-# monthly reports). Prefixes are deliberate: "/api/ocs/" hits the connector but
-# NOT "/api/ocs-catalogue" (managers keep the catalogue); "/api/analytics/" is
-# the Financial tab only. The footer status uses "/api/health", left open.
-_ADMIN_API_PREFIXES = (
-    "/api/settings",        # System Settings
-    "/api/users",           # Users
-    "/api/email-scraper",   # Email Scraper
+# Three-tier access. admin > gm (General Manager) > manager (Store Manager;
+# legacy 'regular' == manager). Enforced by path prefix in the auth middleware
+# (defense beyond hiding nav). Prefixes are deliberate: "/api/ocs/" hits the
+# connector but NOT "/api/ocs-catalogue"; "/api/analytics/" is the Financial
+# tab only. The footer status uses "/api/health", left open to everyone.
+#
+# ADMIN-ONLY: system config, user management, credentials. Only admin.
+_ADMIN_ONLY_PREFIXES = (
+    "/api/users",
+    "/api/email-scraper",
     "/api/ocs/",            # OCS Connector (NOT /api/ocs-catalogue)
     "/api/system/",         # System Health / backups
+)
+# GM-OR-ADMIN: the Admin group (financials / rebate economics). Store Managers
+# blocked; GMs and admins allowed.
+_GM_PREFIXES = (
     "/api/analytics/",      # Financial
     "/api/brand-partners",  # Data Collectives
     "/api/data-revenue-deals",
-    "/api/ltos",            # LTOs
+    "/api/ltos",
     "/api/data-lp-partners",
     "/api/monthly-reports",
 )
+# Settings is special: GMs may READ (the page renders read-only) but only
+# admins may WRITE. Store Managers can't touch it at all. Handled by method
+# in the middleware below.
 
 # One-way latch: once users exist, stop re-checking on every request.
 # (Bootstrap mode only matters until the first admin is created.)
@@ -560,9 +567,22 @@ async def _global_api_auth(request: Request, call_next):
         return JSONResponse({"detail": e.detail}, status_code=e.status_code)
     if not user:
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-    # Admin-only surface: Store Managers (any non-admin) are blocked here.
-    if user.get("role") != "admin" and any(path.startswith(p) for p in _ADMIN_API_PREFIXES):
+    role = user.get("role")
+    is_admin = role == "admin"
+    is_gm = role == "gm"
+    # Admin-only surface (system config / users / credentials).
+    if not is_admin and any(path.startswith(p) for p in _ADMIN_ONLY_PREFIXES):
         return JSONResponse({"detail": "Admin only"}, status_code=403)
+    # System Settings: GM may read, only admin may write; Store Manager: none.
+    if path.startswith("/api/settings"):
+        if request.method in ("GET", "HEAD"):
+            if not (is_admin or is_gm):
+                return JSONResponse({"detail": "Admin only"}, status_code=403)
+        elif not is_admin:
+            return JSONResponse({"detail": "Admin only"}, status_code=403)
+    # Admin group (financials): GM or admin.
+    elif not (is_admin or is_gm) and any(path.startswith(p) for p in _GM_PREFIXES):
+        return JSONResponse({"detail": "Admins and General Managers only"}, status_code=403)
     return await call_next(request)
 
 
@@ -776,10 +796,11 @@ def create_user(payload: dict = Body(...), request: Request = None) -> dict:
         raise HTTPException(status_code=400, detail="Valid email required")
     if len(temp_password) < 12:
         raise HTTPException(status_code=400, detail="Temp password must be at least 12 characters")
-    # 'manager' (a.k.a. legacy 'regular') = everything except the Admin +
-    # Settings sections; 'admin' = full access.
-    if role not in ("admin", "manager", "regular"):
-        raise HTTPException(status_code=400, detail="Role must be admin or manager")
+    # Roles: 'admin' (full), 'gm' (General Manager — financials + read-only
+    # settings, no system config), 'manager'/'regular' (Store Manager — ops
+    # only, no Admin or Settings sections).
+    if role not in ("admin", "gm", "manager", "regular"):
+        raise HTTPException(status_code=400, detail="Role must be admin, gm, or manager")
 
     with db() as conn:
         cur = conn.cursor()
@@ -861,8 +882,8 @@ def change_user_role(user_id: int, payload: dict = Body(...), request: Request =
     always be at least one account able to administer the system."""
     require_admin(request)
     role = (payload.get("role") or "").strip()
-    if role not in ("admin", "manager", "regular"):
-        raise HTTPException(status_code=400, detail="Role must be admin or manager")
+    if role not in ("admin", "gm", "manager", "regular"):
+        raise HTTPException(status_code=400, detail="Role must be admin, gm, or manager")
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT role, is_active FROM users WHERE id = ?", (user_id,))

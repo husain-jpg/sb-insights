@@ -6213,18 +6213,16 @@ async function loadCurrentUser() {
     const data = await res.json();
     _currentUser = data;
     renderUserPane(data);
-    // Hide admin-only nav for non-admins (Store Managers): every button in the
-    // Admin + Settings groups, then the now-empty group containers themselves.
-    if (data.logged_in && data.role !== "admin") {
-      ADMIN_ONLY_PAGES.forEach(p => {
-        const b = document.querySelector(`nav button[data-page="${p}"]`);
-        if (b) b.style.display = "none";
-      });
-      ["admin", "settings"].forEach(g => {
-        const grp = document.querySelector(`.nav-group[data-group="${g}"]`);
-        if (grp) grp.style.display = "none";
-      });
-    }
+    // Hide nav entries this role can't open, then collapse any group left with
+    // no visible items. Works for all three tiers off PAGE_ACCESS/ROLE_RANK.
+    document.querySelectorAll("nav button[data-page]").forEach(b => {
+      b.style.display = canAccessPage(b.dataset.page) ? "" : "none";
+    });
+    document.querySelectorAll(".nav-group").forEach(grp => {
+      const items = grp.querySelectorAll('.nav-group-items button[data-page]');
+      const anyVisible = [...items].some(b => b.style.display !== "none");
+      grp.style.display = anyVisible ? "" : "none";
+    });
   } catch (e) {
     document.getElementById("user-pane-content").innerHTML = '<span style="color: var(--critical);">Auth error</span>';
   }
@@ -6262,6 +6260,10 @@ function renderUserPane(data) {
 // ========================================================================
 // Users — admin user management
 // ========================================================================
+function roleLabel(role) {
+  return role === 'admin' ? 'Admin' : role === 'gm' ? 'General Manager' : 'Store Manager';
+}
+
 async function renderUsers() {
   const main = document.getElementById("main");
   main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading users…</div>`;
@@ -6279,7 +6281,10 @@ async function renderUsers() {
       </div>
 
       <div class="hint-box" style="margin-bottom: 14px;">
-        <strong>Roles:</strong> <strong>Admin</strong> = full access (financials, settings, users, connectors). <strong>Store Manager</strong> = the full operational dashboard (inventory, reorder, promos, mix, market intel, competitor pricing) but <em>no</em> Admin or Settings pages — they can't see financials/rebates or change any configuration. Change a user's role anytime with the role button; the last active admin can't be demoted.<br>
+        <strong>Roles</strong> (set per user, change anytime via the dropdown — the last active admin can't be demoted):<br>
+        • <strong>Admin</strong> — full access: financials, system settings, users, credentials, connectors.<br>
+        • <strong>General Manager</strong> — full operational dashboard <em>plus</em> financials (Collectives, LTOs, LP Partners, Monthly Reports) and <em>read-only</em> System Settings. No user management, credentials, or system config.<br>
+        • <strong>Store Manager</strong> — operational dashboard only (inventory, reorder, promos, mix, market intel, competitor pricing). No financials, no settings.<br>
         <strong>Adding users:</strong> set a temporary password (min 12 chars) — the user must change it on first login. Share it through a secure channel (in person, encrypted message), not email.
       </div>
 
@@ -6293,13 +6298,17 @@ async function renderUsers() {
               <tr>
                 <td><strong>${escapeHtml(u.email)}</strong></td>
                 <td>${escapeHtml(u.name || '—')}</td>
-                <td><span class="tag" style="font-size: 9px;">${u.role === 'admin' ? 'Admin' : 'Store Manager'}</span></td>
+                <td><span class="tag" style="font-size: 9px;">${roleLabel(u.role)}</span></td>
                 <td>${u.is_active ? '<span style="color: #6dab84;">Active</span>' : '<span style="color: var(--text-faint);">Disabled</span>'}${u.must_change_password ? ' · <span style="color: var(--accent);">must change pw</span>' : ''}</td>
                 <td style="font-size: 11px; color: var(--text-dim);">${u.last_login_at || 'Never'}</td>
                 <td>
                   <button class="btn-link user-reset-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px;">Reset pw</button>
-                  <button class="btn-link user-role-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" data-role="${u.role === 'admin' ? 'manager' : 'admin'}" style="font-size: 10px; color: #c89b32;"
-                          title="${u.role === 'admin' ? 'Demote to Store Manager: full operational dashboard, but no Admin pages (Financial, Collectives, LTOs, LP Partners, Monthly Reports) and no Settings.' : 'Promote to Admin: full access including financials, user management, credentials, and settings.'}">${u.role === 'admin' ? 'Make Store Manager' : 'Make Admin'}</button>
+                  <select class="user-role-select" data-id="${u.id}" data-email="${escapeHtml(u.email)}" data-current="${u.role === 'gm' ? 'gm' : (u.role === 'admin' ? 'admin' : 'manager')}"
+                          title="Change this user's access level" style="font-size: 10px; padding: 1px 4px;">
+                    <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>Admin</option>
+                    <option value="gm" ${u.role === 'gm' ? 'selected' : ''}>General Manager</option>
+                    <option value="manager" ${(u.role !== 'admin' && u.role !== 'gm') ? 'selected' : ''}>Store Manager</option>
+                  </select>
                   ${u.is_active ? `<button class="btn-link user-deactivate-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px; color: var(--critical);">Disable</button>` : `<button class="btn-link user-reactivate-btn" data-id="${u.id}" style="font-size: 10px; color: #6dab84;">Re-enable</button>`}
                 </td>
               </tr>
@@ -6313,8 +6322,8 @@ async function renderUsers() {
       const email = prompt("Email for new user:");
       if (!email) return;
       const name = prompt("Display name (optional):") || "";
-      const roleIn = (prompt("Role — type 'admin' for full access, or 'manager' for Store Manager (everything except Admin + Settings):", "manager") || "manager").trim().toLowerCase();
-      const role = roleIn === "admin" ? "admin" : "manager";
+      const roleIn = (prompt("Role — 'admin' (full), 'gm' (General Manager: + financials & read-only settings), or 'manager' (Store Manager: operations only):", "manager") || "manager").trim().toLowerCase();
+      const role = (roleIn === "admin" || roleIn === "gm") ? roleIn : "manager";
       const tempPw = prompt("Temp password (min 12 chars). User will be forced to change on first login:");
       if (!tempPw || tempPw.length < 12) { alert("Password too short"); return; }
       try {
@@ -6347,21 +6356,26 @@ async function renderUsers() {
       });
     });
 
-    document.querySelectorAll(".user-role-btn").forEach(b => {
-      b.addEventListener("click", async () => {
-        const target = b.dataset.role;
-        const msg = target === 'regular'
-          ? `Demote ${b.dataset.email} to regular?\n\nThey keep the full dashboard and can VIEW System Settings, but lose the admin pages (Users, Email Scraper, OCS Connector) and can no longer change settings.`
-          : `Promote ${b.dataset.email} to admin?\n\nFull access: user management, credentials, settings changes.`;
-        if (!confirm(msg)) return;
-        const res = await fetch(`/api/users/${b.dataset.id}/role`, {
+    document.querySelectorAll(".user-role-select").forEach(sel => {
+      sel.addEventListener("change", async () => {
+        const target = sel.value;
+        const blurb = {
+          admin: "Full access: financials, user management, credentials, and settings.",
+          gm: "General Manager: full dashboard + financials (Collectives, LTOs, LP Partners, Monthly Reports) and read-only System Settings. No user management, credentials, or system config.",
+          manager: "Store Manager: operational dashboard only — no Admin pages (financials) and no Settings.",
+        }[target];
+        if (!confirm(`Set ${sel.dataset.email} to ${roleLabel(target)}?\n\n${blurb}`)) {
+          sel.value = sel.dataset.current;  // revert the dropdown
+          return;
+        }
+        const res = await fetch(`/api/users/${sel.dataset.id}/role`, {
           method: "POST", credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ role: target }),
         });
         const result = await res.json().catch(() => ({}));
         if (res.ok) renderUsers();
-        else alert("Failed: " + (result.detail || "unknown"));
+        else { alert("Failed: " + (result.detail || "unknown")); sel.value = sel.dataset.current; }
       });
     });
 
@@ -7238,21 +7252,34 @@ const routes = {
   "system-health": renderSystemHealth,
 };
 
-// Pages only admins may open. The server 403s their APIs anyway; this keeps
-// the UI coherent (hidden nav buttons + a clear message on direct navigation).
-// Store Managers are blocked from the entire Admin group (financials,
-// collectives, LTOs, LP partners, monthly reports) and the Settings group.
-const ADMIN_ONLY_PAGES = [
-  // Settings group
-  "settings", "users", "email-scraper", "ocs-connector", "system-health",
-  // Admin group
-  "analytics", "partners", "ltos", "data-lp-partners", "monthly-reports",
-];
+// Three-tier page access: admin > gm (General Manager) > manager (Store
+// Manager). The server enforces this too; this keeps the UI coherent (hidden
+// nav + a clear message on direct navigation). A page absent from PAGE_ACCESS
+// is open to everyone logged in. 'settings' is gm+ here (renders read-only for
+// non-admins); writes are admin-only server-side.
+const ROLE_RANK = { admin: 3, gm: 2, manager: 1, regular: 1 };
+const PAGE_ACCESS = {
+  // admin only — system config, users, credentials
+  users: "admin", "email-scraper": "admin", "ocs-connector": "admin", "system-health": "admin",
+  // GM or admin — financials + read-only settings
+  analytics: "gm", partners: "gm", ltos: "gm", "data-lp-partners": "gm",
+  "monthly-reports": "gm", settings: "gm",
+};
+function _myRoleRank() {
+  const r = (_currentUser && _currentUser.logged_in) ? (_currentUser.role || "manager") : "manager";
+  return ROLE_RANK[r] ?? 1;
+}
+function canAccessPage(page) {
+  const need = PAGE_ACCESS[page];
+  if (!need) return true;
+  if (_currentUser && _currentUser.bootstrap_mode) return true;
+  return _myRoleRank() >= (ROLE_RANK[need] || 3);
+}
 
 function goto(page) {
-  if (ADMIN_ONLY_PAGES.includes(page) && _currentUser && _currentUser.logged_in && _currentUser.role !== "admin") {
+  if (!canAccessPage(page)) {
     document.getElementById("main").innerHTML =
-      `<div class="error"><strong>Admins only</strong>This section is restricted to the administrator.</div>`;
+      `<div class="error"><strong>Not authorized</strong>You don't have access to this section.</div>`;
     return;
   }
   document.querySelectorAll("nav button[data-page]").forEach(b => b.classList.remove("active"));
