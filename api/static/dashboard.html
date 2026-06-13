@@ -485,7 +485,6 @@
       <div class="nav-group-items">
         <button data-page="inventory">▸ Inventory On Hand</button>
         <button data-page="ocs-catalogue">▸ OCS Catalogue</button>
-        <button data-page="market-intel">▸ Market Intelligence</button>
         <button data-page="reorder">▸ Reorder Report <span class="badge" id="badge-reorder" style="display:none"></span></button>
         <button data-page="stockouts">▸ Stockouts <span class="badge" id="badge-stockouts" style="display:none"></span></button>
         <button data-page="deadstock">▸ Dead Stock / Overstock</button>
@@ -502,6 +501,7 @@
       </button>
       <div class="nav-group-items">
         <button data-page="mix">▸ Inventory Category Mix</button>
+        <button data-page="market-intel">▸ Market Intelligence</button>
         <button data-page="competitors">▸ Competitor Pricing</button>
         <button data-page="outcomes">▸ Order Backtests</button>
       </div>
@@ -6213,12 +6213,16 @@ async function loadCurrentUser() {
     const data = await res.json();
     _currentUser = data;
     renderUserPane(data);
-    // Hide admin-only nav for non-admins (Users, Email Scraper, OCS Connector).
-    // System Settings stays visible — it renders read-only for them.
+    // Hide admin-only nav for non-admins (Store Managers): every button in the
+    // Admin + Settings groups, then the now-empty group containers themselves.
     if (data.logged_in && data.role !== "admin") {
       ADMIN_ONLY_PAGES.forEach(p => {
         const b = document.querySelector(`nav button[data-page="${p}"]`);
         if (b) b.style.display = "none";
+      });
+      ["admin", "settings"].forEach(g => {
+        const grp = document.querySelector(`.nav-group[data-group="${g}"]`);
+        if (grp) grp.style.display = "none";
       });
     }
   } catch (e) {
@@ -6275,7 +6279,8 @@ async function renderUsers() {
       </div>
 
       <div class="hint-box" style="margin-bottom: 14px;">
-        <strong>Adding users:</strong> set a temporary password (min 12 chars). The user will be forced to change it on first login. Share the email + temp password with them through a secure channel (in person, encrypted message). Don't email passwords.
+        <strong>Roles:</strong> <strong>Admin</strong> = full access (financials, settings, users, connectors). <strong>Store Manager</strong> = the full operational dashboard (inventory, reorder, promos, mix, market intel, competitor pricing) but <em>no</em> Admin or Settings pages — they can't see financials/rebates or change any configuration. Change a user's role anytime with the role button; the last active admin can't be demoted.<br>
+        <strong>Adding users:</strong> set a temporary password (min 12 chars) — the user must change it on first login. Share it through a secure channel (in person, encrypted message), not email.
       </div>
 
       <div class="card">
@@ -6288,13 +6293,13 @@ async function renderUsers() {
               <tr>
                 <td><strong>${escapeHtml(u.email)}</strong></td>
                 <td>${escapeHtml(u.name || '—')}</td>
-                <td><span class="tag" style="font-size: 9px;">${escapeHtml(u.role)}</span></td>
+                <td><span class="tag" style="font-size: 9px;">${u.role === 'admin' ? 'Admin' : 'Store Manager'}</span></td>
                 <td>${u.is_active ? '<span style="color: #6dab84;">Active</span>' : '<span style="color: var(--text-faint);">Disabled</span>'}${u.must_change_password ? ' · <span style="color: var(--accent);">must change pw</span>' : ''}</td>
                 <td style="font-size: 11px; color: var(--text-dim);">${u.last_login_at || 'Never'}</td>
                 <td>
                   <button class="btn-link user-reset-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px;">Reset pw</button>
-                  <button class="btn-link user-role-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" data-role="${u.role === 'admin' ? 'regular' : 'admin'}" style="font-size: 10px; color: #c89b32;"
-                          title="${u.role === 'admin' ? 'Demote to regular: keeps full dashboard access + read-only System Settings, removes admin pages and the ability to change settings.' : 'Promote to admin: full access including user management, credentials, and settings changes.'}">${u.role === 'admin' ? 'Make regular' : 'Make admin'}</button>
+                  <button class="btn-link user-role-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" data-role="${u.role === 'admin' ? 'manager' : 'admin'}" style="font-size: 10px; color: #c89b32;"
+                          title="${u.role === 'admin' ? 'Demote to Store Manager: full operational dashboard, but no Admin pages (Financial, Collectives, LTOs, LP Partners, Monthly Reports) and no Settings.' : 'Promote to Admin: full access including financials, user management, credentials, and settings.'}">${u.role === 'admin' ? 'Make Store Manager' : 'Make Admin'}</button>
                   ${u.is_active ? `<button class="btn-link user-deactivate-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px; color: var(--critical);">Disable</button>` : `<button class="btn-link user-reactivate-btn" data-id="${u.id}" style="font-size: 10px; color: #6dab84;">Re-enable</button>`}
                 </td>
               </tr>
@@ -6308,7 +6313,8 @@ async function renderUsers() {
       const email = prompt("Email for new user:");
       if (!email) return;
       const name = prompt("Display name (optional):") || "";
-      const role = prompt("Role (admin or regular)?", "regular") || "regular";
+      const roleIn = (prompt("Role — type 'admin' for full access, or 'manager' for Store Manager (everything except Admin + Settings):", "manager") || "manager").trim().toLowerCase();
+      const role = roleIn === "admin" ? "admin" : "manager";
       const tempPw = prompt("Temp password (min 12 chars). User will be forced to change on first login:");
       if (!tempPw || tempPw.length < 12) { alert("Password too short"); return; }
       try {
@@ -7234,7 +7240,14 @@ const routes = {
 
 // Pages only admins may open. The server 403s their APIs anyway; this keeps
 // the UI coherent (hidden nav buttons + a clear message on direct navigation).
-const ADMIN_ONLY_PAGES = ["users", "email-scraper", "ocs-connector"];
+// Store Managers are blocked from the entire Admin group (financials,
+// collectives, LTOs, LP partners, monthly reports) and the Settings group.
+const ADMIN_ONLY_PAGES = [
+  // Settings group
+  "settings", "users", "email-scraper", "ocs-connector", "system-health",
+  // Admin group
+  "analytics", "partners", "ltos", "data-lp-partners", "monthly-reports",
+];
 
 function goto(page) {
   if (ADMIN_ONLY_PAGES.includes(page) && _currentUser && _currentUser.logged_in && _currentUser.role !== "admin") {

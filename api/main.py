@@ -514,6 +514,26 @@ _PUBLIC_API_PATHS = {
     "/api/auth/logout",  # harmless without a session; avoids weird stuck states
 }
 
+# Admin-only API surface. Store Managers are blocked from these entirely
+# (see AND change) — both the Settings group (system config, users, scrapers,
+# connector) and the Admin group (financials, collectives, LTOs, LP partners,
+# monthly reports). Prefixes are deliberate: "/api/ocs/" hits the connector but
+# NOT "/api/ocs-catalogue" (managers keep the catalogue); "/api/analytics/" is
+# the Financial tab only. The footer status uses "/api/health", left open.
+_ADMIN_API_PREFIXES = (
+    "/api/settings",        # System Settings
+    "/api/users",           # Users
+    "/api/email-scraper",   # Email Scraper
+    "/api/ocs/",            # OCS Connector (NOT /api/ocs-catalogue)
+    "/api/system/",         # System Health / backups
+    "/api/analytics/",      # Financial
+    "/api/brand-partners",  # Data Collectives
+    "/api/data-revenue-deals",
+    "/api/ltos",            # LTOs
+    "/api/data-lp-partners",
+    "/api/monthly-reports",
+)
+
 # One-way latch: once users exist, stop re-checking on every request.
 # (Bootstrap mode only matters until the first admin is created.)
 _USERS_EXIST_LATCH = False
@@ -540,6 +560,9 @@ async def _global_api_auth(request: Request, call_next):
         return JSONResponse({"detail": e.detail}, status_code=e.status_code)
     if not user:
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    # Admin-only surface: Store Managers (any non-admin) are blocked here.
+    if user.get("role") != "admin" and any(path.startswith(p) for p in _ADMIN_API_PREFIXES):
+        return JSONResponse({"detail": "Admin only"}, status_code=403)
     return await call_next(request)
 
 
@@ -747,14 +770,16 @@ def create_user(payload: dict = Body(...), request: Request = None) -> dict:
     email = (payload.get("email") or "").strip().lower()
     name = (payload.get("name") or "").strip() or None
     temp_password = payload.get("temp_password") or ""
-    role = (payload.get("role") or "regular").strip()
+    role = (payload.get("role") or "manager").strip()
 
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email required")
     if len(temp_password) < 12:
         raise HTTPException(status_code=400, detail="Temp password must be at least 12 characters")
-    if role not in ("admin", "regular"):
-        raise HTTPException(status_code=400, detail="Role must be admin or regular")
+    # 'manager' (a.k.a. legacy 'regular') = everything except the Admin +
+    # Settings sections; 'admin' = full access.
+    if role not in ("admin", "manager", "regular"):
+        raise HTTPException(status_code=400, detail="Role must be admin or manager")
 
     with db() as conn:
         cur = conn.cursor()
@@ -836,8 +861,8 @@ def change_user_role(user_id: int, payload: dict = Body(...), request: Request =
     always be at least one account able to administer the system."""
     require_admin(request)
     role = (payload.get("role") or "").strip()
-    if role not in ("admin", "regular"):
-        raise HTTPException(status_code=400, detail="Role must be admin or regular")
+    if role not in ("admin", "manager", "regular"):
+        raise HTTPException(status_code=400, detail="Role must be admin or manager")
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT role, is_active FROM users WHERE id = ?", (user_id,))
