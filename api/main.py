@@ -465,6 +465,8 @@ def _has_any_users(conn) -> bool:
 def get_current_user(request: Request) -> dict | None:
     """Look up the logged-in user from the session cookie. Returns None if
     not logged in or session expired. Does NOT raise — caller decides."""
+    if request is None:  # direct Python call (tests/exports) — no session
+        return None
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if not token:
         return None
@@ -726,6 +728,42 @@ def reactivate_user(user_id: int, request: Request = None) -> dict:
             raise HTTPException(status_code=404, detail="User not found")
         conn.commit()
     return {"ok": True}
+
+
+@app.post("/api/users/{user_id}/role")
+def change_user_role(user_id: int, payload: dict = Body(...), request: Request = None) -> dict:
+    """Change a user's role (admin only). 'regular' users keep full dashboard
+    access and can VIEW System Settings, but can't change settings or reach
+    the admin pages (Users, Email Scraper, OCS Connector).
+
+    Lockout guard: refuses to demote the last active admin — there must
+    always be at least one account able to administer the system."""
+    require_admin(request)
+    role = (payload.get("role") or "").strip()
+    if role not in ("admin", "regular"):
+        raise HTTPException(status_code=400, detail="Role must be admin or regular")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT role, is_active FROM users WHERE id = ?", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        current_role, is_active = row
+        if current_role == role:
+            return {"ok": True, "unchanged": True, "role": role}
+        if current_role == "admin" and role != "admin":
+            cur.execute("""
+                SELECT COUNT(*) FROM users
+                WHERE role = 'admin' AND is_active = 1 AND id != ?
+            """, (user_id,))
+            if (cur.fetchone()[0] or 0) == 0:
+                raise HTTPException(status_code=400,
+                                    detail="Can't demote the last active admin — promote someone else first")
+        cur.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+        conn.commit()
+    # No session invalidation needed: role is read live from the users table
+    # on every request (session lookup joins users), so it applies immediately.
+    return {"ok": True, "role": role}
 
 
 def get_latest_sale_date(conn) -> date:
@@ -5218,8 +5256,11 @@ def get_gap_history(location_id: str, status: str | None = None) -> dict:
 #     localStorage). Falls back to "anonymous" for direct API calls.
 
 @app.get("/api/settings")
-def get_all_settings() -> dict:
-    """List all tunable settings, grouped by section, with current + default values."""
+def get_all_settings(request: Request = None) -> dict:
+    """List all tunable settings, grouped by section, with current + default
+    values. Any logged-in user may VIEW settings; only admins may change them
+    (see update_setting / reset_setting)."""
+    require_user(request)
     with db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -5246,9 +5287,11 @@ def get_all_settings() -> dict:
 
 
 @app.put("/api/settings/{key:path}")
-def update_setting(key: str, payload: dict = Body(...)) -> dict:
-    """Update one setting. Validates against the row's min/max bounds.
-    Logs the change to app_settings_history."""
+def update_setting(key: str, payload: dict = Body(...), request: Request = None) -> dict:
+    """Update one setting (ADMIN ONLY — non-admins get read-only access via
+    GET). Validates against the row's min/max bounds. Logs the change to
+    app_settings_history."""
+    admin = require_admin(request)
     new_value = payload.get("value")
     if new_value is None:
         raise HTTPException(status_code=400, detail="value required")
@@ -5256,7 +5299,9 @@ def update_setting(key: str, payload: dict = Body(...)) -> dict:
         new_value = float(new_value)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="value must be a number")
-    actor = (payload.get("changed_by") or "").strip() or "anonymous"
+    # Audit identity comes from the authenticated session, not the payload —
+    # the old client-typed changed_by is kept only as a fallback label.
+    actor = admin.get("email") or (payload.get("changed_by") or "").strip() or "anonymous"
     note = payload.get("note") or None
 
     with db() as conn:
@@ -5299,9 +5344,10 @@ def update_setting(key: str, payload: dict = Body(...)) -> dict:
 
 
 @app.post("/api/settings/{key:path}/reset")
-def reset_setting(key: str, payload: dict = Body(default={})) -> dict:
-    """Reset a setting back to its default value. Logged to history."""
-    actor = (payload.get("changed_by") or "").strip() or "anonymous"
+def reset_setting(key: str, payload: dict = Body(default={}), request: Request = None) -> dict:
+    """Reset a setting back to its default value (ADMIN ONLY). Logged to history."""
+    admin = require_admin(request)
+    actor = admin.get("email") or (payload.get("changed_by") or "").strip() or "anonymous"
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT value, default_value FROM app_settings WHERE key = ?", (key,))
@@ -5324,8 +5370,11 @@ def reset_setting(key: str, payload: dict = Body(default={})) -> dict:
 
 
 @app.get("/api/settings/_history")
-def get_settings_history(key: str | None = None, limit: int = 100) -> dict:
-    """Audit trail of recent settings changes. Pass ?key=foo.bar to filter."""
+def get_settings_history(key: str | None = None, limit: int = 100,
+                         request: Request = None) -> dict:
+    """Audit trail of recent settings changes. Pass ?key=foo.bar to filter.
+    Viewable by any logged-in user (read-only data)."""
+    require_user(request)
     with db() as conn:
         cur = conn.cursor()
         if key:

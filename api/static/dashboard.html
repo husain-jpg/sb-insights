@@ -6106,6 +6106,14 @@ async function loadCurrentUser() {
     const data = await res.json();
     _currentUser = data;
     renderUserPane(data);
+    // Hide admin-only nav for non-admins (Users, Email Scraper, OCS Connector).
+    // System Settings stays visible — it renders read-only for them.
+    if (data.logged_in && data.role !== "admin") {
+      ADMIN_ONLY_PAGES.forEach(p => {
+        const b = document.querySelector(`nav button[data-page="${p}"]`);
+        if (b) b.style.display = "none";
+      });
+    }
   } catch (e) {
     document.getElementById("user-pane-content").innerHTML = '<span style="color: var(--critical);">Auth error</span>';
   }
@@ -6178,6 +6186,8 @@ async function renderUsers() {
                 <td style="font-size: 11px; color: var(--text-dim);">${u.last_login_at || 'Never'}</td>
                 <td>
                   <button class="btn-link user-reset-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px;">Reset pw</button>
+                  <button class="btn-link user-role-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" data-role="${u.role === 'admin' ? 'regular' : 'admin'}" style="font-size: 10px; color: #c89b32;"
+                          title="${u.role === 'admin' ? 'Demote to regular: keeps full dashboard access + read-only System Settings, removes admin pages and the ability to change settings.' : 'Promote to admin: full access including user management, credentials, and settings changes.'}">${u.role === 'admin' ? 'Make regular' : 'Make admin'}</button>
                   ${u.is_active ? `<button class="btn-link user-deactivate-btn" data-id="${u.id}" data-email="${escapeHtml(u.email)}" style="font-size: 10px; color: var(--critical);">Disable</button>` : `<button class="btn-link user-reactivate-btn" data-id="${u.id}" style="font-size: 10px; color: #6dab84;">Re-enable</button>`}
                 </td>
               </tr>
@@ -6221,6 +6231,24 @@ async function renderUsers() {
           alert(`Password reset. Share this with the user:\n\nEmail: ${b.dataset.email}\nTemp password: ${tempPw}`);
           renderUsers();
         } else { alert("Failed"); }
+      });
+    });
+
+    document.querySelectorAll(".user-role-btn").forEach(b => {
+      b.addEventListener("click", async () => {
+        const target = b.dataset.role;
+        const msg = target === 'regular'
+          ? `Demote ${b.dataset.email} to regular?\n\nThey keep the full dashboard and can VIEW System Settings, but lose the admin pages (Users, Email Scraper, OCS Connector) and can no longer change settings.`
+          : `Promote ${b.dataset.email} to admin?\n\nFull access: user management, credentials, settings changes.`;
+        if (!confirm(msg)) return;
+        const res = await fetch(`/api/users/${b.dataset.id}/role`, {
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ role: target }),
+        });
+        const result = await res.json().catch(() => ({}));
+        if (res.ok) renderUsers();
+        else alert("Failed: " + (result.detail || "unknown"));
       });
     });
 
@@ -6847,9 +6875,10 @@ function renderSystemHealthContent(data) {
 
 async function renderSettings() {
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="loading">LOADING SETTINGS...</div>`;
+  main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading settings…</div>`;
   try {
-    const data = await api("/api/settings");
+    const [data, me] = await Promise.all([api("/api/settings"), api("/api/auth/me")]);
+    const isAdmin = !!(me && me.logged_in && me.role === 'admin') || !!(me && me.bootstrap_mode);
     const sections = data.sections || {};
     const sectionNames = Object.keys(sections);
 
@@ -6857,23 +6886,25 @@ async function renderSettings() {
       <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
         <div style="display: flex; justify-content: space-between; align-items: baseline;">
           <div>
-            <div class="kicker">Admin · Engine Tuning</div>
+            <div class="kicker">${isAdmin ? 'Admin · Engine Tuning' : 'Engine Tuning · Read-only'}</div>
             <h2 style="white-space: nowrap;">Settings</h2>
           </div>
-          <div style="font-size: 11px; color: var(--text-dim);">
+          ${isAdmin ? `<div style="font-size: 11px; color: var(--text-dim);">
             Logged in as: <strong id="settings-author-display">${escapeHtml(getAuthor() || 'click to set name')}</strong>
             <button id="settings-set-author" class="btn-link" style="margin-left: 8px;">change</button>
-          </div>
+          </div>` : ''}
         </div>
       </div>
 
-      <div class="hint-box" style="margin-bottom: 14px;">
+      ${isAdmin ? `<div class="hint-box" style="margin-bottom: 14px;">
         Every change here flows through to the reorder engine on the next /api/reorder call. No restart needed.
         Changes are logged to the audit trail at the bottom. If you need to undo something, "Reset to default" is one click away.
-      </div>
+      </div>` : `<div class="hint-box" style="margin-bottom: 14px;">
+        <strong>Read-only view.</strong> These are the live engine settings — reorder ceilings, Hero classification, promo cascade, and the rest — so you can see exactly what the system is using. Only the administrator can change them.
+      </div>`}
 
       <div id="settings-sections">
-        ${sectionNames.map(name => renderSettingsSection(name, sections[name])).join("")}
+        ${sectionNames.map(name => renderSettingsSection(name, sections[name], isAdmin)).join("")}
       </div>
 
       <div class="card" style="margin-top: 24px;">
@@ -6887,20 +6918,21 @@ async function renderSettings() {
       </div>
     `;
 
-    document.getElementById("settings-set-author").addEventListener("click", () => {
-      const n = (prompt("Your name:", getAuthor() || "") || "").trim();
-      if (n) {
-        setAuthor(n);
-        document.getElementById("settings-author-display").textContent = n;
-      }
-    });
-
-    wireUpSettingsControls();
+    if (isAdmin) {
+      document.getElementById("settings-set-author").addEventListener("click", () => {
+        const n = (prompt("Your name:", getAuthor() || "") || "").trim();
+        if (n) {
+          setAuthor(n);
+          document.getElementById("settings-author-display").textContent = n;
+        }
+      });
+      wireUpSettingsControls();
+    }
     loadSettingsHistory();
   } catch (e) { showError(e); }
 }
 
-function renderSettingsSection(sectionName, settings) {
+function renderSettingsSection(sectionName, settings, editable = true) {
   const rows = settings.map(s => {
     const inputId = `setting-${s.key.replace(/\./g, "-")}`;
     const isPercent = s.value_type === "percent";
@@ -6927,17 +6959,19 @@ function renderSettingsSection(sectionName, settings) {
           </div>
         </div>
         <div style="display: flex; align-items: center; gap: 4px;">
-          <input type="number" id="${inputId}" class="setting-input" data-key="${escapeHtml(s.key)}"
+          ${editable
+            ? `<input type="number" id="${inputId}" class="setting-input" data-key="${escapeHtml(s.key)}"
                  value="${isInt ? Math.round(s.value) : s.value}"
                  step="${step}"
                  min="${s.min_value !== null ? s.min_value : ''}"
                  max="${s.max_value !== null ? s.max_value : ''}"
-                 style="width: 80px; text-align: right;">
+                 style="width: 80px; text-align: right;">`
+            : `<span style="font-family: ui-monospace, Menlo, monospace; font-size: 14px;">${isInt ? Math.round(s.value) : s.value}</span>`}
           <span style="font-size: 11px; color: var(--text-dim);">${suffix}</span>
         </div>
         <div style="display: flex; gap: 6px;">
-          <button class="btn setting-save" data-key="${escapeHtml(s.key)}" style="font-size: 11px;">Save</button>
-          ${s.is_modified ? `<button class="btn-link setting-reset" data-key="${escapeHtml(s.key)}" style="font-size: 11px;">Reset</button>` : ''}
+          ${editable ? `<button class="btn setting-save" data-key="${escapeHtml(s.key)}" style="font-size: 11px;">Save</button>` : ''}
+          ${editable && s.is_modified ? `<button class="btn-link setting-reset" data-key="${escapeHtml(s.key)}" style="font-size: 11px;">Reset</button>` : ''}
         </div>
       </div>
     `;
@@ -7091,7 +7125,16 @@ const routes = {
   "system-health": renderSystemHealth,
 };
 
+// Pages only admins may open. The server 403s their APIs anyway; this keeps
+// the UI coherent (hidden nav buttons + a clear message on direct navigation).
+const ADMIN_ONLY_PAGES = ["users", "email-scraper", "ocs-connector"];
+
 function goto(page) {
+  if (ADMIN_ONLY_PAGES.includes(page) && _currentUser && _currentUser.logged_in && _currentUser.role !== "admin") {
+    document.getElementById("main").innerHTML =
+      `<div class="error"><strong>Admins only</strong>This section is restricted to the administrator.</div>`;
+    return;
+  }
   document.querySelectorAll("nav button[data-page]").forEach(b => b.classList.remove("active"));
   const btn = document.querySelector(`nav button[data-page="${page}"]`);
   if (btn) btn.classList.add("active");
