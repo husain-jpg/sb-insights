@@ -233,10 +233,18 @@ def fetch_catalogue(session, account: OcsAccount) -> tuple[bytes, str]:
     if not resp.content or not resp.content.startswith(_EXCEL_MAGICS):
         if _looks_like_maintenance(resp.text if "html" in (resp.headers.get("content-type") or "") else ""):
             raise RuntimeError("OCS portal is in maintenance mode — catalogue download returned the maintenance page")
+        # Dump the page for diagnosis — when the portal changes its export
+        # flow, this is the only way to see what it served instead.
+        debug_path = IMPORTS_DIR / "_ocs_debug_last_response.html"
+        try:
+            IMPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            debug_path.write_bytes(resp.content)
+        except OSError:
+            pass
         raise RuntimeError(
             f"OCS catalogue download is not an Excel file "
             f"(content-type {resp.headers.get('content-type')!r}, {len(resp.content)} bytes) — "
-            f"login likely failed or the portal is down")
+            f"page saved to {debug_path.name} for diagnosis")
     fname = _filename_from_response(resp, "OCS_Catalogue.xlsx")
     return resp.content, fname
 
