@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, asdict
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 
@@ -41,7 +42,7 @@ class OrderLine:
     pack_size: int               # units per case
     unit_price: float            # per-unit wholesale
     item_price: float            # full case price (unit_price * pack_size)
-    available_quantity: int      # OCS-side stock cap
+    available_quantity: int | None  # OCS-side stock cap (None = no cap shown)
     max_quantity: int | None     # OCS-side per-order cap
     is_back_in_stock: bool
     is_new_arrival: bool
@@ -87,8 +88,13 @@ def fill_template(
     # Reset Quantity to integers, in case the template had any pre-fill
     df["Quantity"] = 0
 
-    # Pull engine recommendations for this store
-    kw = {}
+    # Pull engine recommendations for this store. Anchor to the latest sale
+    # date — same as the Reorder Report — so the filled quantities match what
+    # the manager saw on screen (compute_all_reorders otherwise defaults
+    # as_of to today, which drifts from the data and changes velocities).
+    _row = conn.execute("SELECT MAX(sale_date) FROM sales_daily").fetchone()
+    as_of_date = date.fromisoformat(_row[0]) if _row and _row[0] else None
+    kw = {"as_of_date": as_of_date}
     if ceiling_days is not None:
         kw["ceiling_days"] = ceiling_days
     if min_velocity is not None:
@@ -111,7 +117,11 @@ def fill_template(
         pack_size = int(row["PackSize"]) if pd.notna(row["PackSize"]) else 1
         unit_price = float(row["UnitPrice"]) if pd.notna(row["UnitPrice"]) else 0.0
         item_price = float(row["ItemPrice"]) if pd.notna(row["ItemPrice"]) else unit_price * pack_size
-        available = int(row["Available Quantity"]) if pd.notna(row["Available Quantity"]) else 0
+        # Available Quantity: a NUMBER is OCS's stock cap; BLANK means no cap
+        # shown (orderable, unconstrained) — NOT zero. The old code coerced
+        # blank → 0, which clamped every unconstrained SKU down to 0 cases and
+        # left the whole template empty. None here = "don't clamp on supply".
+        available = int(row["Available Quantity"]) if pd.notna(row["Available Quantity"]) else None
         max_qty = int(row["MaxQty"]) if pd.notna(row.get("MaxQty")) else None
 
         rec = recs_by_variant.get(sku)
@@ -124,12 +134,12 @@ def fill_template(
         engine_cases = int(rec.reorder_cases or 0) if rec.reorder_cases else math.ceil(engine_units / pack_size) if engine_units else 0
 
         # Clamping logic:
-        # 1. Don't order what OCS doesn't have
+        # 1. Don't order more than OCS has (only when a cap is given)
         # 2. Don't exceed MaxQty if set
         # 3. Cases stay ≥ 0
         suggested = max(0, engine_cases)
         notes_parts = []
-        if suggested * pack_size > available:
+        if available is not None and suggested * pack_size > available:
             old = suggested
             suggested = available // pack_size  # floor — only what's on hand
             if old > suggested:
