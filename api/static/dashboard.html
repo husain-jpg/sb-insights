@@ -1093,9 +1093,7 @@ function renderSuggestedTable(items, locationId) {
                  title="Add to this week's order — creates a green trial-add row in the reorder table and fills the OCS template at the suggested quantity."
                  style="font-size: 10px; color: #6dab84;">Add</button>
          <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="snooze"
-                 title="Snooze for 90 days — hides it now, then it comes BACK on the list after 90 days if it's still a gap. Use for 'not right now, maybe later'." style="font-size: 10px; color: var(--text-dim);">Snooze</button>
-         <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="dismiss"
-                 title="Dismiss — hides it for good (never comes back unless you Undo). Use for 'we don't want this SKU'." style="font-size: 10px; color: #d66464;">Dismiss</button>`;
+                 title="Dismiss for now — hides it from this list, then it comes BACK after 90 days if it's still a gap (nothing is permanently deleted). Undo anytime." style="font-size: 10px; color: var(--text-dim);">Dismiss</button>`;
     return `
       <tr data-sku="${escapeHtml(it.sku)}" style="${rowStyle}">
         <td style="font-variant-numeric: tabular-nums; color: var(--text-dim);">${idx + 1}</td>
@@ -1164,8 +1162,7 @@ function renderSuggestedTable(items, locationId) {
           // appears below. Each state shows a label + Undo.
           row.style.opacity = '0.5';
           const label = action === 'added' ? '<span style="color:#6dab84; font-weight:600;">✓ Added</span>'
-                      : action === 'snooze' ? '<span style="color:var(--text-dim);">Snoozed 90d</span>'
-                      : '<span style="color:var(--text-dim);">Dismissed</span>';
+                      : '<span style="color:var(--text-dim);" title="Hidden for 90 days, then reappears if still a gap.">Dismissed</span>';
           row.querySelector('td:last-child').innerHTML =
             `${label} <button class="btn-link sa-undo-btn" data-sku="${escapeHtml(sku)}" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`;
           row.querySelector('.sa-undo-btn').addEventListener('click', async () => {
