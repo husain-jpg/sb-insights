@@ -1082,18 +1082,20 @@ function renderSuggestedTable(items, locationId) {
       return '';
     })();
     const added = it.status === 'added';
-    // Green when added (it's going on the order); buttons reflect current state.
-    const rowStyle = added ? 'background: rgba(80, 160, 100, 0.10);' : '';
+    // Once actioned, the row greys out (it's handled). 'Added' keeps a green
+    // check so you can tell it apart from a dismissal; the real result of Add
+    // is the green trial-add row that appears in the reorder table below.
+    const rowStyle = added ? 'opacity: 0.5;' : '';
     const actionCell = added
-      ? `<span style="font-size: 10px; color: #6dab84; font-weight: 600;" title="On this week's order — appears as a green trial-add row in the table below and fills into the OCS template.">✓ Added</span>
-         <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="reset" style="font-size: 10px; color: var(--text-dim); margin-left: 6px;">Undo</button>`
+      ? `<span style="font-size: 10px; color: #6dab84; font-weight: 600;" title="Added to this week's order — appears as a green trial-add row in the table below and fills into the OCS template.">✓ Added</span>
+         <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="reset" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`
       : `<button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="added"
                  title="Add to this week's order — creates a green trial-add row in the reorder table and fills the OCS template at the suggested quantity."
                  style="font-size: 10px; color: #6dab84;">Add</button>
          <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="snooze"
-                 title="Hide for 90 days, then re-evaluate" style="font-size: 10px; color: var(--text-dim);">Snooze</button>
+                 title="Snooze for 90 days — hides it now, then it comes BACK on the list after 90 days if it's still a gap. Use for 'not right now, maybe later'." style="font-size: 10px; color: var(--text-dim);">Snooze</button>
          <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="dismiss"
-                 title="Dismiss — greys out, hidden on next load" style="font-size: 10px; color: #d66464;">Dismiss</button>`;
+                 title="Dismiss — hides it for good (never comes back unless you Undo). Use for 'we don't want this SKU'." style="font-size: 10px; color: #d66464;">Dismiss</button>`;
     return `
       <tr data-sku="${escapeHtml(it.sku)}" style="${rowStyle}">
         <td style="font-variant-numeric: tabular-nums; color: var(--text-dim);">${idx + 1}</td>
@@ -1152,30 +1154,29 @@ function renderSuggestedTable(items, locationId) {
           alert("Action failed: " + (err.detail || "unknown"));
           return;
         }
-        if (action === 'added') {
-          // Green the row + flip to Added state, and refresh the reorder table
-          // so the new green trial-add row shows up below.
+        if (action === 'reset') {
+          // Undo — restore the row to its normal state.
           loadSuggestedAdditions(locationId);
           if (window._reorderRefetch) window._reorderRefetch();
-        } else if (action === 'dismiss' || action === 'snooze') {
-          // Grey it out in place (it's gone on the next full load).
-          if (row) {
-            row.style.opacity = '0.4';
-            row.querySelector('td:last-child').innerHTML =
-              `<span style="font-size: 10px; color: var(--text-dim);">${action === 'snooze' ? 'Snoozed 90d' : 'Dismissed'}</span>
-               <button class="btn-link sa-undo-btn" data-sku="${escapeHtml(sku)}" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`;
-            row.querySelector('.sa-undo-btn').addEventListener('click', async () => {
-              await fetch(`${API}/api/reorder/suggested-additions/${encodeURIComponent(sku)}/action`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ location_id: locationId, action: 'reset', author_name: author }),
-              });
-              loadSuggestedAdditions(locationId);
+        } else if (row) {
+          // Add / Dismiss / Snooze all grey the row in place (it's handled).
+          // Add also refreshes the reorder table so the green trial-add row
+          // appears below. Each state shows a label + Undo.
+          row.style.opacity = '0.5';
+          const label = action === 'added' ? '<span style="color:#6dab84; font-weight:600;">✓ Added</span>'
+                      : action === 'snooze' ? '<span style="color:var(--text-dim);">Snoozed 90d</span>'
+                      : '<span style="color:var(--text-dim);">Dismissed</span>';
+          row.querySelector('td:last-child').innerHTML =
+            `${label} <button class="btn-link sa-undo-btn" data-sku="${escapeHtml(sku)}" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`;
+          row.querySelector('.sa-undo-btn').addEventListener('click', async () => {
+            await fetch(`${API}/api/reorder/suggested-additions/${encodeURIComponent(sku)}/action`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ location_id: locationId, action: 'reset', author_name: author }),
             });
-          }
-        } else {
-          // reset/undo
-          loadSuggestedAdditions(locationId);
-          if (window._reorderRefetch) window._reorderRefetch();
+            loadSuggestedAdditions(locationId);
+            if (window._reorderRefetch) window._reorderRefetch();
+          });
+          if (action === 'added' && window._reorderRefetch) window._reorderRefetch();
         }
       } catch (e) {
         alert("Action failed: " + e.message);
