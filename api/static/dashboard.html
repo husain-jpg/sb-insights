@@ -1047,6 +1047,8 @@ async function loadSuggestedAdditions(locationId) {
         <div style="padding: 8px 16px; font-size: 11px; color: var(--text-dim); background: var(--bg-elev-2); border-top: 1px solid var(--border);">
           These SKUs sell well at peer stores in your municipality but you don't carry them. Suggested quantities are conservative trial orders (1-2 cases). Once stocked, regular reorder takes over.
         </div>
+        ${(typeof miFreshnessBanner === 'function' && _dataAgeDays(data.imported_at) != null && _dataAgeDays(data.imported_at) > 14)
+          ? `<div style="padding: 10px 16px 0;">${miFreshnessBanner(data.imported_at, data.period_end)}</div>` : ''}
         <div id="sa-table"></div>
       </div>
     </div>
@@ -5821,6 +5823,34 @@ async function renderMonthlyReports() {
 let _miCurrentStore = null;
 let _miCurrentView = "gap";  // 'gap' | 'comparison' | 'imports'
 
+// Age (in days) of an imported_at timestamp, or null if unparseable.
+function _dataAgeDays(importedAt) {
+  if (!importedAt) return null;
+  const t = new Date(String(importedAt).replace(' ', 'T')).getTime();
+  if (isNaN(t)) return null;
+  return Math.floor((Date.now() - t) / 86400000);
+}
+// Colored freshness banner for Market Intelligence (manual 30-day-window
+// reports). Green ≤14d, amber 15–30d, red >30d.
+function miFreshnessBanner(importedAt, periodEnd) {
+  const age = _dataAgeDays(importedAt);
+  if (age == null) return '';
+  const d = String(importedAt).slice(0, 10);
+  let fg, bg, icon, msg;
+  if (age <= 14) {
+    fg = '#6dab84'; bg = 'rgba(80,160,100,.10)'; icon = '✓';
+    msg = `Up to date — imported ${d} (${age} day${age === 1 ? '' : 's'} ago).`;
+  } else if (age <= 30) {
+    fg = '#c89b32'; bg = 'rgba(200,155,50,.12)'; icon = '⚠';
+    msg = `Getting stale — imported ${d} (${age} days ago). Time to refresh from OCS.`;
+  } else {
+    fg = '#d66464'; bg = 'rgba(214,100,100,.12)'; icon = '⚠';
+    msg = `Stale — imported ${d} (${age} days ago). Refresh from OCS recommended; suggestions below may be out of date.`;
+  }
+  const period = periodEnd ? ` Covers a trailing 30-day window ending ${String(periodEnd).slice(0,10)}.` : '';
+  return `<div style="padding:10px 14px; border-radius:6px; background:${bg}; border:1px solid ${fg}55; color:${fg}; font-size:12px; margin-bottom:14px;"><strong>${icon} Market Intelligence: </strong>${msg}${period}</div>`;
+}
+
 async function renderMarketIntel() {
   const main = document.getElementById("main");
   main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading market intelligence…</div>`;
@@ -5872,18 +5902,24 @@ async function renderMarketIntel() {
         </div>
       </div>
 
+      ${(() => {
+        const imps = (importsByStore[_miCurrentStore] || []).slice()
+          .sort((a, b) => String(b.imported_at || '').localeCompare(String(a.imported_at || '')));
+        return imps.length ? miFreshnessBanner(imps[0].imported_at, imps[0].period_end) : '';
+      })()}
+
       <div class="card" style="padding: 14px 16px; margin-bottom: 14px; font-size: 12px; line-height: 1.6;">
         <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; font-weight: 600;">About this data</div>
         <div style="color: var(--text-dim);">OCS provides per-store sales benchmarks vs. other stores in your municipality. Updated every ~48 hours on the OCS portal.</div>
 
         <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Recommended cadence</div>
-        <div style="color: var(--text-dim);">Import bi-weekly using a <strong style="color: var(--text);">trailing 30-day window</strong> in OCS. Balances signal stability with freshness — 30-day captures enough sales-days to make peer velocities meaningful, and bi-weekly imports overlap by ~16 days to smooth week-to-week noise. Stale warnings fire after 21 days.</div>
+        <div style="color: var(--text-dim);">Always pull a <strong style="color: var(--text);">trailing 30-day window</strong> (30 days captures enough sales-days to make peer velocities meaningful). Refresh it <strong style="color: var(--text);">as often as practical — weekly is ideal</strong>: the window is a rolling 30-day average, so a weekly re-pull keeps it current without changing the underlying signal. The banner turns amber after 14 days and red after 30.</div>
 
         <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Today's workflow (manual)</div>
         <div style="color: var(--text-dim);">Download both files for each store from the OCS portal. Drop into <code style="background: var(--bg-elev-2); padding: 1px 6px; border-radius: 3px;">imports/market_intelligence/{YYYY-MM-DD}/{StoreName}/</code> then click <strong style="color: var(--text);">Imports</strong> → Import all.</div>
 
         <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Automation status</div>
-        <div style="color: var(--text-dim);">OCS confirmed no API or scheduled email export available (May 2026). Manual import remains the permanent workflow.</div>
+        <div style="color: var(--text-dim);">Manual for now. The underlying data lives in an OCS <strong style="color: var(--text);">Power BI</strong> report behind a separate login (not the B2B portal the connector uses), so auto-pull isn't wired up. Feasibility of automating a Power BI export is being explored.</div>
 
         <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 11px;">
           ⚠ Top regional sellers ≠ guaranteed winners for your customers. Use as a hypothesis generator, not a directive. Adding SKUs commits real shelf space + capital.
