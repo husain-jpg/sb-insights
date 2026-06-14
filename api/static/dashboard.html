@@ -1081,19 +1081,26 @@ function renderSuggestedTable(items, locationId) {
       }
       return '';
     })();
+    const todayStr = new Date().toISOString().slice(0, 10);
     const added = it.status === 'added';
-    // Once actioned, the row greys out (it's handled). 'Added' keeps a green
-    // check so you can tell it apart from a dismissal; the real result of Add
-    // is the green trial-add row that appears in the reorder table below.
-    const rowStyle = added ? 'opacity: 0.5;' : '';
+    const dismissed = it.status === 'snoozed' && it.snoozed_until && it.snoozed_until > todayStr;
+    const handled = added || dismissed;        // greyed but kept in the list
+    const actionedOn = (it.status_updated || '').slice(0, 10);
+    // Once actioned the row greys out (it stays in the list). 'Added' keeps a
+    // green check; 'Dismissed' shows the date it was dismissed and when it
+    // returns. Both have Undo.
+    const rowStyle = handled ? 'opacity: 0.5;' : '';
     const actionCell = added
       ? `<span style="font-size: 10px; color: #6dab84; font-weight: 600;" title="Added to this week's order — appears as a green trial-add row in the table below and fills into the OCS template.">✓ Added</span>
+         <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="reset" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`
+      : dismissed
+      ? `<span style="font-size: 10px; color: var(--text-dim);" title="Dismissed${actionedOn ? ' on ' + actionedOn : ''} — returns to the list on ${it.snoozed_until} if still a gap.">Dismissed${actionedOn ? ' ' + actionedOn : ''}</span>
          <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="reset" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`
       : `<button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="added"
                  title="Add to this week's order — creates a green trial-add row in the reorder table and fills the OCS template at the suggested quantity."
                  style="font-size: 10px; color: #6dab84;">Add</button>
          <button class="btn-link sa-action-btn" data-sku="${escapeHtml(it.sku)}" data-action="snooze"
-                 title="Dismiss for now — hides it from this list, then it comes BACK after 90 days if it's still a gap (nothing is permanently deleted). Undo anytime." style="font-size: 10px; color: var(--text-dim);">Dismiss</button>`;
+                 title="Dismiss for now — greys it out (stays in the list), then it returns to active after 60 days if it's still a gap. Nothing is deleted; Undo anytime." style="font-size: 10px; color: var(--text-dim);">Dismiss</button>`;
     return `
       <tr data-sku="${escapeHtml(it.sku)}" style="${rowStyle}">
         <td style="font-variant-numeric: tabular-nums; color: var(--text-dim);">${idx + 1}</td>
@@ -1144,7 +1151,7 @@ function renderSuggestedTable(items, locationId) {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             location_id: locationId, action, author_name: author,
-            ...(action === 'snooze' ? { snooze_days: 90 } : {}),
+            ...(action === 'snooze' ? { snooze_days: 60 } : {}),
           }),
         });
         if (!res.ok) {
@@ -1161,8 +1168,9 @@ function renderSuggestedTable(items, locationId) {
           // Add also refreshes the reorder table so the green trial-add row
           // appears below. Each state shows a label + Undo.
           row.style.opacity = '0.5';
+          const todayStr = new Date().toISOString().slice(0, 10);
           const label = action === 'added' ? '<span style="color:#6dab84; font-weight:600;">✓ Added</span>'
-                      : '<span style="color:var(--text-dim);" title="Hidden for 90 days, then reappears if still a gap.">Dismissed</span>';
+                      : `<span style="color:var(--text-dim);" title="Returns to the list in 60 days if still a gap.">Dismissed ${todayStr}</span>`;
           row.querySelector('td:last-child').innerHTML =
             `${label} <button class="btn-link sa-undo-btn" data-sku="${escapeHtml(sku)}" style="font-size: 10px; color: var(--accent); margin-left: 6px;">Undo</button>`;
           row.querySelector('.sa-undo-btn').addEventListener('click', async () => {

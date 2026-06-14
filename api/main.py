@@ -5335,15 +5335,14 @@ def get_suggested_additions(
         params: list = [location_id, ninety_ago, location_id, location_id,
                         import_id, float(min_peer_velocity)]
 
-        if not include_snoozed:
-            # Hide dismissed entirely; hide snoozed unless snooze has expired
-            sql += """
-              AND (gs.status IS NULL
-                   OR gs.status = 'added'
-                   OR (gs.status = 'snoozed' AND gs.snoozed_until <= ?))
-            """
-            params.append(today_iso)
-
+        # Keep handled rows (added / dismissed-a.k.a.-snoozed) IN the list, shown
+        # greyed by the UI in their normal rank, rather than hiding them — so a
+        # manager can see and undo a decision. A dismissed row simply stops
+        # being greyed once its snooze window passes (active suggestion again).
+        # Ordering stays by peer popularity so a dismissed row keeps its place
+        # (sorting handled rows to the bottom would push them past LIMIT and
+        # effectively hide them, which is what we're avoiding).
+        sql += " AND (gs.status IS NULL OR gs.status IN ('added', 'snoozed'))"
         sql += " ORDER BY mi.municipality_units DESC LIMIT ?"
         params.append(min(200, max(1, int(limit))))
 
@@ -5434,7 +5433,7 @@ def update_gap_status(sku: str, payload: dict = Body(...)) -> dict:
 
         snoozed_until = None
         if action == "snooze":
-            days = int(payload.get("snooze_days") or 90)
+            days = int(payload.get("snooze_days") or 60)
             snoozed_until = (date.today() + timedelta(days=days)).isoformat()
 
         # Map action to status value
