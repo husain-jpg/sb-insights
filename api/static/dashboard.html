@@ -1048,7 +1048,7 @@ async function loadSuggestedAdditions(locationId) {
           These SKUs sell well at peer stores in your municipality but you don't carry them. Suggested quantities are conservative trial orders (1-2 cases). Once stocked, regular reorder takes over.
         </div>
         ${(typeof miFreshnessBanner === 'function' && _dataAgeDays(data.imported_at) != null && _dataAgeDays(data.imported_at) > 14)
-          ? `<div style="padding: 10px 16px 0;">${miFreshnessBanner(data.imported_at, data.period_end)}</div>` : ''}
+          ? `<div style="padding: 10px 16px 0;">${miFreshnessBanner(data.imported_at, data.period_end, data.period_days)}</div>` : ''}
         <div id="sa-table"></div>
       </div>
     </div>
@@ -5832,10 +5832,11 @@ function _dataAgeDays(importedAt) {
 }
 // Colored freshness banner for Market Intelligence (manual 30-day-window
 // reports). Green ≤14d, amber 15–30d, red >30d.
-function miFreshnessBanner(importedAt, periodEnd) {
+function miFreshnessBanner(importedAt, periodEnd, periodDays) {
   const age = _dataAgeDays(importedAt);
   if (age == null) return '';
   const d = String(importedAt).slice(0, 10);
+  const win = periodDays ? `${periodDays}-day` : 'trailing 30-day';
   let fg, bg, icon, msg;
   if (age <= 14) {
     fg = '#6dab84'; bg = 'rgba(80,160,100,.10)'; icon = '✓';
@@ -5847,7 +5848,7 @@ function miFreshnessBanner(importedAt, periodEnd) {
     fg = '#d66464'; bg = 'rgba(214,100,100,.12)'; icon = '⚠';
     msg = `Stale — imported ${d} (${age} days ago). Refresh from OCS recommended; suggestions below may be out of date.`;
   }
-  const period = periodEnd ? ` Covers a trailing 30-day window ending ${String(periodEnd).slice(0,10)}.` : '';
+  const period = periodEnd ? ` Covers a ${win} window ending ${String(periodEnd).slice(0,10)}.` : '';
   return `<div style="padding:10px 14px; border-radius:6px; background:${bg}; border:1px solid ${fg}55; color:${fg}; font-size:12px; margin-bottom:14px;"><strong>${icon} Market Intelligence: </strong>${msg}${period}</div>`;
 }
 
@@ -5905,7 +5906,7 @@ async function renderMarketIntel() {
       ${(() => {
         const imps = (importsByStore[_miCurrentStore] || []).slice()
           .sort((a, b) => String(b.imported_at || '').localeCompare(String(a.imported_at || '')));
-        return imps.length ? miFreshnessBanner(imps[0].imported_at, imps[0].period_end) : '';
+        return imps.length ? miFreshnessBanner(imps[0].imported_at, imps[0].period_end, imps[0].period_days) : '';
       })()}
 
       <div class="card" style="padding: 14px 16px; margin-bottom: 14px; font-size: 12px; line-height: 1.6;">
@@ -6131,6 +6132,15 @@ async function loadMiImportsView() {
           <label style="font-size: 11px; color: var(--text-dim);">Report end date<br>
             <input type="date" id="mi-up-date" value="${todayIso}" max="${todayIso}" style="margin-top: 4px;">
           </label>
+          <label style="font-size: 11px; color: var(--text-dim);" title="The window you selected in OCS when exporting. Metadata only — keep it consistent across stores (30 days recommended).">Window<br>
+            <select id="mi-up-window" style="margin-top: 4px;">
+              <option value="7">7 days</option>
+              <option value="14">14 days</option>
+              <option value="30" selected>30 days</option>
+              <option value="60">60 days</option>
+              <option value="90">90 days</option>
+            </select>
+          </label>
           <label style="font-size: 11px; color: var(--text-dim);">Files (both: Average Sales Units + Sales Velocity)<br>
             <input type="file" id="mi-up-files" accept=".xlsx,.xls" multiple style="margin-top: 4px;">
           </label>
@@ -6206,6 +6216,7 @@ async function loadMiImportsView() {
       const fd = new FormData();
       fd.append("location_id", store);
       fd.append("date", date);
+      fd.append("window_days", document.getElementById("mi-up-window").value);
       for (const f of files) fd.append("files", f);
       upBtn.disabled = true; upBtn.textContent = "Uploading…";
       status.style.color = "var(--text-dim)"; status.textContent = "Uploading + importing…";

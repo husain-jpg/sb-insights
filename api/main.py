@@ -4940,6 +4940,7 @@ def list_market_intelligence_folders() -> dict:
 async def upload_market_intelligence(
     location_id: str = Form(...),
     date: str = Form(...),
+    window_days: int = Form(30),
     files: list[UploadFile] = File(...),
     request: Request = None,
 ) -> dict:
@@ -4985,11 +4986,22 @@ async def upload_market_intelligence(
     if not saved:
         raise HTTPException(status_code=400, detail="no valid Excel files in upload")
 
+    # The OCS file doesn't carry its date range, so we record it from the
+    # window the user pulled: period_start = end − (window − 1). This is
+    # display metadata only — the units/velocity are pre-computed in the file.
+    try:
+        wd = max(1, int(window_days or 30))
+    except (TypeError, ValueError):
+        wd = 30
+    from datetime import date as _date  # the 'date' param shadows the class
+    period_start = (_date.fromisoformat(date_str) - timedelta(days=wd - 1)).isoformat()
+
     from jobs.import_market_intelligence import import_market_intelligence
     try:
         with db() as conn:
             result = import_market_intelligence(
-                conn, folder, location_id=location_id, period_end=date_str)
+                conn, folder, location_id=location_id,
+                period_start=period_start, period_end=date_str)
     except Exception as e:
         # Most likely the two expected reports weren't both present / recognized.
         raise HTTPException(
