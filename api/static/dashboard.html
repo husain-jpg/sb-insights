@@ -6106,14 +6106,39 @@ async function loadMiImportsView() {
   const container = document.getElementById("mi-content");
   container.innerHTML = `<div class="loading"><span class="spinner"></span> Loading imports…</div>`;
   try {
-    const [imports, folders] = await Promise.all([
+    const [imports, folders, locsRaw] = await Promise.all([
       api("/api/market-intelligence/imports"),
       api("/api/market-intelligence/folders"),
+      api("/api/locations").catch(() => []),
     ]);
+    const locs = Array.isArray(locsRaw) ? locsRaw : (locsRaw.locations || []);
 
     const pendingFolders = folders.folders.filter(f => f.file_count > 0);
+    const todayIso = new Date().toISOString().slice(0, 10);
 
     container.innerHTML = `
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="padding: 14px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);">
+          <strong>⬆ Upload reports from your computer</strong>
+          <span style="font-size: 11px; color: var(--text-dim); margin-left: 8px;">No server access needed — export the two files from OCS Power BI and drop them here.</span>
+        </div>
+        <div style="padding: 14px; display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end;">
+          <label style="font-size: 11px; color: var(--text-dim);">Store<br>
+            <select id="mi-up-store" style="margin-top: 4px;">
+              ${locs.map(l => `<option value="${l.id}">${escapeHtml(l.short_name || l.name)}</option>`).join('')}
+            </select>
+          </label>
+          <label style="font-size: 11px; color: var(--text-dim);">Report end date<br>
+            <input type="date" id="mi-up-date" value="${todayIso}" max="${todayIso}" style="margin-top: 4px;">
+          </label>
+          <label style="font-size: 11px; color: var(--text-dim);">Files (both: Average Sales Units + Sales Velocity)<br>
+            <input type="file" id="mi-up-files" accept=".xlsx,.xls" multiple style="margin-top: 4px;">
+          </label>
+          <button class="btn btn-primary" id="mi-up-btn" style="font-size: 11px;">Upload &amp; Import</button>
+          <span id="mi-up-status" style="font-size: 11px; color: var(--text-dim);"></span>
+        </div>
+      </div>
+
       <div class="card" style="margin-bottom: 16px;">
         <div style="padding: 14px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2); display: flex; justify-content: space-between; align-items: center;">
           <div>
@@ -6169,6 +6194,33 @@ async function loadMiImportsView() {
         `}
       </div>
     `;
+
+    const upBtn = document.getElementById("mi-up-btn");
+    if (upBtn) upBtn.addEventListener("click", async () => {
+      const store = document.getElementById("mi-up-store").value;
+      const date = document.getElementById("mi-up-date").value;
+      const files = document.getElementById("mi-up-files").files;
+      const status = document.getElementById("mi-up-status");
+      if (!date) { status.textContent = "Pick a report end date."; status.style.color = "#d66464"; return; }
+      if (!files || files.length < 2) { status.textContent = "Select BOTH files (Average Sales Units + Sales Velocity)."; status.style.color = "#d66464"; return; }
+      const fd = new FormData();
+      fd.append("location_id", store);
+      fd.append("date", date);
+      for (const f of files) fd.append("files", f);
+      upBtn.disabled = true; upBtn.textContent = "Uploading…";
+      status.style.color = "var(--text-dim)"; status.textContent = "Uploading + importing…";
+      try {
+        const res = await fetch(`${API}/api/market-intelligence/upload`, { method: "POST", body: fd, credentials: "include" });
+        const result = await res.json().catch(() => ({}));
+        if (!res.ok) { status.style.color = "#d66464"; status.textContent = "Failed: " + (result.detail || "unknown"); upBtn.disabled = false; upBtn.textContent = "Upload & Import"; return; }
+        status.style.color = "#6dab84";
+        status.textContent = `✓ Imported ${result.sku_count} SKUs for ${result.store} (${result.has_municipality ? 'with' : 'no'} municipality data).`;
+        await loadMiImportsView();
+      } catch (e) {
+        status.style.color = "#d66464"; status.textContent = "Failed: " + e.message;
+        upBtn.disabled = false; upBtn.textContent = "Upload & Import";
+      }
+    });
 
     document.querySelectorAll(".mi-import-btn").forEach(btn => {
       btn.addEventListener("click", async () => {

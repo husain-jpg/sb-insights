@@ -4936,6 +4936,70 @@ def list_market_intelligence_folders() -> dict:
     return {"folders": folders}
 
 
+@app.post("/api/market-intelligence/upload")
+async def upload_market_intelligence(
+    location_id: str = Form(...),
+    date: str = Form(...),
+    files: list[UploadFile] = File(...),
+    request: Request = None,
+) -> dict:
+    """Upload the two OCS municipality Excel files for a store + date straight
+    from the browser (no server file access needed), save them under
+    imports/market_intelligence/{date}/{store}/, and import immediately.
+
+    Keep OCS's original filenames so the importer's pattern detection
+    (Average Sales Units / Sales Velocity) still recognizes them.
+    """
+    require_user(request)
+    import re as _re
+    date_str = (date or "").strip()
+    if not _re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    if not files:
+        raise HTTPException(status_code=400, detail="no files uploaded")
+
+    with db() as conn:
+        row = conn.execute("SELECT name FROM locations WHERE id = ?", (location_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail=f"unknown store '{location_id}'")
+    # Folder named by the store so the Imports list reads nicely; the importer
+    # is still handed location_id explicitly so resolution can't go wrong.
+    safe_store = _re.sub(r"[^A-Za-z0-9 _().-]", "_", row[0]).strip() or location_id
+    _ensure_market_intel_dir()
+    folder = MARKET_INTEL_DIR / date_str / safe_store
+    folder.mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    for uf in files:
+        name = os.path.basename(uf.filename or "").strip()
+        if not name:
+            continue
+        if not name.lower().endswith((".xlsx", ".xls")):
+            raise HTTPException(status_code=400,
+                                detail=f"'{name}' is not an Excel file (.xlsx/.xls)")
+        name = _re.sub(r"[^A-Za-z0-9 _().\-]", "_", name)
+        content = await uf.read()
+        with open(folder / name, "wb") as fh:
+            fh.write(content)
+        saved.append(name)
+    if not saved:
+        raise HTTPException(status_code=400, detail="no valid Excel files in upload")
+
+    from jobs.import_market_intelligence import import_market_intelligence
+    try:
+        with db() as conn:
+            result = import_market_intelligence(
+                conn, folder, location_id=location_id, period_end=date_str)
+    except Exception as e:
+        # Most likely the two expected reports weren't both present / recognized.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Saved {len(saved)} file(s) but import failed: {e}. "
+                   f"Make sure you upload BOTH the 'Average Sales Units' and "
+                   f"'Sales Velocity' reports with their original OCS filenames.")
+    return {"ok": True, "saved": saved, "store": row[0], "date": date_str, **result}
+
+
 @app.post("/api/market-intelligence/import")
 def trigger_market_intelligence_import(payload: dict = Body(...)) -> dict:
     """Import a specific folder. Payload:
