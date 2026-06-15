@@ -1624,11 +1624,18 @@ async function renderReorder() {
           return `<input type="checkbox" class="exclude-cb" data-sku="${r.sku}" data-loc="${r.location_id}" data-review="${r.needs_review ? '1' : '0'}" ${isExcluded ? '' : 'checked'} title="${tip}">`;
         } },
       { key: 'urgency', label: 'Status',
-        sortValue: r => ({ trial_add: -1, stockout: 0, critical: 1, high: 2, medium: 3,
+        sortValue: r => r.is_pinned ? -2 : ({ trial_add: -1, stockout: 0, critical: 1, high: 2, medium: 3,
                            ok: 4, overstock: 5, dead_stock: 6 }[r.urgency] ?? 9),
-        render: r => r.is_trial_add
-          ? `<span class="tag" style="background: rgba(80,160,100,.18); color: #6fcf85; border-color: rgba(90,200,110,.45);" title="Trial add from Suggested Additions — peer-popular SKU you don't carry yet. Ordering a small trial quantity; once it sells, the engine takes over.">＋ trial add</span>`
-          : `<span class="tag ${urgencyTagClass(r.urgency)}">${r.urgency}</span>` },
+        render: r => {
+          if (r.is_pinned) {
+            const left = r.pin_days_left != null ? `${r.pin_days_left}d left` : '';
+            return `<span class="tag" style="background: rgba(200,155,50,.18); color: #d6b446; border-color: rgba(220,190,80,.5);" title="Manually pinned from the OCS Catalogue on ${r.pinned_at || '?'}. Auto-removes after 7 days (assumed ordered).">📌 pinned</span>
+              <div class="sku">${r.pinned_at || ''}${left ? ' · ' + left : ''} · <a href="#" class="pin-unpin" data-variant="${escapeHtml(r.ocs_variant || '')}" style="color: var(--accent);">unpin</a></div>`;
+          }
+          return r.is_trial_add
+            ? `<span class="tag" style="background: rgba(80,160,100,.18); color: #6fcf85; border-color: rgba(90,200,110,.45);" title="Trial add from Suggested Additions — peer-popular SKU you don't carry yet. Ordering a small trial quantity; once it sells, the engine takes over.">＋ trial add</span>`
+            : `<span class="tag ${urgencyTagClass(r.urgency)}">${r.urgency}</span>`;
+        } },
       { key: 'product_name', label: 'Product',
         render: r => {
           // Name on line 1 (just a slim ★ for Heroes); everything else lives
@@ -1834,7 +1841,8 @@ async function renderReorder() {
         defaultSort: 'urgency',
         rowAttrs: r => isRowExcluded(r)
           ? 'style="opacity: 0.5;" title="Excluded from this week\'s order"'
-          : (r.is_trial_add ? 'style="background: rgba(80,160,100,.08);"' : ''),
+          : (r.is_pinned ? 'style="background: rgba(200,155,50,.09);"'
+            : (r.is_trial_add ? 'style="background: rgba(80,160,100,.08);"' : '')),
       });
       const anchorCount = filtered.filter(r => r.is_top_sku).length;
       const dataFeeCount = filtered.filter(r => r.data_fee_pct || r.data_fee_is_direct).length;
@@ -1906,6 +1914,19 @@ async function renderReorder() {
     // Include/Exclude checkbox click (event delegation — handles dynamic rows)
     // Inverted logic: checked = include (default), unchecked = exclude.
     // Internally we still maintain the excludedSkus set as the source of truth.
+    // Unpin a manually-pinned SKU (Add to Reorder) from the status cell.
+    document.getElementById("reorder-table").addEventListener("click", async (e) => {
+      const a = e.target.closest(".pin-unpin");
+      if (!a) return;
+      e.preventDefault();
+      const variant = a.dataset.variant;
+      try {
+        await fetch(`${API}/api/reorder/pin?ocs_variant=${encodeURIComponent(variant)}`, {
+          method: "DELETE", credentials: "include" });
+        refetch();
+      } catch (err) { alert("Unpin failed: " + err.message); }
+    });
+
     document.getElementById("reorder-table").addEventListener("change", (e) => {
       const cb = e.target;
       if (!cb.classList.contains("exclude-cb")) return;
@@ -5303,6 +5324,8 @@ async function loadOcsDetail(sku) {
         <div style="font-size: 11px; color: var(--text-faint); margin-top: 4px;">
           Cova SKU: ${p.sku || '—'} &nbsp;·&nbsp; OCS: ${p.ocs_variant_number || '—'}
         </div>
+        ${p.ocs_variant_number ? `<button id="ocs-add-reorder" class="btn btn-primary" data-variant="${escapeHtml(p.ocs_variant_number)}" style="margin-top: 10px; font-size: 11px;" title="Pin this SKU to the top of the Reorder Report for 7 days (then it auto-removes, assuming it's been ordered).">📌 Add to Reorder</button>
+        <span id="ocs-add-reorder-status" style="font-size: 11px; color: var(--text-dim); margin-left: 8px;"></span>` : ''}
       </div>
 
       <div style="background: var(--bg-elev-2); padding: 12px; border-radius: 6px; margin-bottom: 16px;">
@@ -5388,6 +5411,27 @@ async function loadOcsDetail(sku) {
         });
         await loadOcsDetail(target);
       } catch (e) { alert("Failed to save: " + e.message); }
+    });
+
+    const addReorderBtn = document.getElementById("ocs-add-reorder");
+    if (addReorderBtn) addReorderBtn.addEventListener("click", async () => {
+      const status = document.getElementById("ocs-add-reorder-status");
+      addReorderBtn.disabled = true;
+      try {
+        const res = await fetch(`${API}/api/reorder/pin`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+          body: JSON.stringify({ ocs_variant: addReorderBtn.dataset.variant, days: 7 }),
+        });
+        const r = await res.json().catch(() => ({}));
+        if (res.ok) {
+          status.style.color = "#6dab84";
+          status.textContent = "✓ Pinned to the Reorder Report for 7 days.";
+          addReorderBtn.textContent = "📌 Added to Reorder";
+        } else {
+          status.style.color = "#d66464"; status.textContent = "Failed: " + (r.detail || "unknown");
+          addReorderBtn.disabled = false;
+        }
+      } catch (e) { status.style.color = "#d66464"; status.textContent = "Failed: " + e.message; addReorderBtn.disabled = false; }
     });
 
     document.getElementById("add-comment").addEventListener("click", async () => {

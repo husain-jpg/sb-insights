@@ -1234,6 +1234,9 @@ def get_reorder(
         gap_deal_map = (get_active_deals_for_skus(conn, {g["ocs_variant"] for g in added_gap})
                         if added_gap else {})
 
+        # Manual "Add to Reorder" pins (from the OCS Catalogue) — top of report.
+        pin_rows = _build_pin_rows(conn, store, recs, tl, gap_deal_map) if store else []
+
         # Resolve the effective engine knobs for the settings echo, so the UI
         # reports the values the engine actually ran with (settings or override).
         eng = load_engine_settings(conn)
@@ -1410,7 +1413,15 @@ def get_reorder(
             "sale_flag": None, "sale_flag_detail": None,
             "order_fill_flow_thru": None,
         })
-    actionable = trial_rows + actionable
+    # Manual pins ride at the very top. Drop any normal/trial row for the same
+    # variant so a pinned SKU shows once (as the pin), then prepend the pins.
+    if pin_rows:
+        pinned_variants = {p["ocs_variant"].lower() for p in pin_rows if p.get("ocs_variant")}
+        actionable = [p for p in actionable
+                      if (p.get("ocs_variant") or "").lower() not in pinned_variants]
+        trial_rows = [t for t in trial_rows
+                      if (t.get("ocs_variant") or "").lower() not in pinned_variants]
+    actionable = pin_rows + trial_rows + actionable
 
     # Assemble header KPIs: inventory-derived metrics + this week's reorder
     # totals + active stockout count (selling SKUs at 0 on-hand).
@@ -4068,10 +4079,17 @@ def export_ocs_template(store: str | None = None):
                 detail=f"Order Fill file for {store} is no longer on disk ({source_file}); "
                        f"re-run the OCS Connector to refresh it.")
         try:
-            # Include trial additions the manager 'Added' from Suggested
-            # Additions so they land in the OCS order too.
+            # Include trial additions ('Added' from Suggested Additions) and
+            # manual pins ('Add to Reorder' from the OCS Catalogue) so they
+            # land in the OCS order too. Pins not otherwise ordered get 1 case.
             extra = {g["ocs_variant"]: g["trial_units"]
                      for g in _added_gap_rows(conn, store)}
+            for variant in _active_pins(conn, store):
+                if variant not in extra:
+                    pk = conn.execute(
+                        "SELECT pack_size FROM ocs_catalog WHERE LOWER(ocs_variant_number)=?",
+                        (variant,)).fetchone()
+                    extra[variant] = int(pk[0]) if pk and pk[0] else 1
             _lines, filled_df, _summary = fill_template(
                 conn, path, location_id=store, extra_order_units=extra)
         except ValueError as e:
@@ -5339,6 +5357,137 @@ def _added_gap_rows(conn, location_id: str) -> list[dict]:
             "trial_units": units, "trial_cases": cases,
         })
     return rows
+
+
+def _ensure_reorder_pins(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reorder_pins (
+            ocs_variant TEXT NOT NULL, location_id TEXT,
+            added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, added_by TEXT,
+            expires_at TEXT NOT NULL, note TEXT,
+            PRIMARY KEY (ocs_variant, location_id))""")
+
+
+def _active_pins(conn, store: str | None) -> dict:
+    """Active (non-expired) reorder pins applicable to this store — chain-wide
+    (location_id NULL) plus any store-specific ones. Returns
+    {ocs_variant_lower: {added_at, expires_at, days_left}}."""
+    _ensure_reorder_pins(conn)
+    now = datetime.utcnow()
+    rows = conn.execute(
+        """SELECT ocs_variant, added_at, expires_at FROM reorder_pins
+           WHERE expires_at > ? AND (location_id IS NULL OR location_id = ?)""",
+        (now.strftime("%Y-%m-%d %H:%M:%S"), store or "__none__")).fetchall()
+    out = {}
+    for variant, added_at, expires_at in rows:
+        try:
+            exp = datetime.strptime(expires_at[:19], "%Y-%m-%d %H:%M:%S")
+            days_left = max(0, (exp - now).days + (1 if (exp - now).seconds else 0))
+        except Exception:
+            days_left = None
+        out[(variant or "").lower()] = {
+            "added_at": added_at, "expires_at": expires_at, "days_left": days_left}
+    return out
+
+
+def _build_pin_rows(conn, store: str | None, recs, tl: str, gap_deal_map: dict) -> list[dict]:
+    """Build Reorder-Report rows for manually-pinned SKUs (Add to Reorder from
+    the OCS Catalogue). Carried SKUs reuse the engine's own numbers; SKUs the
+    store doesn't carry get a 1-case starter. Marked is_pinned + pinned_at +
+    pin_days_left, and pinned to the very top of the report."""
+    pins = _active_pins(conn, store)
+    if not pins:
+        return []
+    from jobs.data_revenue_resolver import get_active_deals_for_skus
+    rec_by_variant = {(r.ocs_variant or "").lower(): r for r in recs if r.ocs_variant}
+    deal_map = get_active_deals_for_skus(conn, {v for v in pins}) if pins else {}
+    rows = []
+    for variant, meta in pins.items():
+        cat = conn.execute(
+            """SELECT product_name, brand, category, pack_size, unit_price, stock_status
+               FROM ocs_catalog WHERE LOWER(ocs_variant_number) = ?""", (variant,)).fetchone()
+        rec = rec_by_variant.get(variant)
+        if rec:
+            sku = rec.sku; name = rec.product_name; category = rec.category
+            brand = rec.brand; on_hand = rec.on_hand; vel = rec.daily_velocity
+            days_supply = rec.days_supply; qty = rec.reorder_qty; cases = rec.reorder_cases
+            pack = rec.ocs_pack_size; price = rec.ocs_unit_price; stock = rec.ocs_stock_status
+        elif cat:
+            pname, pbrand, pcat, ppack, pprice, pstock = cat
+            sku = variant; name = pname or variant; category = pcat; brand = pbrand
+            on_hand = 0; vel = 0.0; days_supply = None
+            ppack = int(ppack) if ppack else 1
+            cases = 1; qty = ppack  # 1-case starter for an un-carried pin
+            pack = ppack; price = float(pprice) if pprice else None; stock = pstock
+        else:
+            continue  # variant not in catalog — can't display
+        deal = deal_map.get(variant)
+        est = round(price, 2) if price else None
+        rows.append({
+            "sku": sku, "product_name": name, "category": category,
+            "category_path": None, "top_level": tl, "brand": brand,
+            "location_id": store, "on_hand": int(on_hand or 0),
+            "daily_velocity": round(vel or 0, 2),
+            "days_supply": days_supply,
+            "reorder_qty": int(qty or 0), "reorder_cases": cases,
+            "urgency": "pinned", "revenue_30d": 0.0,
+            "ocs_variant": variant, "ocs_pack_size": pack,
+            "ocs_unit_price": est, "ocs_stock_status": stock,
+            "wholesale_cost_est": est,
+            "line_total": round((est or 0) * int(qty or 0), 2),
+            "mix_multiplier": 1.0, "is_top_sku": False, "needs_review": False,
+            "is_trial_add": False, "is_pinned": True,
+            "pinned_at": (meta["added_at"] or "")[:10], "pin_days_left": meta["days_left"],
+            "data_fee_pct": round(deal["percentage"], 2) if deal else None,
+            "data_fee_partner": deal["partner"] if deal else None,
+            "data_fee_basis": deal["basis"] if deal else None,
+            "data_fee_is_direct": bool(deal and deal["is_direct"]),
+            "avg_rating": None, "rating_count": 0, "comment_count": 0,
+            "sale_flag": None, "sale_flag_detail": None, "order_fill_flow_thru": None,
+        })
+    return rows
+
+
+@app.post("/api/reorder/pin")
+def add_reorder_pin(payload: dict = Body(...), request: Request = None) -> dict:
+    """Pin a SKU to the top of the Reorder Report (Add to Reorder from the OCS
+    Catalogue). Auto-expires after `days` (default 7) — by then it's ordered."""
+    user = require_user(request)
+    variant = (payload.get("ocs_variant") or payload.get("sku") or "").strip()
+    if not variant:
+        raise HTTPException(status_code=400, detail="ocs_variant required")
+    store = (payload.get("location_id") or "").strip() or None
+    try:
+        days = max(1, min(60, int(payload.get("days") or 7)))
+    except (TypeError, ValueError):
+        days = 7
+    now = datetime.utcnow()
+    added = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires = (now + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        _ensure_reorder_pins(conn)
+        conn.execute("""DELETE FROM reorder_pins WHERE ocs_variant = ?
+                        AND IFNULL(location_id,'') = IFNULL(?,'')""", (variant, store))
+        conn.execute("""INSERT INTO reorder_pins
+                        (ocs_variant, location_id, added_at, added_by, expires_at)
+                        VALUES (?, ?, ?, ?, ?)""",
+                     (variant, store, added, user.get("email"), expires))
+        conn.commit()
+    return {"ok": True, "ocs_variant": variant, "expires_at": expires, "days": days}
+
+
+@app.delete("/api/reorder/pin")
+def remove_reorder_pin(ocs_variant: str, location_id: str | None = None,
+                       request: Request = None) -> dict:
+    """Remove a reorder pin (manual unpin before it expires)."""
+    require_user(request)
+    with db() as conn:
+        _ensure_reorder_pins(conn)
+        conn.execute("""DELETE FROM reorder_pins WHERE ocs_variant = ?
+                        AND IFNULL(location_id,'') = IFNULL(?,'')""",
+                     (ocs_variant, location_id))
+        conn.commit()
+    return {"ok": True}
 
 
 @app.get("/api/reorder/suggested-additions")

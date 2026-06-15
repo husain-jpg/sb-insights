@@ -406,6 +406,20 @@ CREATE TABLE IF NOT EXISTS gap_suggestions_status (
 );
 CREATE INDEX IF NOT EXISTS ix_gap_status_snooze ON gap_suggestions_status (location_id, status, snoozed_until);
 
+-- Manual "Add to Reorder" pins from the OCS Catalogue. A pinned SKU rides at
+-- the top of the Reorder Report until it auto-expires (default 7 days — by
+-- then it's been ordered). Chain-wide when location_id IS NULL.
+CREATE TABLE IF NOT EXISTS reorder_pins (
+    ocs_variant   TEXT NOT NULL,
+    location_id   TEXT,                              -- NULL = all stores
+    added_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    added_by      TEXT,
+    expires_at    TEXT NOT NULL,                     -- ISO datetime; row drops off after this
+    note          TEXT,
+    PRIMARY KEY (ocs_variant, location_id)
+);
+CREATE INDEX IF NOT EXISTS ix_reorder_pins_exp ON reorder_pins (expires_at);
+
 -- ============================================================================
 -- Authentication & user management
 -- ============================================================================
