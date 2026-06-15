@@ -2477,12 +2477,12 @@ async function renderInventory() {
     ]);
 
     main.innerHTML = `
-      <div class="section-header">
+      <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
         <div>
           <div class="kicker">Full Inventory</div>
           <h2 style="white-space: nowrap;">Inventory on Hand</h2>
         </div>
-        <div class="controls-row">
+        <div class="controls-row" style="flex-wrap: wrap;">
           <input type="search" id="inv-search" placeholder="Search product or SKU...">
           <select id="inv-type-filter">
             <option value="">All types</option>
@@ -2524,9 +2524,11 @@ async function renderInventory() {
         render: r => r.brand || '—' },
       { key: 'location_id', label: 'Store', render: r => storeLabel(r.location_id) },
       { key: 'on_hand', label: 'On hand', type: 'number', align: 'right' },
-      { key: 'daily_velocity', label: 'Units/day', type: 'number', align: 'right',
+      { key: 'daily_velocity', label: 'Units Sold/Day (30 days)', type: 'number', align: 'right',
+        tooltip: 'Average units sold per day over the trailing 30 days.',
         render: r => (r.daily_velocity || 0).toFixed(2) },
-      { key: 'days_supply', label: 'Days supply', type: 'number', align: 'right',
+      { key: 'days_supply', label: 'Est. Days Supply', type: 'number', align: 'right',
+        tooltip: 'On-hand units ÷ 30-day daily velocity. "—" = no recent sales.',
         render: r => r.days_supply == null ? '—' : Math.round(r.days_supply) },
       { key: 'regular_price', label: 'Price', type: 'number', align: 'right',
         render: r => r.regular_price ? fmt$2(r.regular_price) : '—' },
@@ -2536,7 +2538,8 @@ async function renderInventory() {
           const flag = r.cost_source === 'estimated' ? ' <span class="sku" title="Estimated: 60% of retail (no OCS match)">~</span>' : '';
           return `${fmt$2(r.unit_cost)}${flag}`;
         } },
-      { key: 'total_cost', label: 'Total cost', type: 'number', align: 'right',
+      { key: 'total_cost', label: 'Total Cost on Hand', type: 'number', align: 'right',
+        tooltip: 'On-hand units × cost per unit for this SKU at this store.',
         render: r => r.total_cost ? fmt$2(r.total_cost) : '—' },
       { key: 'retail_value', label: 'Retail value', type: 'number', align: 'right',
         render: r => fmt$2(r.retail_value) },
@@ -2551,14 +2554,21 @@ async function renderInventory() {
         render: r => r.days_since_last_sold == null ? '—' : r.days_since_last_sold },
     ];
 
-    // Populate category dropdown
-    const categories = [...new Set(data.items.map(i => i.category).filter(Boolean))].sort();
-    const catFilter = document.getElementById("inv-category-filter");
-    categories.forEach(c => {
-      const opt = document.createElement('option');
-      opt.value = c; opt.textContent = c;
-      catFilter.appendChild(opt);
-    });
+    // Populate the category dropdown, scoped to the selected Type so that
+    // picking "Cannabis" only offers cannabis categories (and vice versa).
+    // Preserves the current selection if it's still valid for the new type.
+    function populateCategories() {
+      const type = document.getElementById("inv-type-filter").value;
+      const catFilter = document.getElementById("inv-category-filter");
+      const prev = catFilter.value;
+      const cats = [...new Set(data.items
+        .filter(i => !type || i.top_level === type)
+        .map(i => i.category).filter(Boolean))].sort();
+      catFilter.innerHTML = '<option value="">All categories</option>' +
+        cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+      catFilter.value = cats.includes(prev) ? prev : '';
+    }
+    populateCategories();
 
     function applyFilters() {
       const q = document.getElementById("inv-search").value.trim().toLowerCase();
@@ -2585,13 +2595,18 @@ async function renderInventory() {
       document.getElementById("inv-summary").innerHTML = `
         <div>SKUs shown<strong>${filtered.length}</strong></div>
         <div>Total units<strong>${fmtN(totalUnits)}</strong></div>
-        <div>Total cost<strong>${fmt$(totalCost)}</strong></div>
+        <div>Total cost on hand<strong>${fmt$(totalCost)}</strong></div>
         <div>Retail value<strong>${fmt$(totalRetail)}</strong></div>
         <div title="Implied margin = (Retail value − Total cost) ÷ Retail value. THEORETICAL margin if all on-hand units sold at full regular retail price. Does not reflect actual realized margin (which depends on discounts and actual sale prices). Cost uses OCS catalog wholesale price; will switch to Cova average cost once that column is wired in.">Implied margin<strong>${marginPct.toFixed(1)}%</strong></div>
       `;
     }
 
-    ["inv-search", "inv-type-filter", "inv-category-filter", "inv-store-filter", "inv-stock-filter"].forEach(id => {
+    // Type change re-scopes the category dropdown first, then re-filters.
+    document.getElementById("inv-type-filter").addEventListener("change", () => {
+      populateCategories();
+      applyFilters();
+    });
+    ["inv-search", "inv-category-filter", "inv-store-filter", "inv-stock-filter"].forEach(id => {
       document.getElementById(id).addEventListener(id.includes("search") ? "input" : "change", applyFilters);
     });
     applyFilters();
