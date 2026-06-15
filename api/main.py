@@ -4491,11 +4491,15 @@ def get_ocs_catalogue(
                 if not variant:
                     continue
                 agg = of_by_variant.setdefault(variant, {
-                    "flow_thru": False, "back_in_stock": False,
-                    "available_quantity": 0, "stores_seen": 0,
+                    "flow_thru": False, "back_in_stock": False, "new_arrival": False,
+                    "delivery_tier": None, "available_quantity": 0, "stores_seen": 0,
                 })
                 if info.get("flow_thru"):     agg["flow_thru"] = True
                 if info.get("back_in_stock"): agg["back_in_stock"] = True
+                if info.get("new_arrival"):   agg["new_arrival"] = True
+                # First delivery tier seen among flow-through stores.
+                if info.get("flow_thru") and info.get("delivery_tier") and not agg["delivery_tier"]:
+                    agg["delivery_tier"] = info["delivery_tier"]
                 aq = info.get("available_quantity") or 0
                 if aq > agg["available_quantity"]:
                     agg["available_quantity"] = aq
@@ -4504,17 +4508,23 @@ def get_ocs_catalogue(
                 v = (it.get("ocs_variant_number") or "").lower()
                 agg = of_by_variant.get(v)
                 if agg:
-                    it["order_fill_flow_thru"]     = bool(agg["flow_thru"])
-                    it["order_fill_back_in_stock"] = bool(agg["back_in_stock"])
-                    it["order_fill_avail_qty"]     = int(agg["available_quantity"])
+                    it["order_fill_flow_thru"]      = bool(agg["flow_thru"])
+                    it["order_fill_back_in_stock"]  = bool(agg["back_in_stock"])
+                    it["order_fill_new_arrival"]    = bool(agg["new_arrival"])
+                    it["order_fill_delivery_tier"]  = agg["delivery_tier"]
+                    it["order_fill_avail_qty"]      = int(agg["available_quantity"])
                 else:
-                    it["order_fill_flow_thru"]     = None
-                    it["order_fill_back_in_stock"] = False
-                    it["order_fill_avail_qty"]     = 0
+                    it["order_fill_flow_thru"]      = None
+                    it["order_fill_back_in_stock"]  = False
+                    it["order_fill_new_arrival"]    = False
+                    it["order_fill_delivery_tier"]  = None
+                    it["order_fill_avail_qty"]      = 0
         except Exception:
             for it in items:
                 it.setdefault("order_fill_flow_thru", None)
                 it.setdefault("order_fill_back_in_stock", False)
+                it.setdefault("order_fill_new_arrival", False)
+                it.setdefault("order_fill_delivery_tier", None)
                 it.setdefault("order_fill_avail_qty", 0)
 
         # Attach data revenue / rebate info via the resolver so the OCS
