@@ -69,9 +69,37 @@ def _ctx(headless: bool):
     pw = sync_playwright().start()
     ctx = pw.chromium.launch_persistent_context(
         PROFILE_DIR, headless=headless, accept_downloads=True,
+        viewport={"width": 1600, "height": 1000},
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"),
         args=["--disable-blink-features=AutomationControlled"],
     )
     return pw, ctx
+
+
+def _wait_logged_in(page, timeout: int = 120) -> bool:
+    """Wait for the report to actually render. Returns True once report visuals
+    appear, False if we land on a real password/email login form. Tolerates the
+    brief Microsoft silent-auth redirect (which is NOT a real logout)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # A genuine login form means the session is dead.
+        try:
+            if page.locator("input[type=password], input[name=loginfmt]").count() > 0 \
+               and page.locator("input[type=password], input[name=loginfmt]").first.is_visible():
+                return False
+        except Exception:
+            pass
+        # Report rendered = logged in.
+        try:
+            if page.locator("visual-container-modern, visual-container, .visualContainer").count() > 0:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    # Timed out — assume not loaded.
+    return page.locator("visual-container-modern, visual-container, .visualContainer").count() > 0
 
 
 def cmd_login() -> None:
@@ -104,7 +132,7 @@ def cmd_probe() -> None:
     pw, ctx = _ctx(headless=True)
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto(REPORT_URL, wait_until="load", timeout=120_000)
-    time.sleep(20)  # let the report render
+    _wait_logged_in(page)  # tolerate the silent-auth redirect
     shot = str(Path(DOWNLOAD_DIR) / "powerbi_probe.png")
     page.screenshot(path=shot, full_page=True)
     title = page.title()
@@ -207,9 +235,14 @@ def cmd_pull(store: str, window: int, headless: bool = True) -> None:
     pw, ctx = _ctx(headless=headless)
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto(REPORT_URL, wait_until="load", timeout=120_000)
-    time.sleep(20)
-    if "login" in page.url.lower() or "signin" in page.url.lower():
-        print(">>> Session expired — run `login` again."); ctx.close(); pw.stop(); return
+    print("Waiting for the report to load…")
+    if not _wait_logged_in(page):
+        _shot(page, "not_loaded")
+        print(">>> Couldn't reach the report (saved a screenshot 'step_not_loaded.png'). "
+              "If it shows a login page, run `login` again; otherwise send me the shot.")
+        ctx.close(); pw.stop(); return
+    print("Report loaded.")
+    time.sleep(5)
 
     files: list[Path] = []
     for page_name, filename in PAGES:
