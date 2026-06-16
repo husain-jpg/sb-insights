@@ -109,25 +109,112 @@ def cmd_probe() -> None:
     ctx.close(); pw.stop()
 
 
-def cmd_pull(store: str, window: int) -> None:
-    """Headless: reuse session, export both reports, upload to the dashboard.
-    The export selectors are filled in after `probe` shows the report layout."""
-    pw, ctx = _ctx(headless=True)
+# The two report pages to export, mapped to the filename the importer expects
+# (it recognizes the report by these original-style names).
+PAGES = [
+    ("2.2 Sales Velocity Your City",
+     "2.2 Sales Velocity - Average Daily Sales Units per Store by Municipality.xlsx"),
+    ("3.2 Sales Units Your City",
+     "3.2 Average Sales Units per Store by Municipality.xlsx"),
+]
+
+
+def _shot(page, name: str) -> None:
+    try:
+        page.screenshot(path=str(Path(DOWNLOAD_DIR) / f"step_{name}.png"))
+        print("   (screenshot: step_%s.png)" % name)
+    except Exception:
+        pass
+
+
+def _go_to_page(page, page_name: str) -> None:
+    """Click a report page in the left navigator by its visible name."""
+    print(f" → opening page '{page_name}'")
+    # The left nav renders page names as clickable text. Try a few locators.
+    for loc in (page.get_by_role("button", name=page_name),
+                page.get_by_text(page_name, exact=True),
+                page.get_by_text(page_name)):
+        try:
+            loc.first.click(timeout=8000)
+            time.sleep(10)  # let the page's visuals render
+            return
+        except Exception:
+            continue
+    raise RuntimeError(f"could not find left-nav page '{page_name}'")
+
+
+def _export_table(page, out_path: Path) -> Path:
+    """Export the page's data table to .xlsx via the visual's More-options menu."""
+    # Reveal the visual header: hover the largest visual container on the page.
+    visuals = page.locator("visual-container-modern, visual-container, .visualContainer")
+    n = visuals.count()
+    print(f"   found {n} visual container(s); hovering the table")
+    target = None
+    # Pick the widest visual (the data table dominates the page).
+    best_w = -1
+    for i in range(min(n, 12)):
+        try:
+            box = visuals.nth(i).bounding_box()
+            if box and box["width"] > best_w:
+                best_w = box["width"]; target = visuals.nth(i)
+        except Exception:
+            continue
+    target = target or visuals.first
+    target.hover()
+    time.sleep(1)
+    _shot(page, "hover")
+    # The "More options" (…) button on the visual header.
+    for loc in (target.get_by_role("button", name="More options"),
+                page.get_by_role("button", name="More options"),
+                target.locator("[aria-label='More options']")):
+        try:
+            loc.last.click(timeout=5000); break
+        except Exception:
+            continue
+    time.sleep(1)
+    _shot(page, "menu")
+    # "Export data" entry.
+    page.get_by_text("Export data", exact=False).first.click(timeout=8000)
+    time.sleep(2)
+    _shot(page, "dialog")
+    # Export dialog: accept defaults and download.
+    with page.expect_download(timeout=120_000) as dl:
+        for loc in (page.get_by_role("button", name="Export"),
+                    page.get_by_role("button", name="Export data")):
+            try:
+                loc.last.click(timeout=5000); break
+            except Exception:
+                continue
+    download = dl.value
+    download.save_as(str(out_path))
+    print(f"   ✓ exported -> {out_path.name}")
+    return out_path
+
+
+def cmd_pull(store: str, window: int, headless: bool = True) -> None:
+    """Reuse the saved session, export both report pages, upload to dashboard."""
+    pw, ctx = _ctx(headless=headless)
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto(REPORT_URL, wait_until="load", timeout=120_000)
     time.sleep(20)
+    if "login" in page.url.lower() or "signin" in page.url.lower():
+        print(">>> Session expired — run `login` again."); ctx.close(); pw.stop(); return
 
-    # --- EXPORT (to be finalized from the probe screenshot) -------------------
-    # Standard Power BI flow per visual: hover the visual -> "More options (…)"
-    # -> "Export data" -> Underlying/summarized data -> .xlsx download. We grab
-    # both the "Average Sales Units" and "Sales Velocity" visuals/pages.
     files: list[Path] = []
-    print("EXPORT step not yet wired — run `probe` first so we capture the "
-          "report layout, then this function gets the exact clicks.")
-    # files = _export_both_visuals(page)   # <- finalized after probe
-
-    if files:
+    for page_name, filename in PAGES:
+        try:
+            _go_to_page(page, page_name)
+            out = Path(DOWNLOAD_DIR) / filename
+            files.append(_export_table(page, out))
+        except Exception as e:
+            print(f"   ✗ failed on '{page_name}': {e}")
+            _shot(page, "fail_" + page_name.split()[0])
+    print(f"\nExported {len(files)} file(s) to {DOWNLOAD_DIR}")
+    if len(files) == 2 and APP_EMAIL and APP_PASSWORD:
         _upload(files, store, window)
+    elif len(files) == 2:
+        print("Set APP_EMAIL / APP_PASSWORD in the script to auto-upload; "
+              "for now the files are saved locally.")
     ctx.close(); pw.stop()
 
 
@@ -155,6 +242,8 @@ def main() -> None:
     p_pull = sub.add_parser("pull")
     p_pull.add_argument("--store", required=True)
     p_pull.add_argument("--window", type=int, default=30)
+    p_pull.add_argument("--watch", action="store_true",
+                        help="run with a visible browser to watch the export")
     args = ap.parse_args()
 
     try:
@@ -169,7 +258,7 @@ def main() -> None:
     elif args.cmd == "probe":
         cmd_probe()
     elif args.cmd == "pull":
-        cmd_pull(args.store, args.window)
+        cmd_pull(args.store, args.window, headless=not args.watch)
 
 
 if __name__ == "__main__":
