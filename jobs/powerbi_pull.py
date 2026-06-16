@@ -79,10 +79,21 @@ def cmd_login() -> None:
     pw, ctx = _ctx(headless=False)
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto(REPORT_URL, wait_until="load", timeout=120_000)
-    print("\n>>> A browser window opened. Sign in to Power BI and complete MFA.")
+    print("\n" + "=" * 70)
+    print(">>> A browser window opened. Sign in to Power BI + complete MFA.")
+    print(">>> CRITICAL: when it asks 'Stay signed in?' click YES — that's what")
+    print(">>>           keeps the session alive for automation (days, not 1 hour).")
     print(">>> When the REPORT is fully visible, come back here and press Enter.")
+    print("=" * 70)
     input()
-    print("Session saved to:", PROFILE_DIR)
+    # Verify we're actually logged in (re-navigate in this same session).
+    page.goto(REPORT_URL, wait_until="load", timeout=120_000)
+    time.sleep(8)
+    if "login" in page.url.lower() or "signin" in page.url.lower():
+        print("\n>>> WARNING: still on a login page — sign-in didn't stick. "
+              "Re-run `login` and be sure to accept 'Stay signed in?'.")
+    else:
+        print("\n>>> Logged in and session saved to:", PROFILE_DIR)
     ctx.close(); pw.stop()
 
 
