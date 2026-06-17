@@ -4969,6 +4969,7 @@ async def upload_market_intelligence(
     location_id: str = Form(...),
     date: str = Form(...),
     window_days: int = Form(30),
+    replace: bool = Form(False),
     files: list[UploadFile] = File(...),
     request: Request = None,
 ) -> dict:
@@ -5037,7 +5038,31 @@ async def upload_market_intelligence(
             detail=f"Saved {len(saved)} file(s) but import failed: {e}. "
                    f"Make sure you upload BOTH the 'Average Sales Units' and "
                    f"'Sales Velocity' reports with their original OCS filenames.")
-    return {"ok": True, "saved": saved, "store": row[0], "date": date_str, **result}
+
+    # Replace mode (used by the daily Power BI auto-pull): keep only the latest
+    # snapshot per (store, window). Delete prior imports for this location +
+    # period length — but ONLY after the new import succeeded above, so a failed
+    # import can never wipe good data. Bounds the table to one row-set per
+    # store/window instead of accumulating a snapshot every day.
+    removed = 0
+    if replace:
+        new_id = result.get("import_id")
+        pdays = result.get("period_days")
+        if new_id and pdays:
+            with db() as conn:
+                conn.execute(
+                    "DELETE FROM market_intelligence_data WHERE import_id IN "
+                    "(SELECT id FROM market_intelligence_imports "
+                    " WHERE location_id = ? AND period_days = ? AND id <> ?)",
+                    (location_id, pdays, new_id))
+                cur = conn.execute(
+                    "DELETE FROM market_intelligence_imports "
+                    "WHERE location_id = ? AND period_days = ? AND id <> ?",
+                    (location_id, pdays, new_id))
+                removed = cur.rowcount
+                conn.commit()
+    return {"ok": True, "saved": saved, "store": row[0], "date": date_str,
+            "replaced_prior": removed, **result}
 
 
 @app.post("/api/market-intelligence/import")

@@ -37,5 +37,8 @@ desktop.ini
 # Cova catalogue exports — large binary source data
 cova-catalog/
 
+# Power BI pull diagnostic screenshots
+powerbi_shots/
+
 # Claude Code local config
 .claude/
