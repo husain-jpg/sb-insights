@@ -2986,6 +2986,16 @@ async function renderCompetitors() {
 
     let data = initialData;
 
+    // Stores for the comparison picker. Only stores that actually have competitor
+    // data are selectable; the rest are greyed out (auto-enable as data is added).
+    const locations = await api("/api/locations").catch(() => []);
+    const storesWithData = new Set((initialData.competitors || []).map(c => c.sb_store));
+    const storeOptionsHtml = locations.map(l => {
+      const on = storesWithData.has(l.id);
+      return `<option value="${escapeHtml(l.id)}"${on ? "" : " disabled"}>`
+           + `${escapeHtml(l.name)}${on ? "" : " — no competitor data"}</option>`;
+    }).join("");
+
     const renderSummary = (d) => `
       <div>Rows shown<strong>${d.count.toLocaleString()}</strong></div>
       <div>Median price<strong>${d.summary.median_price ? fmt$2(d.summary.median_price) : "—"}</strong></div>
@@ -2999,6 +3009,12 @@ async function renderCompetitors() {
         <div>
           <div class="kicker">Competitor Intelligence</div>
           <h2>Where can we cut to compete?</h2>
+        </div>
+        <div class="controls-row">
+          <select id="comp-store-select">
+            <option value="">— Select a store —</option>
+            ${storeOptionsHtml}
+          </select>
         </div>
       </div>
 
@@ -3033,8 +3049,11 @@ async function renderCompetitors() {
       </div>
     `;
 
-    // Head-to-head: where are we priced above the competitors? (Bradford / S3)
-    renderPriceComparison();
+    // Comparison report loads only after the user picks a store.
+    renderPriceComparison("");
+    document.getElementById("comp-store-select").addEventListener("change", (e) => {
+      renderPriceComparison(e.target.value);
+    });
 
     const columns = [
       { key: 'competitor_name', label: 'Competitor',
@@ -3099,21 +3118,26 @@ async function renderCompetitors() {
 }
 
 // Head-to-head price comparison: our shelf price vs Olympus & Beaverton (Bradford).
-async function renderPriceComparison() {
+async function renderPriceComparison(sbStore) {
   const el = document.getElementById("comp-comparison");
   if (!el) return;
+  if (!sbStore) {
+    el.innerHTML = `<div class="hint-box">Pick a store above to load its competitor price comparison.</div>`;
+    return;
+  }
+  el.innerHTML = `<div class="loading"><span class="spinner"></span> Loading comparison…</div>`;
   try {
-    const d = await api("/api/competitor-comparison?sb_store=S3");
+    const d = await api(`/api/competitor-comparison?sb_store=${encodeURIComponent(sbStore)}`);
     if (!d.match_count) {
-      el.innerHTML = `<div class="hint-box">No Bradford price matches yet — load competitor data for Bradford (Olympus / Beaverton).</div>`;
+      el.innerHTML = `<div class="hint-box">No matched products for this store yet.</div>`;
       return;
     }
     const higher = d.items.filter(i => i.we_are_higher);
     el.innerHTML = `
       <div class="section-header" style="margin-bottom: 8px">
         <div>
-          <div class="kicker">Bradford · vs Olympus &amp; Beaverton</div>
-          <h3 style="margin: 4px 0 0">Priced above a competitor on <strong>${d.higher_count}</strong> of ${d.match_count} matched products — discount targets</h3>
+          <div class="kicker">Discount opportunities</div>
+          <h3 style="margin: 4px 0 0">Priced above a competitor on <strong>${d.higher_count}</strong> of ${d.match_count} matched products</h3>
         </div>
       </div>
       <div class="card"><div id="comp-cmp-table"></div></div>`;
