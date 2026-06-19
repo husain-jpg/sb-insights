@@ -3264,15 +3264,16 @@ def _name_tokens(title: str, brand: str) -> frozenset:
 
 @app.get("/api/competitor-comparison")
 def competitor_comparison(sb_store: str, request: Request = None) -> dict:
-    """Head-to-head: match our shelf products to the competitors' — same brand +
-    size, with a token-subset match on the distinctive product name (tolerates
-    naming differences) — and flag where we're priced ABOVE the cheapest
-    competitor: discount opportunities. Works for any store with competitor data."""
+    """One row per competitor menu product for this store, annotated with OUR
+    price where we carry the same thing (matched by brand + size + token-subset on
+    the distinctive name). `overlap`=we both carry it; `delta`=our price minus
+    theirs (positive = we're higher = discount opportunity). Overlap rows sort
+    first (biggest overprice first), then the rest of the competitor menu."""
     require_user(request)
     with db() as conn:
         conn.row_factory = sqlite3.Row
-        # our products, deduped by (brand, size, name-tokens), cheapest kept
-        ours: dict = {}
+        # our products indexed by (brand, size) -> [(name-tokens, price)]
+        ours_idx: dict = {}
         for r in conn.execute(
             """SELECT pr.brand, pr.name, pr.size, p.regular_price, p.sale_price
                FROM prices p JOIN products pr ON pr.sku = p.sku
@@ -3280,51 +3281,49 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
                      AND p.regular_price < 900""", (sb_store,)):
             toks = _name_tokens(r["name"], r["brand"])
             bkey = (_norm_brand(r["brand"]), _norm_size(r["size"], r["name"]))
-            if not (toks and bkey[1]):
-                continue
-            price = r["sale_price"] or r["regular_price"]
-            k = (bkey, toks)
-            if k not in ours or price < ours[k]["our_price"]:
-                ours[k] = {"bkey": bkey, "tokens": toks, "brand": r["brand"],
-                           "name": r["name"], "size": bkey[1], "our_price": price}
-        # latest competitor snapshot per variant, indexed by (brand, size)
-        comp_idx: dict = {}
+            if toks and bkey[1]:
+                ours_idx.setdefault(bkey, []).append(
+                    (toks, r["sale_price"] or r["regular_price"]))
+        # every latest competitor product, annotated with our matching price
+        items = []
+        competitors = set()
         for r in conn.execute(
-            """SELECT competitor_name, vendor, product_title, variant_size, price FROM (
+            """SELECT competitor_name, vendor, product_title, product_type,
+                      variant_size, price FROM (
                    SELECT *, ROW_NUMBER() OVER (
                        PARTITION BY competitor_name, variant_id
                        ORDER BY collected_at DESC) rn
                    FROM competitor_prices
                    WHERE sb_competes_with = ? AND price IS NOT NULL
                          AND variant_size <> 'multi') WHERE rn = 1""", (sb_store,)):
-            toks = _name_tokens(r["product_title"], r["vendor"])
+            competitors.add(r["competitor_name"])
+            ctoks = _name_tokens(r["product_title"], r["vendor"])
             bkey = (_norm_brand(r["vendor"]), _norm_size(r["variant_size"]))
-            if toks and bkey[1]:
-                comp_idx.setdefault(bkey, []).append(
-                    {"tokens": toks, "competitor": r["competitor_name"], "price": r["price"]})
-        items = []
-        for o in ours.values():
-            theirs: dict = {}
-            for cnd in comp_idx.get(o["bkey"], []):
-                ot, ct = o["tokens"], cnd["tokens"]
-                if (ot <= ct or ct <= ot) and (ot & ct):   # token-subset, ≥1 shared
-                    cn = cnd["competitor"]
-                    if cn not in theirs or cnd["price"] < theirs[cn]:
-                        theirs[cn] = cnd["price"]
-            if not theirs:
-                continue
-            mn = min(theirs.values())
+            our_price = None
+            if ctoks and bkey[1]:
+                for otoks, oprice in ours_idx.get(bkey, []):
+                    if (otoks <= ctoks or ctoks <= otoks) and (otoks & ctoks):
+                        if our_price is None or oprice < our_price:
+                            our_price = oprice
+            overlap = our_price is not None
             items.append({
-                "brand": o["brand"], "name": o["name"], "size": o["size"],
-                "our_price": o["our_price"], "competitors": theirs,
-                "min_competitor": mn, "delta": round(o["our_price"] - mn, 2),
-                "we_are_higher": o["our_price"] > mn,
+                "competitor": r["competitor_name"], "brand": r["vendor"],
+                "product": r["product_title"], "category": r["product_type"],
+                "size": r["variant_size"], "their_price": r["price"],
+                "our_price": our_price,
+                "delta": round(our_price - r["price"], 2) if overlap else None,
+                "overlap": overlap,
+                "we_are_higher": bool(overlap and our_price > r["price"]),
             })
-        items.sort(key=lambda x: -x["delta"])
+        # overlap first (biggest overprice first), then the rest of their menu
+        items.sort(key=lambda x: (not x["overlap"],
+                                  -(x["delta"] if x["delta"] is not None else -1e9)))
     return {
         "sb_store": sb_store,
-        "match_count": len(items),
+        "competitors": sorted(competitors),
+        "overlap_count": sum(1 for i in items if i["overlap"]),
         "higher_count": sum(1 for i in items if i["we_are_higher"]),
+        "total_count": len(items),
         "items": items,
     }
 

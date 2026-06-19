@@ -3020,32 +3020,8 @@ async function renderCompetitors() {
 
       <div id="comp-comparison" style="margin-bottom: 24px;"></div>
 
-      <div class="section-header">
-        <div>
-          <div class="kicker">All competitor prices</div>
-          <h3 style="margin: 2px 0 0">What are they charging? — searchable</h3>
-        </div>
-        <div class="controls-row">
-          <select id="comp-competitor-filter">
-            <option value="">All competitors</option>
-            ${data.competitors.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join("")}
-          </select>
-          <select id="comp-type-filter">
-            <option value="">All categories</option>
-            ${data.product_types.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("")}
-          </select>
-          <input type="text" id="comp-search" placeholder="Search product or brand..." style="padding: 6px 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-family: inherit; font-size: 13px;">
-          ${excelButtonHtml("comp-excel-btn")}
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="summary-bar" id="comp-summary">${renderSummary(data)}</div>
-        <div id="comp-table"></div>
-      </div>
-
       <div class="hint-box">
-        <strong>Market price only.</strong> These are the public, non-member prices shown on competitor websites. Actual member (Elite/Cabana Club) prices are typically 15–20% lower.
+        <strong>Market price only.</strong> Competitor figures are the public, non-member website prices; their member prices are typically 15–20% lower.
       </div>
     `;
 
@@ -3053,65 +3029,6 @@ async function renderCompetitors() {
     renderPriceComparison("");
     document.getElementById("comp-store-select").addEventListener("change", (e) => {
       renderPriceComparison(e.target.value);
-    });
-
-    const columns = [
-      { key: 'competitor_name', label: 'Competitor',
-        render: r => escapeHtml(r.competitor_name || '') },
-      { key: 'vendor', label: 'Brand',
-        render: r => escapeHtml(r.vendor || '') },
-      { key: 'product_title', label: 'Product',
-        render: r => escapeHtml(r.product_title || '') },
-      { key: 'product_type', label: 'Category',
-        render: r => escapeHtml(r.product_type || '') },
-      { key: 'variant_size', label: 'Size',
-        render: r => escapeHtml(r.variant_size || '') },
-      { key: 'price', label: 'Price', type: 'number', align: 'right',
-        render: r => r.price ? fmt$2(r.price) : '—' },
-      { key: 'compare_at_price', label: 'Was', type: 'number', align: 'right',
-        render: r => r.compare_at_price ? `<span style="text-decoration: line-through; color: var(--text-dim)">${fmt$2(r.compare_at_price)}</span>` : '' },
-      { key: 'discount_pct', label: 'Sale', type: 'number', align: 'right',
-        render: r => r.on_sale ? `<span class="tag tag-critical">-${r.discount_pct}%</span>` : '' },
-      { key: 'available', label: 'Stock',
-        render: r => r.available === false ? '<span class="tag tag-warning">OOS</span>' : r.available === true ? '<span class="tag">in stock</span>' : '' },
-    ];
-
-    renderTable('comp-table', data.items, columns, {
-      defaultSort: 'price', defaultDir: 'desc',
-      emptyText: 'No competitor prices match these filters.'
-    });
-
-    let debounceTimer = null;
-    const refetch = async () => {
-      const params = new URLSearchParams();
-      const competitor = document.getElementById("comp-competitor-filter").value;
-      const type = document.getElementById("comp-type-filter").value;
-      const search = document.getElementById("comp-search").value.trim();
-      if (competitor) params.set("competitor", competitor);
-      if (type) params.set("product_type", type);
-      if (search) params.set("search", search);
-      data = await api(`/api/competitor-prices?${params.toString()}`);
-      document.getElementById("comp-summary").innerHTML = renderSummary(data);
-      renderTable('comp-table', data.items, columns, { defaultSort: 'price', defaultDir: 'desc' });
-    };
-
-    ["comp-competitor-filter", "comp-type-filter"].forEach(id => {
-      document.getElementById(id).addEventListener("change", refetch);
-    });
-    document.getElementById("comp-search").addEventListener("input", () => {
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(refetch, 400);
-    });
-
-    document.getElementById("comp-excel-btn").addEventListener("click", () => {
-      const params = new URLSearchParams();
-      const competitor = document.getElementById("comp-competitor-filter").value;
-      const type = document.getElementById("comp-type-filter").value;
-      const search = document.getElementById("comp-search").value.trim();
-      if (competitor) params.set("competitor", competitor);
-      if (type) params.set("product_type", type);
-      if (search) params.set("search", search);
-      downloadUrl(`/api/export/competitor-prices?${params.toString()}`);
     });
 
   } catch (e) { showError(e); }
@@ -3128,37 +3045,57 @@ async function renderPriceComparison(sbStore) {
   el.innerHTML = `<div class="loading"><span class="spinner"></span> Loading comparison…</div>`;
   try {
     const d = await api(`/api/competitor-comparison?sb_store=${encodeURIComponent(sbStore)}`);
-    if (!d.match_count) {
-      el.innerHTML = `<div class="hint-box">No matched products for this store yet.</div>`;
+    if (!d.total_count) {
+      el.innerHTML = `<div class="hint-box">No competitor data for this store yet.</div>`;
       return;
     }
-    const higher = d.items.filter(i => i.we_are_higher);
+    const cols = [
+      { key: 'competitor', label: 'Competitor',
+        render: r => escapeHtml((r.competitor || '').split(' ')[0]) },
+      { key: 'brand', label: 'Brand', render: r => escapeHtml(r.brand || '') },
+      { key: 'product', label: 'Product', render: r => escapeHtml(r.product || '') },
+      { key: 'size', label: 'Size', render: r => escapeHtml(r.size || '') },
+      { key: 'their_price', label: 'Their price', type: 'number', align: 'right',
+        render: r => r.their_price != null ? fmt$2(r.their_price) : '—' },
+      { key: 'our_price', label: 'Our price', type: 'number', align: 'right',
+        render: r => r.our_price != null ? fmt$2(r.our_price)
+          : '<span style="color:var(--text-dim)">not carried</span>' },
+      { key: 'delta', label: 'Δ vs them', type: 'number', align: 'right',
+        render: r => r.delta == null ? ''
+          : `<span class="tag ${r.we_are_higher ? 'tag-critical' : ''}">${r.delta > 0 ? '+' : ''}${fmt$2(r.delta)}</span>` },
+    ];
+    let onlyOverlap = true, compFilter = "";
+    const apply = () => {
+      let rows = d.items;
+      if (compFilter) rows = rows.filter(r => r.competitor === compFilter);
+      if (onlyOverlap) rows = rows.filter(r => r.overlap);
+      // overlap first (biggest overprice first), then the rest of their menu
+      rows = rows.slice().sort((a, b) =>
+        (a.overlap !== b.overlap) ? (a.overlap ? -1 : 1)
+          : a.overlap ? ((b.delta || 0) - (a.delta || 0))
+          : ((b.their_price || 0) - (a.their_price || 0)));
+      renderTable('comp-cmp-table', rows, cols, { emptyText: 'No products match.' });
+    };
     el.innerHTML = `
       <div class="section-header" style="margin-bottom: 8px">
         <div>
-          <div class="kicker">Discount opportunities</div>
-          <h3 style="margin: 4px 0 0">Priced above a competitor on <strong>${d.higher_count}</strong> of ${d.match_count} matched products</h3>
+          <div class="kicker">Price comparison</div>
+          <h3 style="margin: 4px 0 0">You both carry <strong>${d.overlap_count}</strong> products · priced above them on <strong>${d.higher_count}</strong> · ${d.total_count.toLocaleString()} on their menu</h3>
+        </div>
+        <div class="controls-row">
+          <select id="cmp-comp-filter">
+            <option value="">All competitors</option>
+            ${d.competitors.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
+          </select>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap;cursor:pointer;">
+            <input type="checkbox" id="cmp-overlap-only" checked> Overlap only
+          </label>
         </div>
       </div>
       <div class="card"><div id="comp-cmp-table"></div></div>`;
-    const cols = [
-      { key: 'brand', label: 'Brand', render: r => escapeHtml(r.brand || '') },
-      { key: 'name', label: 'Product', render: r => escapeHtml(r.name || '') },
-      { key: 'size', label: 'Size', render: r => escapeHtml(r.size || '') },
-      { key: 'our_price', label: 'Our price', type: 'number', align: 'right',
-        render: r => fmt$2(r.our_price) },
-      { key: 'min_competitor', label: 'Beat to', type: 'number', align: 'right',
-        render: r => fmt$2(r.min_competitor) },
-      { key: 'delta', label: 'Over by', type: 'number', align: 'right',
-        render: r => `<span class="tag tag-critical">+${fmt$2(r.delta)}</span>` },
-      { key: 'competitors', label: 'Competitor prices',
-        render: r => Object.entries(r.competitors)
-          .map(([n, p]) => `${escapeHtml(n.split(' ')[0])} ${fmt$2(p)}`).join(' · ') },
-    ];
-    renderTable('comp-cmp-table', higher, cols, {
-      defaultSort: 'delta', defaultDir: 'desc',
-      emptyText: 'You are at or below competitor prices on all matched products. 🎉'
-    });
+    apply();
+    document.getElementById("cmp-comp-filter").addEventListener("change", e => { compFilter = e.target.value; apply(); });
+    document.getElementById("cmp-overlap-only").addEventListener("change", e => { onlyOverlap = e.target.checked; apply(); });
   } catch (e) {
     el.innerHTML = `<div class="hint-box">Comparison unavailable: ${escapeHtml(String((e && e.message) || e))}</div>`;
   }
