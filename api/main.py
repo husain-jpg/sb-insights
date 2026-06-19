@@ -3318,14 +3318,14 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
         # overlap first (biggest overprice first), then the rest of their menu
         items.sort(key=lambda x: (not x["overlap"],
                                   -(x["delta"] if x["delta"] is not None else -1e9)))
-        # how many SKUs we carry at this store (priced), for the % context
-        our_sku_count = conn.execute(
-            "SELECT COUNT(*) FROM prices WHERE location_id = ? "
-            "AND regular_price IS NOT NULL AND regular_price < 900", (sb_store,)).fetchone()[0]
+        # how many SKUs we currently have IN STOCK at this store (on_hand > 0)
+        in_stock_count = conn.execute(
+            "SELECT COUNT(*) FROM current_inventory "
+            "WHERE location_id = ? AND on_hand > 0", (sb_store,)).fetchone()[0]
     return {
         "sb_store": sb_store,
         "competitors": sorted(competitors),
-        "our_sku_count": our_sku_count,
+        "in_stock_count": in_stock_count,
         "overlap_count": sum(1 for i in items if i["overlap"]),
         "higher_count": sum(1 for i in items if i["we_are_higher"]),
         "total_count": len(items),

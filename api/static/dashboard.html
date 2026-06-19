@@ -3074,10 +3074,12 @@ async function renderPriceComparison(sbStore) {
       const pct = overlapN ? Math.round(higherN / overlapN * 100) : 0;
       const sum = document.getElementById("cmp-summary");
       if (sum) sum.innerHTML =
-        `We carry <strong>${(d.our_sku_count || 0).toLocaleString()}</strong> SKUs here · `
-        + `overlap with them: <strong>${overlapN}</strong> · `
-        + `overpriced on <strong>${higherN}</strong> (<strong>${pct}%</strong> of overlap) · `
-        + `their menu: ${scope.length.toLocaleString()}`;
+        `<ul style="margin: 6px 0 0; padding-left: 18px; line-height: 1.7;">`
+        + `<li><strong>${(d.in_stock_count || 0).toLocaleString()}</strong> SKUs in stock currently</li>`
+        + `<li>Overlap with them: <strong>${overlapN}</strong></li>`
+        + `<li>Overpriced on <strong>${higherN}</strong> (<strong>${pct}%</strong> of overlap)</li>`
+        + `<li><strong>${scope.length.toLocaleString()}</strong> products on their menu</li>`
+        + `</ul>`;
       let rows = onlyOverlap ? scope.filter(r => r.overlap) : scope.slice();
       // overlap first (biggest overprice first), then the rest of their menu
       rows = rows.slice().sort((a, b) =>
@@ -3090,7 +3092,7 @@ async function renderPriceComparison(sbStore) {
       <div class="section-header" style="margin-bottom: 8px">
         <div>
           <div class="kicker">Price comparison</div>
-          <h3 style="margin: 4px 0 0" id="cmp-summary"></h3>
+          <div id="cmp-summary" style="margin: 4px 0 0"></div>
         </div>
         <div class="controls-row">
           <select id="cmp-comp-filter">
