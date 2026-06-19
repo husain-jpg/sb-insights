@@ -3219,6 +3219,93 @@ def competitor_prices(
     }
 
 
+# --- competitor price comparison (our shelf price vs the competitors') --------
+def _norm_brand(b: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]", "", (b or "").lower())
+
+
+def _norm_size(*texts) -> str:
+    import re
+    s = " ".join(x or "" for x in texts)
+    m = re.search(r"(\d+\.?\d*)\s*(g|ml|mg|cap|pk|pack|seed)", s, re.I)
+    return (m.group(1) + m.group(2).lower()) if m else ""
+
+
+def _norm_name(n: str, brand: str = "") -> str:
+    import re
+    n = (n or "").lower()
+    if "|" in n:                       # our names are "Brand | Product [size]"
+        n = n.split("|", 1)[1]
+    n = re.sub(r"\[[^\]]*\]", " ", n)   # drop "[3.5g]"
+    n = re.sub(r"\b(indica|sativa|hybrid|blend|new)\b", " ", n)
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    for w in (brand or "").lower().split():
+        n = re.sub(rf"\b{re.escape(w)}\b", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+@app.get("/api/competitor-comparison")
+def competitor_comparison(sb_store: str, request: Request = None) -> dict:
+    """Head-to-head: match our shelf products to the competitors' (by brand +
+    normalized name + size) for one store, and flag where we're priced ABOVE the
+    cheapest competitor — i.e. discount opportunities. Built for the Bradford
+    discount play; works for any store with competitor data."""
+    require_user(request)
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        # our products at this store (skip 999 placeholder / no-price rows)
+        ours: dict = {}
+        for r in conn.execute(
+            """SELECT pr.brand, pr.name, pr.size, p.regular_price, p.sale_price
+               FROM prices p JOIN products pr ON pr.sku = p.sku
+               WHERE p.location_id = ? AND p.regular_price IS NOT NULL
+                     AND p.regular_price < 900""", (sb_store,)):
+            key = (_norm_brand(r["brand"]), _norm_name(r["name"], r["brand"]),
+                   _norm_size(r["size"], r["name"]))
+            if not (key[1] and key[2]):
+                continue
+            price = r["sale_price"] or r["regular_price"]
+            if key not in ours or price < ours[key]["our_price"]:
+                ours[key] = {"brand": r["brand"], "name": r["name"],
+                             "size": key[2], "our_price": price}
+        # latest competitor snapshot per variant
+        comp: dict = {}
+        for r in conn.execute(
+            """SELECT competitor_name, vendor, product_title, variant_size, price FROM (
+                   SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY competitor_name, variant_id
+                       ORDER BY collected_at DESC) rn
+                   FROM competitor_prices
+                   WHERE sb_competes_with = ? AND price IS NOT NULL
+                         AND variant_size <> 'multi') WHERE rn = 1""", (sb_store,)):
+            key = (_norm_brand(r["vendor"]), _norm_name(r["product_title"], r["vendor"]),
+                   _norm_size(r["variant_size"]))
+            if key[1] and key[2]:
+                comp.setdefault(key, {})
+                prev = comp[key].get(r["competitor_name"])
+                if prev is None or r["price"] < prev:
+                    comp[key][r["competitor_name"]] = r["price"]
+        items = []
+        for key, o in ours.items():
+            theirs = comp.get(key)
+            if not theirs:
+                continue
+            mn = min(theirs.values())
+            items.append({
+                **o, "competitors": theirs, "min_competitor": mn,
+                "delta": round(o["our_price"] - mn, 2),
+                "we_are_higher": o["our_price"] > mn,
+            })
+        items.sort(key=lambda x: -x["delta"])
+    return {
+        "sb_store": sb_store,
+        "match_count": len(items),
+        "higher_count": sum(1 for i in items if i["we_are_higher"]),
+        "items": items,
+    }
+
+
 # ---------------------------------------------------------------------------
 # /api/export/* — Excel export endpoints
 # ---------------------------------------------------------------------------

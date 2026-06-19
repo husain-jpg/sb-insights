@@ -198,17 +198,19 @@ def parse_card(card: dict, gid: str, label: str, ts: str) -> Row | None:
 
 
 def _click_pager(pg, page_no: int) -> bool:
-    """Click the numbered pager button for `page_no`. Scoped to small numeric
-    buttons/links (the pagination control), so we don't click a stray number in
-    a product. Returns True if a click happened."""
-    for loc in (pg.get_by_role("button", name=str(page_no), exact=True),
-                pg.get_by_role("link", name=str(page_no), exact=True),
-                pg.locator(f"xpath=//*[(self::button or self::a or self::li) "
-                           f"and normalize-space(.)='{page_no}']")):
+    """Click the numbered pager button for `page_no`. Tries several shapes of the
+    (hashed-class) pager control; returns True if a click happened."""
+    n = page_no
+    for sel in (f"xpath=//button[normalize-space(.)='{n}']",
+                f"xpath=//a[normalize-space(.)='{n}']",
+                f"xpath=//*[@role='button' and normalize-space(.)='{n}']",
+                f"xpath=//li[normalize-space(.)='{n}']//*"):
         try:
-            loc.last.scroll_into_view_if_needed(timeout=2000)
-            loc.last.click(timeout=2500)
-            return True
+            el = pg.locator(sel).last
+            if el.count():
+                el.scroll_into_view_if_needed(timeout=1500)
+                el.click(timeout=2000)
+                return True
         except Exception:
             continue
     return False
@@ -229,7 +231,11 @@ def scrape_group(pg, gid: str, label: str, ts: str) -> list[Row]:
         if not _click_pager(pg, page_no + 1):
             break                      # no next page button
         page_no += 1
-        pg.wait_for_timeout(2500)
+        try:
+            pg.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        pg.wait_for_timeout(1800)
         _scroll_all(pg)
         # extract here so we can tell if the new page actually added anything
         for c in pg.evaluate(EXTRACT_JS):

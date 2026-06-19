@@ -3014,6 +3014,8 @@ async function renderCompetitors() {
         </div>
       </div>
 
+      <div id="comp-comparison" style="margin-bottom: 18px;"></div>
+
       <div class="card">
         <div class="summary-bar" id="comp-summary">${renderSummary(data)}</div>
         <div id="comp-table"></div>
@@ -3023,6 +3025,9 @@ async function renderCompetitors() {
         <strong>Market price only.</strong> These are the public, non-member prices shown on competitor websites. Actual member (Elite/Cabana Club) prices are typically 15–20% lower.
       </div>
     `;
+
+    // Head-to-head: where are we priced above the competitors? (Bradford / S3)
+    renderPriceComparison();
 
     const columns = [
       { key: 'competitor_name', label: 'Competitor',
@@ -3084,6 +3089,48 @@ async function renderCompetitors() {
     });
 
   } catch (e) { showError(e); }
+}
+
+// Head-to-head price comparison: our shelf price vs Olympus & Beaverton (Bradford).
+async function renderPriceComparison() {
+  const el = document.getElementById("comp-comparison");
+  if (!el) return;
+  try {
+    const d = await api("/api/competitor-comparison?sb_store=S3");
+    if (!d.match_count) {
+      el.innerHTML = `<div class="hint-box">No Bradford price matches yet — load competitor data for Bradford (Olympus / Beaverton).</div>`;
+      return;
+    }
+    const higher = d.items.filter(i => i.we_are_higher);
+    el.innerHTML = `
+      <div class="section-header" style="margin-bottom: 8px">
+        <div>
+          <div class="kicker">Bradford · vs Olympus &amp; Beaverton</div>
+          <h3 style="margin: 4px 0 0">Priced above a competitor on <strong>${d.higher_count}</strong> of ${d.match_count} matched products — discount targets</h3>
+        </div>
+      </div>
+      <div class="card"><div id="comp-cmp-table"></div></div>`;
+    const cols = [
+      { key: 'brand', label: 'Brand', render: r => escapeHtml(r.brand || '') },
+      { key: 'name', label: 'Product', render: r => escapeHtml(r.name || '') },
+      { key: 'size', label: 'Size', render: r => escapeHtml(r.size || '') },
+      { key: 'our_price', label: 'Our price', type: 'number', align: 'right',
+        render: r => fmt$2(r.our_price) },
+      { key: 'min_competitor', label: 'Beat to', type: 'number', align: 'right',
+        render: r => fmt$2(r.min_competitor) },
+      { key: 'delta', label: 'Over by', type: 'number', align: 'right',
+        render: r => `<span class="tag tag-critical">+${fmt$2(r.delta)}</span>` },
+      { key: 'competitors', label: 'Competitor prices',
+        render: r => Object.entries(r.competitors)
+          .map(([n, p]) => `${escapeHtml(n.split(' ')[0])} ${fmt$2(p)}`).join(' · ') },
+    ];
+    renderTable('comp-cmp-table', higher, cols, {
+      defaultSort: 'delta', defaultDir: 'desc',
+      emptyText: 'You are at or below competitor prices on all matched products. 🎉'
+    });
+  } catch (e) {
+    el.innerHTML = `<div class="hint-box">Comparison unavailable: ${escapeHtml(String((e && e.message) || e))}</div>`;
+  }
 }
 
 // ========================================================================
