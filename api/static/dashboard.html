@@ -3069,11 +3069,15 @@ async function renderPriceComparison(sbStore) {
       // Scope = the selected competitor (or all). The summary counts reflect this
       // scope; the "Overlap only" toggle only changes which rows are shown.
       const scope = compFilter ? d.items.filter(r => r.competitor === compFilter) : d.items;
+      const overlapN = scope.filter(r => r.overlap).length;
+      const higherN = scope.filter(r => r.we_are_higher).length;
+      const pct = overlapN ? Math.round(higherN / overlapN * 100) : 0;
       const sum = document.getElementById("cmp-summary");
       if (sum) sum.innerHTML =
-        `You both carry <strong>${scope.filter(r => r.overlap).length}</strong> products · `
-        + `priced above them on <strong>${scope.filter(r => r.we_are_higher).length}</strong> · `
-        + `${scope.length.toLocaleString()} on their menu`;
+        `We carry <strong>${(d.our_sku_count || 0).toLocaleString()}</strong> SKUs here · `
+        + `overlap with them: <strong>${overlapN}</strong> · `
+        + `overpriced on <strong>${higherN}</strong> (<strong>${pct}%</strong> of overlap) · `
+        + `their menu: ${scope.length.toLocaleString()}`;
       let rows = onlyOverlap ? scope.filter(r => r.overlap) : scope.slice();
       // overlap first (biggest overprice first), then the rest of their menu
       rows = rows.slice().sort((a, b) =>
