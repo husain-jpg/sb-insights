@@ -88,6 +88,25 @@ DOWNLOAD_DIR = str(Path.home() / ".sbinsights_powerbi_downloads")
 # Diagnostic screenshots go straight into the project (gitignored) so they can
 # be inspected without copying them out of the hidden downloads folder.
 SHOT_DIR = str(Path(__file__).resolve().parent.parent / "powerbi_shots")
+# Machine-readable last-run status (for the scheduler wrapper / a future dashboard
+# health banner). auth_expired=True means the Power BI session needs `login`.
+STATUS_FILE = Path(__file__).resolve().parent.parent / "logs" / "powerbi_status.json"
+
+
+def _write_status(*, auth_expired: bool, ok: list, failed: list) -> None:
+    import json
+    from datetime import datetime
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_FILE.write_text(json.dumps({
+            "last_run": datetime.now().isoformat(timespec="seconds"),
+            "auth_expired": auth_expired,
+            "ok_count": len(ok),
+            "failed_count": len(failed),
+            "failed": [f if isinstance(f, str) else f[0] for f in failed],
+        }, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _ctx(headless: bool):
@@ -631,7 +650,9 @@ def cmd_pull(store: str | None, windows: list, headless: bool = True) -> None:
         _shot(page, "not_loaded")
         print(">>> Couldn't reach the report ('step_not_loaded.png'). If it shows a "
               "login page, run `login` again; otherwise send me the shot.")
-        ctx.close(); pw.stop(); return
+        ctx.close(); pw.stop()
+        _write_status(auth_expired=True, ok=[], failed=[])
+        return 2  # exit code 2 = Power BI session expired, needs `login`
     print("Report loaded.")
     time.sleep(5)
     _dump_date_slicer(page)  # one-time: capture the date control's DOM
@@ -688,6 +709,8 @@ def cmd_pull(store: str | None, windows: list, headless: bool = True) -> None:
         for lbl, why in failed:
             print(f"      - {lbl}: {why}")
     ctx.close(); pw.stop()
+    _write_status(auth_expired=False, ok=succeeded, failed=failed)
+    return 1 if failed else 0  # 1 = some store-windows failed, 0 = all good
 
 
 def _select_targets(store: str | None) -> list[dict]:
@@ -744,11 +767,21 @@ def _upload(files: list[Path], location_id: str, window: int, end_date) -> None:
                data={"location_id": location_id, "date": end_date.isoformat(),
                      "window_days": str(window), "replace": "true"},
                files=multipart, timeout=120)
-    print("   upload:", r.status_code, r.text[:200])
+    print("   upload:", r.status_code, r.text[:400])
     r.raise_for_status()
 
 
 def main() -> None:
+    # Force UTF-8 stdout/stderr. When run from Task Scheduler with output
+    # redirected to a file, Python otherwise uses the legacy cp1252 codec and
+    # crashes on the progress glyphs (→ ✓ ✗).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            # line_buffering=True so the log updates live (not block-buffered)
+            # when redirected to a file by the scheduler.
+            _stream.reconfigure(encoding="utf-8", line_buffering=True)
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(description="Power BI auto-pull for OCS Market Intelligence")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login")
@@ -776,7 +809,7 @@ def main() -> None:
         cmd_probe()
     elif args.cmd == "pull":
         windows = [args.window] if args.window else WINDOWS
-        cmd_pull(args.store, windows, headless=not args.watch)
+        sys.exit(cmd_pull(args.store, windows, headless=not args.watch) or 0)
 
 
 if __name__ == "__main__":

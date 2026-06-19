@@ -42,3 +42,5 @@ powerbi_shots/
 
 # Claude Code local config
 .claude/
+# Power BI run logs/status
+logs/
