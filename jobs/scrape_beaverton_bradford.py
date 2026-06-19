@@ -92,7 +92,8 @@ class Row:
 def _ctx(headless: bool):
     from playwright.sync_api import sync_playwright
     pw = sync_playwright().start()
-    b = pw.chromium.launch(headless=headless)
+    b = pw.chromium.launch(headless=headless,
+                           args=["--no-sandbox", "--disable-dev-shm-usage"])
     pg = b.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/124.0.0.0 Safari/537.36",
@@ -198,22 +199,21 @@ def parse_card(card: dict, gid: str, label: str, ts: str) -> Row | None:
 
 
 def _click_pager(pg, page_no: int) -> bool:
-    """Click the numbered pager button for `page_no`. Tries several shapes of the
-    (hashed-class) pager control; returns True if a click happened."""
-    n = page_no
-    for sel in (f"xpath=//button[normalize-space(.)='{n}']",
-                f"xpath=//a[normalize-space(.)='{n}']",
-                f"xpath=//*[@role='button' and normalize-space(.)='{n}']",
-                f"xpath=//li[normalize-space(.)='{n}']//*"):
-        try:
-            el = pg.locator(sel).last
-            if el.count():
-                el.scroll_into_view_if_needed(timeout=1500)
-                el.click(timeout=2000)
-                return True
-        except Exception:
-            continue
-    return False
+    """Click the numbered pager via a JS click. Playwright's actionable .click()
+    is unreliable here (the pager sits under an overlay and times out), which
+    silently truncated several categories to one page. A JS el.click() works."""
+    try:
+        return bool(pg.evaluate(
+            """(n) => {
+                const el = [...document.querySelectorAll('button,a,li,span,div')].find(
+                    e => e.children.length === 0 &&
+                         (e.textContent||'').trim() === String(n) &&
+                         e.offsetParent !== null);
+                if (el) { el.scrollIntoView({block:'center'}); el.click(); return true; }
+                return false;
+            }""", page_no))
+    except Exception:
+        return False
 
 
 def scrape_group(pg, gid: str, label: str, ts: str) -> list[Row]:

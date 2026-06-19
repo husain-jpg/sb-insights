@@ -84,7 +84,8 @@ class Row:
 def _ctx(headless: bool):
     from playwright.sync_api import sync_playwright
     pw = sync_playwright().start()
-    b = pw.chromium.launch(headless=headless)
+    b = pw.chromium.launch(headless=headless,
+                           args=["--no-sandbox", "--disable-dev-shm-usage"])
     pg = b.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/124.0.0.0 Safari/537.36",
