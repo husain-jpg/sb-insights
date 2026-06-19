@@ -3102,12 +3102,18 @@ async function renderPriceComparison(sbStore) {
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap;cursor:pointer;">
             <input type="checkbox" id="cmp-overlap-only" checked> Overlap only
           </label>
+          ${excelButtonHtml("cmp-excel-btn")}
         </div>
       </div>
       <div class="card"><div id="comp-cmp-table"></div></div>`;
     apply();
     document.getElementById("cmp-comp-filter").addEventListener("change", e => { compFilter = e.target.value; apply(); });
     document.getElementById("cmp-overlap-only").addEventListener("change", e => { onlyOverlap = e.target.checked; apply(); });
+    document.getElementById("cmp-excel-btn").addEventListener("click", () => {
+      const params = new URLSearchParams({ sb_store: sbStore, overlap_only: onlyOverlap ? "true" : "false" });
+      if (compFilter) params.set("competitor", compFilter);
+      downloadUrl(`/api/export/competitor-comparison?${params.toString()}`);
+    });
   } catch (e) {
     el.innerHTML = `<div class="hint-box">Comparison unavailable: ${escapeHtml(String((e && e.message) || e))}</div>`;
   }

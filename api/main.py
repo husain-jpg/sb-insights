@@ -3784,6 +3784,52 @@ def export_competitor_prices(
     return _xlsx_response(xlsx, fname)
 
 
+@app.get("/api/export/competitor-comparison")
+def export_competitor_comparison(
+    sb_store: str,
+    competitor: str | None = None,
+    overlap_only: bool = True,
+    request: Request = None,
+) -> Response:
+    """Excel of the price-comparison view for a store, mirroring the on-screen
+    competitor filter + 'overlap only' toggle."""
+    data = competitor_comparison(sb_store=sb_store, request=request)
+    items = data["items"]
+    if competitor:
+        items = [r for r in items if r["competitor"] == competitor]
+    if overlap_only:
+        items = [r for r in items if r["overlap"]]
+    for r in items:
+        r["position"] = ("OVERPRICED" if r["we_are_higher"]
+                         else "at/below" if r["overlap"] else "")
+
+    columns = [
+        {"key": "competitor", "label": "Competitor"},
+        {"key": "brand", "label": "Brand"},
+        {"key": "product", "label": "Product"},
+        {"key": "category", "label": "Category"},
+        {"key": "size", "label": "Size"},
+        {"key": "their_price", "label": "Their Price", "format": "currency"},
+        {"key": "our_price", "label": "Our Price", "format": "currency"},
+        {"key": "delta", "label": "Over by (vs them)", "format": "currency"},
+        {"key": "position", "label": "Position"},
+    ]
+    sub = [f"Store {sb_store}"]
+    if competitor:
+        sub.append(competitor)
+    sub.append("overlap only" if overlap_only else "full menu")
+    subtitle = "  ·  ".join(sub) + f"  ·  {len(items)} rows"
+    xlsx = build_workbook(
+        sheet_name="Price Comparison",
+        title="SB Insights — Competitor Price Comparison",
+        subtitle=subtitle, columns=columns, rows=items,
+    )
+    fname = (f"PriceComparison_{sb_store}"
+             f"{'_' + competitor.replace(' ', '') if competitor else ''}"
+             f"_{_today_str()}.xlsx")
+    return _xlsx_response(xlsx, fname)
+
+
 def _locations_short_map() -> dict:
     """Cached {store_id: short_name} lookup for enriching exports."""
     with db() as conn:
