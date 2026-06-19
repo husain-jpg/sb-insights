@@ -3066,9 +3066,15 @@ async function renderPriceComparison(sbStore) {
     ];
     let onlyOverlap = true, compFilter = "";
     const apply = () => {
-      let rows = d.items;
-      if (compFilter) rows = rows.filter(r => r.competitor === compFilter);
-      if (onlyOverlap) rows = rows.filter(r => r.overlap);
+      // Scope = the selected competitor (or all). The summary counts reflect this
+      // scope; the "Overlap only" toggle only changes which rows are shown.
+      const scope = compFilter ? d.items.filter(r => r.competitor === compFilter) : d.items;
+      const sum = document.getElementById("cmp-summary");
+      if (sum) sum.innerHTML =
+        `You both carry <strong>${scope.filter(r => r.overlap).length}</strong> products · `
+        + `priced above them on <strong>${scope.filter(r => r.we_are_higher).length}</strong> · `
+        + `${scope.length.toLocaleString()} on their menu`;
+      let rows = onlyOverlap ? scope.filter(r => r.overlap) : scope.slice();
       // overlap first (biggest overprice first), then the rest of their menu
       rows = rows.slice().sort((a, b) =>
         (a.overlap !== b.overlap) ? (a.overlap ? -1 : 1)
@@ -3080,7 +3086,7 @@ async function renderPriceComparison(sbStore) {
       <div class="section-header" style="margin-bottom: 8px">
         <div>
           <div class="kicker">Price comparison</div>
-          <h3 style="margin: 4px 0 0">You both carry <strong>${d.overlap_count}</strong> products · priced above them on <strong>${d.higher_count}</strong> · ${d.total_count.toLocaleString()} on their menu</h3>
+          <h3 style="margin: 4px 0 0" id="cmp-summary"></h3>
         </div>
         <div class="controls-row">
           <select id="cmp-comp-filter">
