@@ -2997,8 +2997,17 @@ async function renderCompetitors() {
     main.innerHTML = `
       <div class="section-header">
         <div>
-          <div class="kicker">Competitor Market Pricing</div>
-          <h2>What are they charging?</h2>
+          <div class="kicker">Competitor Intelligence</div>
+          <h2>Where can we cut to compete?</h2>
+        </div>
+      </div>
+
+      <div id="comp-comparison" style="margin-bottom: 24px;"></div>
+
+      <div class="section-header">
+        <div>
+          <div class="kicker">All competitor prices</div>
+          <h3 style="margin: 2px 0 0">What are they charging? — searchable</h3>
         </div>
         <div class="controls-row">
           <select id="comp-competitor-filter">
@@ -3013,8 +3022,6 @@ async function renderCompetitors() {
           ${excelButtonHtml("comp-excel-btn")}
         </div>
       </div>
-
-      <div id="comp-comparison" style="margin-bottom: 18px;"></div>
 
       <div class="card">
         <div class="summary-bar" id="comp-summary">${renderSummary(data)}</div>

@@ -3220,6 +3220,16 @@ def competitor_prices(
 
 
 # --- competitor price comparison (our shelf price vs the competitors') --------
+# Format/descriptor words to drop from product names so the same product matches
+# across retailers despite naming differences ("510 Thread Cartridge" vs "510 Cart").
+_COMP_STOP = set(
+    "510 thread threads cartridge cart carts milled live resin rosin distillate "
+    "disposable disposables all in one allinone aio pre roll preroll prerolls blunt "
+    "blunts infused full spectrum fse hash oil oils capsule capsules softgel softgels "
+    "gummies gummy gummie chew chews soft beverage drink sparkler seltzer sativa indica "
+    "hybrid blend cbd thc cbn by the and a x pack new".split())
+
+
 def _norm_brand(b: str) -> str:
     import re
     return re.sub(r"[^a-z0-9]", "", (b or "").lower())
@@ -3232,45 +3242,53 @@ def _norm_size(*texts) -> str:
     return (m.group(1) + m.group(2).lower()) if m else ""
 
 
-def _norm_name(n: str, brand: str = "") -> str:
+def _name_tokens(title: str, brand: str) -> frozenset:
+    """Distinctive product-name tokens: strip the 'Brand -'/'Brand |' prefix, the
+    [size]/(...) bits, brand words, and format/descriptor words, leaving the core
+    name so the same product matches across retailers."""
     import re
-    n = (n or "").lower()
-    if "|" in n:                       # our names are "Brand | Product [size]"
-        n = n.split("|", 1)[1]
-    n = re.sub(r"\[[^\]]*\]", " ", n)   # drop "[3.5g]"
-    n = re.sub(r"\b(indica|sativa|hybrid|blend|new)\b", " ", n)
+    n = (title or "").lower()
+    bl = (brand or "").lower().strip()
+    if bl and n.startswith(bl):
+        n = n[len(bl):]
+    n = re.sub(r"^[\s|\-–:]+", "", n)
+    n = re.sub(r"\[[^\]]*\]", " ", n)
+    n = re.sub(r"\([^)]*\)", " ", n)
     n = re.sub(r"[^a-z0-9 ]", " ", n)
-    for w in (brand or "").lower().split():
-        n = re.sub(rf"\b{re.escape(w)}\b", " ", n)
-    return re.sub(r"\s+", " ", n).strip()
+    bw = set(re.sub(r"[^a-z0-9 ]", " ", bl).split())
+    toks = [w for w in n.split()
+            if w not in _COMP_STOP and w not in bw
+            and not re.fullmatch(r"\d+\.?\d*(g|mg|ml)?", w)]
+    return frozenset(toks)
 
 
 @app.get("/api/competitor-comparison")
 def competitor_comparison(sb_store: str, request: Request = None) -> dict:
-    """Head-to-head: match our shelf products to the competitors' (by brand +
-    normalized name + size) for one store, and flag where we're priced ABOVE the
-    cheapest competitor — i.e. discount opportunities. Built for the Bradford
-    discount play; works for any store with competitor data."""
+    """Head-to-head: match our shelf products to the competitors' — same brand +
+    size, with a token-subset match on the distinctive product name (tolerates
+    naming differences) — and flag where we're priced ABOVE the cheapest
+    competitor: discount opportunities. Works for any store with competitor data."""
     require_user(request)
     with db() as conn:
         conn.row_factory = sqlite3.Row
-        # our products at this store (skip 999 placeholder / no-price rows)
+        # our products, deduped by (brand, size, name-tokens), cheapest kept
         ours: dict = {}
         for r in conn.execute(
             """SELECT pr.brand, pr.name, pr.size, p.regular_price, p.sale_price
                FROM prices p JOIN products pr ON pr.sku = p.sku
                WHERE p.location_id = ? AND p.regular_price IS NOT NULL
                      AND p.regular_price < 900""", (sb_store,)):
-            key = (_norm_brand(r["brand"]), _norm_name(r["name"], r["brand"]),
-                   _norm_size(r["size"], r["name"]))
-            if not (key[1] and key[2]):
+            toks = _name_tokens(r["name"], r["brand"])
+            bkey = (_norm_brand(r["brand"]), _norm_size(r["size"], r["name"]))
+            if not (toks and bkey[1]):
                 continue
             price = r["sale_price"] or r["regular_price"]
-            if key not in ours or price < ours[key]["our_price"]:
-                ours[key] = {"brand": r["brand"], "name": r["name"],
-                             "size": key[2], "our_price": price}
-        # latest competitor snapshot per variant
-        comp: dict = {}
+            k = (bkey, toks)
+            if k not in ours or price < ours[k]["our_price"]:
+                ours[k] = {"bkey": bkey, "tokens": toks, "brand": r["brand"],
+                           "name": r["name"], "size": bkey[1], "our_price": price}
+        # latest competitor snapshot per variant, indexed by (brand, size)
+        comp_idx: dict = {}
         for r in conn.execute(
             """SELECT competitor_name, vendor, product_title, variant_size, price FROM (
                    SELECT *, ROW_NUMBER() OVER (
@@ -3279,22 +3297,27 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
                    FROM competitor_prices
                    WHERE sb_competes_with = ? AND price IS NOT NULL
                          AND variant_size <> 'multi') WHERE rn = 1""", (sb_store,)):
-            key = (_norm_brand(r["vendor"]), _norm_name(r["product_title"], r["vendor"]),
-                   _norm_size(r["variant_size"]))
-            if key[1] and key[2]:
-                comp.setdefault(key, {})
-                prev = comp[key].get(r["competitor_name"])
-                if prev is None or r["price"] < prev:
-                    comp[key][r["competitor_name"]] = r["price"]
+            toks = _name_tokens(r["product_title"], r["vendor"])
+            bkey = (_norm_brand(r["vendor"]), _norm_size(r["variant_size"]))
+            if toks and bkey[1]:
+                comp_idx.setdefault(bkey, []).append(
+                    {"tokens": toks, "competitor": r["competitor_name"], "price": r["price"]})
         items = []
-        for key, o in ours.items():
-            theirs = comp.get(key)
+        for o in ours.values():
+            theirs: dict = {}
+            for cnd in comp_idx.get(o["bkey"], []):
+                ot, ct = o["tokens"], cnd["tokens"]
+                if (ot <= ct or ct <= ot) and (ot & ct):   # token-subset, ≥1 shared
+                    cn = cnd["competitor"]
+                    if cn not in theirs or cnd["price"] < theirs[cn]:
+                        theirs[cn] = cnd["price"]
             if not theirs:
                 continue
             mn = min(theirs.values())
             items.append({
-                **o, "competitors": theirs, "min_competitor": mn,
-                "delta": round(o["our_price"] - mn, 2),
+                "brand": o["brand"], "name": o["name"], "size": o["size"],
+                "our_price": o["our_price"], "competitors": theirs,
+                "min_competitor": mn, "delta": round(o["our_price"] - mn, 2),
                 "we_are_higher": o["our_price"] > mn,
             })
         items.sort(key=lambda x: -x["delta"])
