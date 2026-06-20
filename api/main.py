@@ -3329,14 +3329,20 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
                             rebate = orebate
             overlap = our_price is not None
             rebate_pct = rebate[0] if rebate else None
+            # BudClub members get 5% off our retail; show that effective price and
+            # whether it still sits above the competitor.
+            budclub = round(our_price * 0.95, 2) if overlap else None
             items.append({
                 "competitor": r["competitor_name"], "brand": r["vendor"],
                 "product": r["product_title"], "category": r["product_type"],
                 "size": r["variant_size"], "their_price": r["price"],
                 "our_price": our_price,
                 "delta": round(our_price - r["price"], 2) if overlap else None,
+                "budclub_price": budclub,
+                "budclub_delta": round(budclub - r["price"], 2) if overlap else None,
                 "overlap": overlap,
                 "we_are_higher": bool(overlap and our_price > r["price"]),
+                "budclub_higher": bool(overlap and budclub > r["price"]),
                 "rebate_pct": rebate_pct,
                 "rebate_collective": rebate[1] if rebate else None,
                 "rebate_room": (round(our_price * rebate_pct / 100, 2)
@@ -3840,6 +3846,8 @@ def export_competitor_comparison(
         {"key": "their_price", "label": "Their Price", "format": "currency"},
         {"key": "our_price", "label": "Our Price", "format": "currency"},
         {"key": "delta", "label": "Over by (vs them)", "format": "currency"},
+        {"key": "budclub_price", "label": "BudClub (-5%)", "format": "currency"},
+        {"key": "budclub_delta", "label": "BudClub over by", "format": "currency"},
         {"key": "rebate_collective", "label": "Collective"},
         {"key": "rebate_pct", "label": "Rebate %"},
         {"key": "rebate_room", "label": "Rebate room ($)", "format": "currency"},

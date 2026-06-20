@@ -3063,6 +3063,9 @@ async function renderPriceComparison(sbStore) {
       { key: 'delta', label: 'Δ vs them', type: 'number', align: 'right',
         render: r => r.delta == null ? ''
           : `<span class="tag ${r.we_are_higher ? 'tag-critical' : ''}">${r.delta > 0 ? '+' : ''}${fmt$2(r.delta)}</span>` },
+      { key: 'budclub_price', label: 'BudClub −5%', type: 'number', align: 'right',
+        render: r => r.budclub_price == null ? ''
+          : `${fmt$2(r.budclub_price)} <span class="tag ${r.budclub_higher ? 'tag-critical' : ''}" style="font-size:.85em">${r.budclub_delta > 0 ? '+' : ''}${fmt$2(r.budclub_delta)}</span>` },
       { key: 'rebate_pct', label: 'Rebate (room to cut)', type: 'number', align: 'right',
         render: r => r.rebate_pct
           ? `<span class="tag" style="background:#dcfce7;color:#166534;border:1px solid #86efac">${escapeHtml(r.rebate_collective || '')} ${r.rebate_pct}% · ${fmt$2(r.rebate_room)}</span>`
