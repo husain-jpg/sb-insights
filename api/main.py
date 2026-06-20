@@ -3272,10 +3272,22 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
     require_user(request)
     with db() as conn:
         conn.row_factory = sqlite3.Row
-        # our products indexed by (brand, size) -> [(name-tokens, price)]
+        # active collective rebates (revenue-share %) keyed by OCS variant number
+        from datetime import date as _date
+        today = _date.today().isoformat()
+        rebate_by_ocs: dict = {}
+        for r in conn.execute(
+            """SELECT sku_filter, percentage FROM data_revenue_deals
+               WHERE sku_filter IS NOT NULL AND percentage IS NOT NULL
+                     AND start_date <= ? AND end_date >= ?""", (today, today)):
+            sf = r["sku_filter"]
+            if sf not in rebate_by_ocs or r["percentage"] > rebate_by_ocs[sf]:
+                rebate_by_ocs[sf] = r["percentage"]
+        # our products indexed by (brand, size) -> [(name-tokens, price, rebate%)]
         ours_idx: dict = {}
         for r in conn.execute(
-            """SELECT pr.brand, pr.name, pr.size, p.regular_price, p.sale_price
+            """SELECT pr.brand, pr.name, pr.size, pr.ocs_variant_number,
+                      p.regular_price, p.sale_price
                FROM prices p JOIN products pr ON pr.sku = p.sku
                WHERE p.location_id = ? AND p.regular_price IS NOT NULL
                      AND p.regular_price < 900""", (sb_store,)):
@@ -3283,7 +3295,8 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
             bkey = (_norm_brand(r["brand"]), _norm_size(r["size"], r["name"]))
             if toks and bkey[1]:
                 ours_idx.setdefault(bkey, []).append(
-                    (toks, r["sale_price"] or r["regular_price"]))
+                    (toks, r["sale_price"] or r["regular_price"],
+                     rebate_by_ocs.get(r["ocs_variant_number"])))
         # every latest competitor product, annotated with our matching price
         items = []
         competitors = set()
@@ -3300,11 +3313,14 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
             ctoks = _name_tokens(r["product_title"], r["vendor"])
             bkey = (_norm_brand(r["vendor"]), _norm_size(r["variant_size"]))
             our_price = None
+            rebate_pct = None
             if ctoks and bkey[1]:
-                for otoks, oprice in ours_idx.get(bkey, []):
+                for otoks, oprice, orebate in ours_idx.get(bkey, []):
                     if (otoks <= ctoks or ctoks <= otoks) and (otoks & ctoks):
                         if our_price is None or oprice < our_price:
                             our_price = oprice
+                        if orebate is not None and (rebate_pct is None or orebate > rebate_pct):
+                            rebate_pct = orebate
             overlap = our_price is not None
             items.append({
                 "competitor": r["competitor_name"], "brand": r["vendor"],
@@ -3314,6 +3330,9 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
                 "delta": round(our_price - r["price"], 2) if overlap else None,
                 "overlap": overlap,
                 "we_are_higher": bool(overlap and our_price > r["price"]),
+                "rebate_pct": rebate_pct,
+                "rebate_room": (round(our_price * rebate_pct / 100, 2)
+                               if (overlap and rebate_pct) else None),
             })
         # overlap first (biggest overprice first), then the rest of their menu
         items.sort(key=lambda x: (not x["overlap"],
@@ -3328,6 +3347,7 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
         "in_stock_count": in_stock_count,
         "overlap_count": sum(1 for i in items if i["overlap"]),
         "higher_count": sum(1 for i in items if i["we_are_higher"]),
+        "rebate_count": sum(1 for i in items if i.get("rebate_pct")),
         "total_count": len(items),
         "items": items,
     }
@@ -3812,6 +3832,8 @@ def export_competitor_comparison(
         {"key": "their_price", "label": "Their Price", "format": "currency"},
         {"key": "our_price", "label": "Our Price", "format": "currency"},
         {"key": "delta", "label": "Over by (vs them)", "format": "currency"},
+        {"key": "rebate_pct", "label": "Rebate %"},
+        {"key": "rebate_room", "label": "Rebate room ($)", "format": "currency"},
         {"key": "position", "label": "Position"},
     ]
     sub = [f"Store {sb_store}"]

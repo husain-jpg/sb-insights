@@ -3063,6 +3063,10 @@ async function renderPriceComparison(sbStore) {
       { key: 'delta', label: 'Δ vs them', type: 'number', align: 'right',
         render: r => r.delta == null ? ''
           : `<span class="tag ${r.we_are_higher ? 'tag-critical' : ''}">${r.delta > 0 ? '+' : ''}${fmt$2(r.delta)}</span>` },
+      { key: 'rebate_pct', label: 'Rebate (room to cut)', type: 'number', align: 'right',
+        render: r => r.rebate_pct
+          ? `<span class="tag" style="background:#dcfce7;color:#166534;border:1px solid #86efac">${r.rebate_pct}% · ${fmt$2(r.rebate_room)}</span>`
+          : '' },
     ];
     let onlyOverlap = true, compFilter = "";
     const apply = () => {
@@ -3071,6 +3075,7 @@ async function renderPriceComparison(sbStore) {
       const scope = compFilter ? d.items.filter(r => r.competitor === compFilter) : d.items;
       const overlapN = scope.filter(r => r.overlap).length;
       const higherN = scope.filter(r => r.we_are_higher).length;
+      const primeN = scope.filter(r => r.we_are_higher && r.rebate_pct).length;
       const pct = overlapN ? Math.round(higherN / overlapN * 100) : 0;
       const sum = document.getElementById("cmp-summary");
       if (sum) sum.innerHTML =
@@ -3078,6 +3083,7 @@ async function renderPriceComparison(sbStore) {
         + `<li><strong>${(d.in_stock_count || 0).toLocaleString()}</strong> SKUs in stock currently</li>`
         + `<li>Overlap with them: <strong>${overlapN}</strong></li>`
         + `<li>Overpriced on <strong>${higherN}</strong> (<strong>${pct}%</strong> of overlap)</li>`
+        + `<li><strong>${primeN}</strong> overpriced <em>and</em> on a collective rebate — prime to cut</li>`
         + `<li><strong>${scope.length.toLocaleString()}</strong> products on their menu</li>`
         + `</ul>`;
       let rows = onlyOverlap ? scope.filter(r => r.overlap) : scope.slice();
