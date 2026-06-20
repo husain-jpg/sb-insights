@@ -3272,17 +3272,23 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
     require_user(request)
     with db() as conn:
         conn.row_factory = sqlite3.Row
-        # active collective rebates (revenue-share %) keyed by OCS variant number
+        # active collective rebates keyed by OCS variant number -> (pct, collective).
+        # data_revenue_deals.brand_id points at the COLLECTIVE in brand_partners
+        # (Canna Collective / IRCC / Seeker), not the product brand.
         from datetime import date as _date
         today = _date.today().isoformat()
+        coll_name = {r["id"]: r["brand_name"]
+                     for r in conn.execute("SELECT id, brand_name FROM brand_partners")}
         rebate_by_ocs: dict = {}
         for r in conn.execute(
-            """SELECT sku_filter, percentage FROM data_revenue_deals
+            """SELECT sku_filter, percentage, brand_id FROM data_revenue_deals
                WHERE sku_filter IS NOT NULL AND percentage IS NOT NULL
                      AND start_date <= ? AND end_date >= ?""", (today, today)):
             sf = r["sku_filter"]
-            if sf not in rebate_by_ocs or r["percentage"] > rebate_by_ocs[sf]:
-                rebate_by_ocs[sf] = r["percentage"]
+            pct = round(r["percentage"], 2)   # source has float noise (7.0000001)
+            cur = rebate_by_ocs.get(sf)
+            if cur is None or pct > cur[0]:
+                rebate_by_ocs[sf] = (pct, coll_name.get(r["brand_id"]))
         # our products indexed by (brand, size) -> [(name-tokens, price, rebate%)]
         ours_idx: dict = {}
         for r in conn.execute(
@@ -3313,15 +3319,16 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
             ctoks = _name_tokens(r["product_title"], r["vendor"])
             bkey = (_norm_brand(r["vendor"]), _norm_size(r["variant_size"]))
             our_price = None
-            rebate_pct = None
+            rebate = None  # (pct, collective)
             if ctoks and bkey[1]:
                 for otoks, oprice, orebate in ours_idx.get(bkey, []):
                     if (otoks <= ctoks or ctoks <= otoks) and (otoks & ctoks):
                         if our_price is None or oprice < our_price:
                             our_price = oprice
-                        if orebate is not None and (rebate_pct is None or orebate > rebate_pct):
-                            rebate_pct = orebate
+                        if orebate is not None and (rebate is None or orebate[0] > rebate[0]):
+                            rebate = orebate
             overlap = our_price is not None
+            rebate_pct = rebate[0] if rebate else None
             items.append({
                 "competitor": r["competitor_name"], "brand": r["vendor"],
                 "product": r["product_title"], "category": r["product_type"],
@@ -3331,6 +3338,7 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
                 "overlap": overlap,
                 "we_are_higher": bool(overlap and our_price > r["price"]),
                 "rebate_pct": rebate_pct,
+                "rebate_collective": rebate[1] if rebate else None,
                 "rebate_room": (round(our_price * rebate_pct / 100, 2)
                                if (overlap and rebate_pct) else None),
             })
@@ -3832,6 +3840,7 @@ def export_competitor_comparison(
         {"key": "their_price", "label": "Their Price", "format": "currency"},
         {"key": "our_price", "label": "Our Price", "format": "currency"},
         {"key": "delta", "label": "Over by (vs them)", "format": "currency"},
+        {"key": "rebate_collective", "label": "Collective"},
         {"key": "rebate_pct", "label": "Rebate %"},
         {"key": "rebate_room", "label": "Rebate room ($)", "format": "currency"},
         {"key": "position", "label": "Position"},

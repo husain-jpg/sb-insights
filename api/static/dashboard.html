@@ -3065,7 +3065,7 @@ async function renderPriceComparison(sbStore) {
           : `<span class="tag ${r.we_are_higher ? 'tag-critical' : ''}">${r.delta > 0 ? '+' : ''}${fmt$2(r.delta)}</span>` },
       { key: 'rebate_pct', label: 'Rebate (room to cut)', type: 'number', align: 'right',
         render: r => r.rebate_pct
-          ? `<span class="tag" style="background:#dcfce7;color:#166534;border:1px solid #86efac">${r.rebate_pct}% · ${fmt$2(r.rebate_room)}</span>`
+          ? `<span class="tag" style="background:#dcfce7;color:#166534;border:1px solid #86efac">${escapeHtml(r.rebate_collective || '')} ${r.rebate_pct}% · ${fmt$2(r.rebate_room)}</span>`
           : '' },
     ];
     let onlyOverlap = true, compFilter = "";
