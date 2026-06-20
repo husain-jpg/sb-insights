@@ -1,17 +1,20 @@
 """
 Scrape the Beaverton Cannabis — BRADFORD menu for competitive pricing.
 
-Bradford is the downtown competitor for SB's Bradford store (S3). The menu is a
-React SPA (TechPOS) at beavertoncannabis.ca/shop/bradford-3 — products render in
-the DOM but the markup uses hashed CSS-module class names, so we scrape by
-structure (each product card has an image, a price, and an Add-to-cart button)
-rather than by class. Output is a competitor_*.csv that import_competitor_prices.py
-loads into competitor_prices, tagged sb_competes_with = "S3".
+Bradford is the downtown competitor for SB's Bradford store (S3). The site is a
+React SPA (TechPOS) at beavertoncannabis.ca/shop/bradford-3, backed by a JSON
+API at dceapi.techpos.ca. The menu's product grid is served by
+  POST https://dceapi.techpos.ca/website/api/products/filterProducts
+which returns clean product JSON (brand, name, category, price, size) and the
+true total record count — so we call that API directly with a large PageSize
+instead of scraping the DOM pager. The API only needs a `domain` header to pick
+the tenant; no auth/cookies, so no browser is required.
 
-Usage (from terroir-ops root, needs: pip install playwright; playwright install chromium):
-    python jobs/scrape_beaverton_bradford.py            # scrape all groups -> CSV
-    python jobs/scrape_beaverton_bradford.py --debug 20 # dump one group's raw cards
-    python jobs/scrape_beaverton_bradford.py --watch     # visible browser
+Output is a competitor_*.csv that import_competitor_prices.py loads into
+competitor_prices, tagged sb_competes_with = "S3".
+
+    python jobs/scrape_beaverton_bradford.py            # full menu -> CSV
+    python jobs/scrape_beaverton_bradford.py --debug    # print totals + samples
 """
 from __future__ import annotations
 
@@ -27,52 +30,33 @@ from pathlib import Path
 
 BASE = "https://beavertoncannabis.ca"
 BRANCH = "bradford-3"                       # = TechPOS branchId 3
+BRANCH_ID = "3"
 COMPETITOR_NAME = "Beaverton Cannabis (Bradford)"
 SB_COMPETES_WITH = "S3"                     # SB Bradford
-HOME_URL = f"{BASE}/shop/{BRANCH}/homepage"
-GROUP_URL = f"{BASE}/shop/{BRANCH}/menu?productgroupid={{gid}}"
+
+API_URL = "https://dceapi.techpos.ca/website/api/products/filterProducts"
+API_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "domain": "beavertoncannabis.ca",       # tenant selector — required, else 500
+    "timezone_offset": "240",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+}
+PAGE_SIZE = 250                             # 1000 is rejected (500); 250 is fine
 
 OUTPUT_DIR = Path("imports")
-SHOT_DIR = Path("powerbi_shots")           # reuse the gitignored diagnostics dir
 
-# JS run in the page to pull one row per product card. Resilient to hashed class
-# names: find each Add-to-cart/Select-size button, climb to the card ancestor
-# (the first ancestor that has an <img> AND a price), and return its text + image.
-EXTRACT_JS = r"""
-() => {
-  const norm = s => (s || '').replace(/ /g,' ').replace(/[ \t]+/g,' ').trim();
-  const priceRe = /\$\s?\d+(?:\.\d{2})?/;
-  const cards = new Set();
-  document.querySelectorAll('button, a').forEach(btn => {
-    const t = norm(btn.textContent).toLowerCase();
-    if (t.includes('add to cart') || t.includes('select size') || t.includes('sold out')) {
-      let n = btn;
-      for (let i = 0; i < 8 && n.parentElement; i++) {
-        n = n.parentElement;
-        if (n.querySelector('img') && priceRe.test(n.textContent || '')) { cards.add(n); break; }
-      }
-    }
-  });
-  // Drop the grid/false-positives: keep only leaf cards (a card that does not
-  // contain another candidate card).
-  const arr = [...cards];
-  const leaves = arr.filter(c => !arr.some(o => o !== c && c.contains(o)));
-  return leaves.map(card => {
-    const img = card.querySelector('img');
-    const lines = (card.innerText || '').split('\n').map(norm).filter(Boolean);
-    const prices = (card.innerText || '').match(/\$\s?\d+(?:\.\d{2})?(?:\s*\/\s*[^\s,]+)?/g) || [];
-    return { lines, prices, img: img ? (img.getAttribute('alt') || '') : '', raw: card.innerText };
-  });
-}
-"""
+_SIZE_RE = re.compile(
+    r"(\d+\.?\d*)\s?(g|mg|ml|pk|pack|seeds?|caps?|capsules?)\b", re.I)
 
 
 @dataclass
 class Row:
     competitor_name: str
     sb_competes_with: str
-    collection: str           # product group id
-    collection_label: str     # product group / category name
+    collection: str           # category id
+    collection_label: str     # category name
     product_id: str
     product_handle: str
     product_title: str
@@ -89,211 +73,140 @@ class Row:
     scraped_at: str
 
 
-def _ctx(headless: bool):
-    from playwright.sync_api import sync_playwright
-    pw = sync_playwright().start()
-    b = pw.chromium.launch(headless=headless,
-                           args=["--no-sandbox", "--disable-dev-shm-usage"])
-    pg = b.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/124.0.0.0 Safari/537.36",
-                    viewport={"width": 1500, "height": 1200})
-    return pw, b, pg
+def _body(page: int, page_size: int = PAGE_SIZE) -> dict:
+    """The exact filterProducts payload the site sends; ProductGroupId=null pulls
+    the whole menu (every category) in one paginated stream."""
+    return {
+        "ProductGroupId": None, "Category": "", "SortId": 1,
+        "Page": page, "PageSize": page_size, "SearchText": "",
+        "Brand": [], "Weight": [], "Species": [], "BranchId": BRANCH_ID,
+        "Terpene": "", "Mood": "", "SubCategory": "",
+        "THCMAX": 100, "THCMIN": 0, "CBDMAX": 100, "CBDMIN": 0,
+        "FromExpressCheckout": False, "OnSale": False,
+        "ShowOnlyOutOfStock": False, "CategoryId": None, "CampaignId": 0,
+    }
 
 
-def get_groups(pg) -> list[tuple[str, str]]:
-    """Return [(group_id, label)] from the Bradford homepage's category links."""
-    pg.goto(HOME_URL, wait_until="networkidle", timeout=60_000)
-    pg.wait_for_timeout(3000)
-    pairs = pg.eval_on_selector_all(
-        "a[href*='productgroupid=']",
-        "els => els.map(e => [ (e.getAttribute('href').match(/productgroupid=(\\d+)/)||[])[1],"
-        "                       (e.innerText||'').trim() ])")
-    out, seen = [], set()
-    for gid, label in pairs:
-        if gid and gid not in seen:
-            seen.add(gid)
-            label = re.sub(r"^\s*Shop\s*", "", label or "").strip() or f"group {gid}"
-            out.append((gid, label))
-    return out
+def _fetch_page(session, page: int) -> dict:
+    """POST one page; return the `data` object ({products, totalRecords, ...})."""
+    last = None
+    for attempt in range(3):
+        try:
+            r = session.post(API_URL, headers=API_HEADERS, json=_body(page), timeout=30)
+            r.raise_for_status()
+            j = r.json()
+            if not j.get("success", True) and j.get("errors"):
+                raise RuntimeError(j["errors"])
+            return j.get("data") or {}
+        except Exception as e:           # transient network/5xx — back off and retry
+            last = e
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"filterProducts page {page} failed: {last}")
 
 
-def _scroll_all(pg) -> None:
-    """Lazy-load: scroll to the bottom until the height stops growing."""
-    last = -1
-    for _ in range(40):
-        h = pg.evaluate("document.body.scrollHeight")
-        if h == last:
-            break
-        last = h
-        pg.mouse.wheel(0, 6000)
-        pg.wait_for_timeout(900)
+def _size_from_name(name: str) -> str | None:
+    """The consumer-facing pack size lives in the product name (e.g. '… - 3.5g',
+    '510 Thread Cartridge - 1g'); take the last weight/count token. This matches
+    how our own product names are sized, so the comparison matcher lines up."""
+    m = _SIZE_RE.findall(name or "")
+    if not m:
+        return None
+    amt, unit = m[-1]
+    unit = unit.lower()
+    unit = {"pack": "pk", "capsule": "caps", "capsules": "caps",
+            "seed": "seeds"}.get(unit, unit)
+    return f"{amt}{unit}"
 
 
-def _money(s: str) -> float | None:
-    m = re.search(r"\d+(?:\.\d{2})?", s or "")
-    return float(m.group()) if m else None
-
-
-def parse_card(card: dict, gid: str, label: str, ts: str) -> Row | None:
-    """Turn one extracted card into a Row. From the live markup, each card holds:
-      species badge, THC/CBD badges, "<Brand> - <Name>", "<Brand>",
-      "$<pack price>", "/<pack size>", "$<per-gram> /g", "Excl. Tax", button
-    The image alt = the clean product name; the pack price (size like 3.5g/7g) is
-    the real price — NOT the per-gram (/g) figure."""
-    lines = card.get("lines", [])
-    raw = card.get("raw", "")
-    name = (card.get("img") or "").strip()
-    if not name:  # fallback: the line containing "Brand - Name"
-        name = next((ln for ln in lines if " - " in ln), "")
+def parse_product(p: dict, ts: str) -> Row | None:
+    name = (p.get("name") or "").replace(" ", " ").strip()
     if not name:
         return None
+    brand = (p.get("brand") or "").strip() or None
+    pr = p.get("price") or {}
+    reg = pr.get("price")
+    sell = pr.get("discountedPrice")
+    if sell is None:
+        sell = reg
+    if sell is None:
+        return None
+    # on sale → discountedPrice is the shelf price, regular price is the strike-through
+    compare_at = reg if (reg is not None and sell is not None and reg > sell) else None
 
-    # Brand = the short line right after the name line (e.g. "Redecan").
-    brand = None
-    if name in lines:
-        i = lines.index(name)
-        for ln in lines[i + 1:]:
-            low = ln.lower()
-            if re.search(r"\$\s?\d", ln) or low in ("excl. tax", "add to cart", "select size"):
-                break
-            brand = ln
-            break
+    cat = (p.get("category") or "").strip() or None
+    size = _size_from_name(name)
+    if not size and p.get("weightPerUnit"):
+        wpu = p["weightPerUnit"]
+        size = f"{wpu:g}g" if p.get("measurementType") == 2 else str(wpu)
 
-    # Separate pack prices (size starts with a digit, e.g. /3.5g, /7g, /28g) from
-    # the per-gram price (/g). The pack price is what the store charges.
-    pack = []          # (amount, size)
-    for p in card.get("prices", []):
-        amt = _money(p)
-        if amt is None:
-            continue
-        msz = re.search(r"/\s*(\d[\w.]*)", p)        # /7g, /3.5g, /1g …
-        if msz:
-            pack.append((amt, msz.group(1)))
-    multi = "select size" in raw.lower()
-    if pack:
-        pack.sort(key=lambda x: x[0])
-        price, size = pack[0]
-        compare_at = pack[-1][0] if len(pack) > 1 and pack[-1][0] > price else None
-    elif multi:
-        # multi-variant card shows "from $X / g" — capture as a from-price marker.
-        price = _money(next((p for p in card.get("prices", [])), ""))
-        size, compare_at = "multi", None
-    else:
-        # No sized price (edibles/beverages/accessories): the FIRST price listed is
-        # the product price; any smaller one after it is a per-unit figure.
-        amts = [a for a in (_money(p) for p in card.get("prices", [])) if a is not None]
-        if not amts:
-            return None
-        price, size, compare_at = amts[0], None, None
+    q = p.get("quantity")
+    available = (q is None) or (q > 0)
     vid = hashlib.sha1(f"{BRANCH}|{brand}|{name}|{size}".encode()).hexdigest()[:16]
     return Row(
         competitor_name=COMPETITOR_NAME, sb_competes_with=SB_COMPETES_WITH,
-        collection=gid, collection_label=label,
+        collection=str(p.get("categoryId") or ""), collection_label=cat or "Menu",
         product_id=hashlib.sha1(f"{BRANCH}|{brand}|{name}".encode()).hexdigest()[:16],
-        product_handle="", product_title=name, vendor=brand, product_type=label,
-        variant_id=vid, variant_sku=None, variant_title=size, variant_size=size,
-        price=price, compare_at_price=compare_at,
-        available=("sold out" not in card.get("raw", "").lower()),
-        tags=None, scraped_at=ts)
+        product_handle=str(p.get("id") or ""), product_title=name, vendor=brand,
+        product_type=cat, variant_id=vid, variant_sku=(p.get("sku") or None),
+        variant_title=size, variant_size=size,
+        price=float(sell), compare_at_price=(float(compare_at) if compare_at else None),
+        available=available, tags=None, scraped_at=ts)
 
 
-def _click_pager(pg, page_no: int) -> bool:
-    """Click the numbered pager via a JS click. Playwright's actionable .click()
-    is unreliable here (the pager sits under an overlay and times out), which
-    silently truncated several categories to one page. A JS el.click() works."""
-    try:
-        return bool(pg.evaluate(
-            """(n) => {
-                const el = [...document.querySelectorAll('button,a,li,span,div')].find(
-                    e => e.children.length === 0 &&
-                         (e.textContent||'').trim() === String(n) &&
-                         e.offsetParent !== null);
-                if (el) { el.scrollIntoView({block:'center'}); el.click(); return true; }
-                return false;
-            }""", page_no))
-    except Exception:
-        return False
-
-
-def scrape_group(pg, gid: str, label: str, ts: str) -> list[Row]:
-    pg.goto(GROUP_URL.format(gid=gid), wait_until="networkidle", timeout=60_000)
-    pg.wait_for_timeout(3500)
-    _scroll_all(pg)
+def fetch_all() -> list[Row]:
+    """Page through filterProducts until every record is collected."""
+    import requests
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    session = requests.Session()
     rows: dict[str, Row] = {}
-    page_no = 1
-    while page_no <= 60:  # safety ceiling
-        for c in pg.evaluate(EXTRACT_JS):
-            r = parse_card(c, gid, label, ts)
+    page = 1
+    total = None
+    while True:
+        data = _fetch_page(session, page)
+        prods = data.get("products") or []
+        if total is None:
+            total = data.get("totalRecords") or 0
+            print(f"Beaverton Bradford: {total} products to fetch "
+                  f"({-(-total // PAGE_SIZE)} pages of {PAGE_SIZE})")
+        for p in prods:
+            r = parse_product(p, ts)
             if r and r.variant_id not in rows:
                 rows[r.variant_id] = r
-        before = len(rows)
-        if not _click_pager(pg, page_no + 1):
-            break                      # no next page button
-        page_no += 1
-        try:
-            pg.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-        pg.wait_for_timeout(1800)
-        _scroll_all(pg)
-        # extract here so we can tell if the new page actually added anything
-        for c in pg.evaluate(EXTRACT_JS):
-            r = parse_card(c, gid, label, ts)
-            if r and r.variant_id not in rows:
-                rows[r.variant_id] = r
-        if len(rows) == before:        # page added nothing new → stop
+        print(f"   page {page}: +{len(prods)} (have {len(rows)} unique)")
+        if not prods or len(rows) >= (total or 0) or page > 60:
             break
-    print(f"   group {gid} '{label}': {page_no} page(s) -> {len(rows)} rows")
+        page += 1
     return list(rows.values())
 
 
-def cmd_debug(group_id: str, headless: bool) -> None:
-    pw, b, pg = _ctx(headless)
-    try:
-        SHOT_DIR.mkdir(exist_ok=True)
-        pg.goto(GROUP_URL.format(gid=group_id), wait_until="networkidle", timeout=60_000)
-        pg.wait_for_timeout(4000)
-        _scroll_all(pg)
-        cards = pg.evaluate(EXTRACT_JS)
-        pg.screenshot(path=str(SHOT_DIR / f"_bv_group_{group_id}.png"), full_page=True)
-        print(f"=== group {group_id}: {len(cards)} cards ===")
-        for c in cards[:8]:
-            print("\n--- card ---")
-            print("lines:", c["lines"])
-            print("prices:", c["prices"], "img-alt:", c["img"][:50])
-        print(f"\n(screenshot: powerbi_shots/_bv_group_{group_id}.png)")
-    finally:
-        b.close(); pw.stop()
-
-
-def cmd_scrape(headless: bool) -> None:
+def cmd_scrape() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    pw, b, pg = _ctx(headless)
-    all_rows: list[Row] = []
-    try:
-        groups = get_groups(pg)
-        print(f"Bradford product groups: {[(g, l) for g, l in groups]}")
-        for gid, label in groups:
-            try:
-                all_rows.extend(scrape_group(pg, gid, label, ts))
-            except Exception as e:
-                print(f"   ! group {gid} failed: {e}")
-    finally:
-        b.close(); pw.stop()
-    if not all_rows:
-        print(">>> No rows scraped — run with `--debug <groupid>` to inspect card markup.")
+    rows = fetch_all()
+    if not rows:
+        print(">>> No products returned — check the `domain` header / API status.")
         return
     out = OUTPUT_DIR / ("competitor_beaverton_bradford_"
                         + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv")
     with open(out, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(asdict(all_rows[0]).keys()))
+        w = csv.DictWriter(f, fieldnames=list(asdict(rows[0]).keys()))
         w.writeheader()
-        for r in all_rows:
+        for r in rows:
             w.writerow(asdict(r))
-    print(f"\nSaved {len(all_rows)} products -> {out}")
+    cats: dict[str, int] = {}
+    for r in rows:
+        cats[r.product_type or "?"] = cats.get(r.product_type or "?", 0) + 1
+    print(f"\nSaved {len(rows)} products -> {out}")
+    print("  by category:", ", ".join(f"{k} {v}" for k, v in sorted(cats.items())))
     print("  Next: python jobs/import_competitor_prices.py")
+
+
+def cmd_debug() -> None:
+    rows = fetch_all()
+    print(f"\n=== {len(rows)} products; first 8 ===")
+    for r in rows[:8]:
+        print(f"  [{r.product_type}] {r.vendor} | {r.product_title[:48]} "
+              f"| {r.variant_size} | ${r.price}"
+              + (f" (was ${r.compare_at_price})" if r.compare_at_price else ""))
 
 
 def main() -> None:
@@ -303,18 +216,17 @@ def main() -> None:
         except Exception:
             pass
     ap = argparse.ArgumentParser(description="Scrape Beaverton Cannabis (Bradford) menu")
-    ap.add_argument("--debug", metavar="GROUPID", help="dump one group's raw cards and exit")
-    ap.add_argument("--watch", action="store_true", help="visible browser")
+    ap.add_argument("--debug", action="store_true", help="print totals + sample rows, no CSV")
     args = ap.parse_args()
     try:
-        import playwright  # noqa: F401
+        import requests  # noqa: F401
     except ImportError:
-        print("Playwright not installed:\n  pip install playwright\n  playwright install chromium")
+        print("Need: pip install requests")
         sys.exit(1)
     if args.debug:
-        cmd_debug(args.debug, headless=not args.watch)
+        cmd_debug()
     else:
-        cmd_scrape(headless=not args.watch)
+        cmd_scrape()
 
 
 if __name__ == "__main__":
