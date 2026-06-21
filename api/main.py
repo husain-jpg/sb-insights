@@ -5390,6 +5390,79 @@ def _lp_partner_coverage(conn):
     return lp_by_norm, brand_by_norm
 
 
+def _collective_coverage(conn):
+    """ocs_variant_number → collective name for SKUs on an active collective rebate
+    (data_revenue_deals, e.g. IRCC / Canna Collective / Seeker)."""
+    today = date.today().isoformat()
+    coll_name = {r[0]: r[1] for r in conn.execute("SELECT id, brand_name FROM brand_partners")}
+    by_sku: dict[str, str] = {}
+    for r in conn.execute(
+        """SELECT sku_filter, brand_id FROM data_revenue_deals
+           WHERE sku_filter IS NOT NULL AND start_date <= ? AND end_date >= ?""",
+        (today, today)):
+        by_sku[r[0]] = coll_name.get(r[1]) or "Collective"
+    return by_sku
+
+
+def _lto_coverage(conn):
+    """Active-LTO lookups. Returns (by_sku, by_brand_norm, by_subcat). An LTO can
+    target an explicit SKU list (lto_skus) or a whole brand/subcategory."""
+    today = date.today().isoformat()
+    active = list(conn.execute(
+        """SELECT id, name, applies_to_brand, applies_to_subcategory FROM ltos
+           WHERE is_active = 1 AND start_date <= ?
+                 AND (end_date IS NULL OR end_date >= ?)""", (today, today)))
+    names = {r[0]: (r[1] or "LTO") for r in active}
+    by_sku: dict[str, str] = {}
+    if names:
+        qs = ",".join("?" * len(names))
+        for r in conn.execute(
+            f"SELECT lto_id, sku FROM lto_skus WHERE lto_id IN ({qs})", list(names)):
+            by_sku[r[1]] = names.get(r[0], "LTO")
+    by_brand: dict[str, str] = {}
+    by_subcat: dict[str, str] = {}
+    for r in active:
+        if r[2]:
+            by_brand[_norm_lp(r[2])] = r[1] or "LTO"
+        if r[3]:
+            by_subcat[(r[3] or "").lower()] = r[1] or "LTO"
+    return by_sku, by_brand, by_subcat
+
+
+def _annotate_deals(conn, items):
+    """Tag each market-intel item with the deal programs it's on:
+    collective (data_revenue_deals), lp_partner (data_lp_partner_agreements), lto."""
+    coll = _collective_coverage(conn)
+    lp_by_norm, brand_by_norm = _lp_partner_coverage(conn)
+    lto_sku, lto_brand, lto_subcat = _lto_coverage(conn)
+    for it in items:
+        sku, brand = it.get("sku"), it.get("brand")
+        sup, sub = it.get("supplier"), (it.get("subcategory") or "").lower()
+        it["collective"] = coll.get(sku)
+        it["lp_partner"] = (lp_by_norm.get(_norm_lp(sup))
+                            or brand_by_norm.get(_norm_lp(brand)))
+        it["lto"] = (lto_sku.get(sku) or lto_brand.get(_norm_lp(brand))
+                     or lto_subcat.get(sub))
+    return items
+
+
+def _filter_by_deal(items, deal_filter, limit):
+    """Keep only items on the requested deal program ('collective'|'lp'|'lto'|'any'),
+    then truncate to limit. No filter → items unchanged."""
+    if not deal_filter:
+        return items
+    def keep(it):
+        c, l, t = it.get("collective"), it.get("lp_partner"), it.get("lto")
+        if deal_filter == "collective":
+            return bool(c)
+        if deal_filter == "lp":
+            return bool(l)
+        if deal_filter == "lto":
+            return bool(t)
+        return bool(c or l or t)  # 'any'
+    return [it for it in items if keep(it)][:limit]
+
+
 @app.get("/api/market-intelligence/gap-report")
 def get_gap_report(
     location_id: str,
@@ -5398,6 +5471,7 @@ def get_gap_report(
     subcategory: str | None = None,
     in_ocs_catalog_only: bool = True,
     include_carried: bool = False,
+    deal_filter: str | None = None,
 ) -> dict:
     """Top municipality SKUs you DON'T carry.
 
@@ -5440,18 +5514,20 @@ def get_gap_report(
             params.append(subcategory)
         if in_ocs_catalog_only:
             sql += " AND oc.ocs_variant_number IS NOT NULL"
+        # When filtering by deal program we must rank the whole import then filter,
+        # so fetch wide and truncate after annotating; otherwise just fetch the page.
+        display_limit = min(2000, max(1, int(limit)))
         sql += " ORDER BY mi.municipality_units DESC LIMIT ?"
-        params.append(min(2000, max(1, int(limit))))
+        params.append(5000 if deal_filter else display_limit)
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, r)) for r in cur.fetchall()]
 
-        # Tag rows whose LP (or brand) has an active Data LP Partner agreement.
-        lp_by_norm, brand_by_norm = _lp_partner_coverage(conn)
+        # Tag each row with its deal programs (collective / LP partner / LTO).
+        _annotate_deals(conn, items)
         for it in items:
-            it["lp_partner"] = (lp_by_norm.get(_norm_lp(it.get("supplier")))
-                                or brand_by_norm.get(_norm_lp(it.get("brand"))))
             it["carried"] = it.get("your_units") is not None
+        items = _filter_by_deal(items, deal_filter, display_limit)
 
         # Get import metadata for context
         cur.execute("""
@@ -5490,6 +5566,7 @@ def get_performance_comparison(
     import_id: int | None = None,
     limit: int = 200,
     subcategory: str | None = None,
+    deal_filter: str | None = None,
 ) -> dict:
     """SKUs you DO carry, with your velocity vs municipality velocity.
 
@@ -5525,17 +5602,16 @@ def get_performance_comparison(
         if subcategory:
             sql += " AND mi.subcategory = ?"
             params.append(subcategory)
+        display_limit = min(2000, max(1, int(limit)))
         sql += " ORDER BY mi.municipality_units DESC LIMIT ?"
-        params.append(min(2000, max(1, int(limit))))
+        params.append(5000 if deal_filter else display_limit)
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, r)) for r in cur.fetchall()]
 
-        # Tag rows whose LP (or brand) has an active Data LP Partner agreement.
-        lp_by_norm, brand_by_norm = _lp_partner_coverage(conn)
-        for it in items:
-            it["lp_partner"] = (lp_by_norm.get(_norm_lp(it.get("supplier")))
-                                or brand_by_norm.get(_norm_lp(it.get("brand"))))
+        # Tag each row with its deal programs, then optionally filter to one.
+        _annotate_deals(conn, items)
+        items = _filter_by_deal(items, deal_filter, display_limit)
 
         # Compute ratio + flag
         for it in items:

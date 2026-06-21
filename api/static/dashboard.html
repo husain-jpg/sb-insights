@@ -6031,6 +6031,7 @@ let _miCurrentView = "gap";  // 'gap' | 'comparison' | 'imports'
 let _miWindow = 30;          // selected lookback window in days (30 = recommended)
 let _miCategory = "";        // selected subcategory filter ('' = all)
 let _miIncludeCarried = false; // gap view: also show SKUs we already carry
+let _miDealFilter = "";      // '' | 'any' | 'collective' | 'lp' | 'lto'
 let _miImportId = null;      // import_id resolved from the selected store + window
 
 // Resolve the selected store+window to a concrete import. The Power BI connector
@@ -6132,6 +6133,10 @@ async function renderMarketIntel() {
             <select id="mi-category-select" title="Filter by product category">
               <option value="">All categories</option>
               ${_miCategory ? `<option value="${escapeHtml(_miCategory)}" selected>${escapeHtml(_miCategory)}</option>` : ''}
+            </select>
+            <select id="mi-deal-select" title="Filter to products on a deal program">
+              ${[['','All products'],['any','On any deal'],['collective','On a Collective'],['lp','On an LP Partner'],['lto','On an LTO']]
+                .map(([v, l]) => `<option value="${v}" ${_miDealFilter === v ? 'selected' : ''}>${l}</option>`).join('')}
             </select>` : ''}
           ${_miCurrentView === 'gap' ? `
             <label style="font-size: 11px; color: var(--text-dim); display: inline-flex; align-items: center; gap: 5px;" title="Also show top municipality SKUs you already carry, with your sales velocity">
@@ -6181,6 +6186,11 @@ async function renderMarketIntel() {
     const carriedChk = document.getElementById("mi-include-carried");
     if (carriedChk) carriedChk.addEventListener("change", e => {
       _miIncludeCarried = e.target.checked;
+      loadMiContent();
+    });
+    const dealSel = document.getElementById("mi-deal-select");
+    if (dealSel) dealSel.addEventListener("change", e => {
+      _miDealFilter = e.target.value;
       loadMiContent();
     });
     document.querySelectorAll('[id^="mi-view-"]').forEach(btn => {
@@ -6245,10 +6255,21 @@ function miLpPartnerTag(partner) {
   return `<span class="tag" style="font-size: 9px; padding: 1px 5px; background: rgba(140,100,180,0.15); color: #a78bd9; border: 1px solid rgba(160,110,200,0.4);" title="Active Data LP Partner rebate agreement with ${escapeHtml(name)}">${escapeHtml(name)}</span>`;
 }
 
+// Tags for every active deal program a SKU is on: Collective (green), LP Partner
+// (purple), LTO (amber).
+function miDealTags(r) {
+  const tags = [];
+  if (r.collective) tags.push(`<span class="tag" style="font-size: 9px; padding: 1px 5px; background: rgba(80,180,100,0.15); color: #6fcf85; border: 1px solid rgba(90,200,110,0.4);" title="On an active collective rebate">${escapeHtml(r.collective)}</span>`);
+  if (r.lp_partner) tags.push(miLpPartnerTag(r.lp_partner));
+  if (r.lto) tags.push(`<span class="tag" style="font-size: 9px; padding: 1px 5px; background: rgba(214,180,70,0.18); color: #d6b446; border: 1px solid rgba(220,190,80,0.45);" title="On an active LTO">${escapeHtml(typeof r.lto === 'string' ? r.lto : 'LTO')}</span>`);
+  return tags.join(' ');
+}
+
 function _miParams(limit) {
   const p = new URLSearchParams({ location_id: _miCurrentStore, limit: String(limit) });
   if (_miImportId) p.set('import_id', _miImportId);
   if (_miCategory) p.set('subcategory', _miCategory);
+  if (_miDealFilter) p.set('deal_filter', _miDealFilter);
   return p;
 }
 
@@ -6290,9 +6311,9 @@ async function loadMiGapView() {
         render: (r, i) => i + 1, sortValue: (r, i) => i },
       { key: 'item_name', label: 'Product',
         render: r => `${escapeHtml(r.item_name || r.sku)}${r.carried ? ' <span class="tag tag-accent" style="font-size: 8px; padding: 0 4px;">carried</span>' : ''}<div class="sku">${escapeHtml(r.brand || '—')} · ${escapeHtml(titleCaseLp(r.supplier) || '—')}</div>` },
-      { key: 'lp_partner', label: 'LP Partner', align: 'center',
-        tooltip: 'This SKU\'s LP (or brand) has an active Data LP Partner rebate agreement.',
-        render: r => r.lp_partner ? miLpPartnerTag(r.lp_partner) : '' },
+      { key: 'deals', label: 'Deals', align: 'center', sortable: false,
+        tooltip: 'Active deal programs on this SKU: Collective / LP Partner / LTO.',
+        render: r => miDealTags(r) },
       { key: 'subcategory', label: 'Category', render: r => r.subcategory || '—' },
       { key: 'size', label: 'Size', render: r => r.size || '—' },
       { key: 'municipality_units', label: 'Peer units (per store)', type: 'number', align: 'right',
@@ -6360,9 +6381,9 @@ async function loadMiComparisonView() {
     const columns = [
       { key: 'item_name', label: 'Product',
         render: r => `${escapeHtml(r.item_name || r.sku)}<div class="sku">${escapeHtml(r.brand || '—')} · ${escapeHtml(titleCaseLp(r.supplier) || '—')}</div>` },
-      { key: 'lp_partner', label: 'LP Partner', align: 'center',
-        tooltip: 'This SKU\'s LP (or brand) has an active Data LP Partner rebate agreement.',
-        render: r => r.lp_partner ? miLpPartnerTag(r.lp_partner) : '' },
+      { key: 'deals', label: 'Deals', align: 'center', sortable: false,
+        tooltip: 'Active deal programs on this SKU: Collective / LP Partner / LTO.',
+        render: r => miDealTags(r) },
       { key: 'subcategory', label: 'Category', render: r => r.subcategory || '—' },
       { key: 'your_units', label: 'You', type: 'number', align: 'right',
         tooltip: 'Cumulative units sold at THIS store during the period.',
