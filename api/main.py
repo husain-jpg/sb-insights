@@ -6403,6 +6403,28 @@ def delete_lto(lto_id: int) -> dict:
 # A Data LP Partner is an ongoing arrangement: "this brand/LP pays us X% of
 # Y on an ongoing basis." Multiple rate types supported.
 
+@app.get("/api/data-lp-partners/lp-brands")
+def data_lp_brands() -> dict:
+    """LP → brands map from the OCS catalogue, for the agreement form's LP
+    (supplier) picker and its dependent brand picker. In OCS data the supplier
+    column is the licensed producer and brand is the brand under it; an LP can
+    carry several brands. ~200 LPs / 17KB, so the whole map ships at once and the
+    UI does typeahead + brand scoping client-side."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT supplier, brand FROM ocs_catalog
+            WHERE supplier IS NOT NULL AND supplier <> '' AND brand IS NOT NULL
+            ORDER BY supplier, brand
+        """)
+        by_supplier: dict[str, list] = {}
+        for sup, brand in cur.fetchall():
+            lst = by_supplier.setdefault(sup, [])
+            if brand not in lst:
+                lst.append(brand)
+    return {"suppliers": sorted(by_supplier.keys()), "brands_by_supplier": by_supplier}
+
+
 @app.get("/api/data-lp-partners")
 def list_data_lp_partners(include_inactive: bool = False) -> dict:
     """List all Data LP Partner agreements."""

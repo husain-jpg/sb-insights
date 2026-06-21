@@ -5527,6 +5527,8 @@ async function renderDataLpPartners() {
   main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading data lp partners…</div>`;
   try {
     const data = await api("/api/data-lp-partners?include_inactive=true");
+    const lpBrands = await api("/api/data-lp-partners/lp-brands").catch(() => ({ suppliers: [], brands_by_supplier: {} }));
+    let selectedBrands = [];   // brands chosen for the agreement being edited ([] = all)
     const RATE_TYPE_LABELS = {
       pct_wholesale: "% of wholesale cost",
       pct_retail: "% of retail sales",
@@ -5583,20 +5585,19 @@ async function renderDataLpPartners() {
           <h3 id="dlp-dialog-title" style="margin: 0 0 14px 0; font-size: 16px;">New Data LP Partner Agreement</h3>
           <input type="hidden" id="dlp-id" value="">
           <div style="display: grid; gap: 8px;">
-            <label style="font-size: 11px; color: var(--text-dim);">Partner name
-              <input type="text" id="dlp-partner-name" placeholder="e.g. Spinach, Organigram" style="width: 100%; margin-top: 4px;">
+            <label style="font-size: 11px; color: var(--text-dim);">Licensed Producer (LP)
+              <input type="text" id="dlp-lp" list="dlp-lp-options" autocomplete="off" placeholder="Search LP… e.g. ORGANIGRAM INC." style="width: 100%; margin-top: 4px;">
+              <datalist id="dlp-lp-options">${lpBrands.suppliers.map(s => `<option value="${escapeHtml(s)}"></option>`).join('')}</datalist>
             </label>
-            <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 8px;">
-              <label style="font-size: 11px; color: var(--text-dim);">Scope type
-                <select id="dlp-scope-type" style="width: 100%; margin-top: 4px;">
-                  <option value="brand">Brand</option>
-                  <option value="lp">LP (Licensed Producer)</option>
-                </select>
-              </label>
-              <label style="font-size: 11px; color: var(--text-dim);">Scope value (brand or LP name)
-                <input type="text" id="dlp-scope-value" placeholder="e.g. Spinach" style="width: 100%; margin-top: 4px;">
-              </label>
-            </div>
+            <label style="font-size: 11px; color: var(--text-dim);">Brands under this LP
+              <span style="color: var(--text-faint);">— leave blank to cover ALL brands under this LP</span>
+              <div style="display: flex; gap: 6px; margin-top: 4px;">
+                <input type="text" id="dlp-brand-input" list="dlp-brand-options" autocomplete="off" placeholder="Type a brand, then Add (or Enter)" style="flex: 1;" disabled>
+                <datalist id="dlp-brand-options"></datalist>
+                <button type="button" class="btn" id="dlp-brand-add" style="font-size: 11px;" disabled>Add</button>
+              </div>
+              <div id="dlp-brand-chips" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;"></div>
+            </label>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
               <label style="font-size: 11px; color: var(--text-dim);">Rate type
                 <select id="dlp-rate-type" style="width: 100%; margin-top: 4px;">
@@ -5634,6 +5635,44 @@ async function renderDataLpPartners() {
       </div>
     `;
 
+    let lpForChips = "";   // the LP that selectedBrands currently belong to
+
+    const renderBrandChips = () => {
+      const wrap = document.getElementById("dlp-brand-chips");
+      if (!wrap) return;
+      if (!selectedBrands.length) {
+        wrap.innerHTML = '<span style="font-size: 11px; color: var(--text-faint);">All brands under this LP</span>';
+        return;
+      }
+      wrap.innerHTML = selectedBrands.map((b, i) =>
+        `<span class="tag" style="font-size: 10px; padding: 2px 6px; display: inline-flex; align-items: center; gap: 4px;">${escapeHtml(b)}<button type="button" data-i="${i}" class="dlp-chip-x" style="background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 0; font-size: 13px; line-height: 1;">×</button></span>`
+      ).join('');
+      wrap.querySelectorAll(".dlp-chip-x").forEach(x => x.addEventListener("click", () => {
+        selectedBrands.splice(parseInt(x.dataset.i), 1);
+        renderBrandChips();
+      }));
+    };
+
+    const refreshBrandPicker = (lp) => {
+      const brands = lpBrands.brands_by_supplier[lp] || [];
+      const dl = document.getElementById("dlp-brand-options");
+      if (dl) dl.innerHTML = brands.map(b => `<option value="${escapeHtml(b)}"></option>`).join('');
+      const has = (lp || "").trim().length > 0;
+      const inp = document.getElementById("dlp-brand-input");
+      const btn = document.getElementById("dlp-brand-add");
+      if (inp) { inp.disabled = !has; inp.placeholder = has ? "Type a brand, then Add (or Enter)" : "Pick an LP first"; }
+      if (btn) btn.disabled = !has;
+    };
+
+    const addBrand = () => {
+      const inp = document.getElementById("dlp-brand-input");
+      const v = (inp.value || "").trim();
+      if (!v) return;
+      if (!selectedBrands.includes(v)) selectedBrands.push(v);
+      inp.value = "";
+      renderBrandChips();
+    };
+
     const renderList = () => {
       const q = document.getElementById("dlp-search").value.trim().toLowerCase();
       const status = document.getElementById("dlp-filter-status").value;
@@ -5665,7 +5704,9 @@ async function renderDataLpPartners() {
             ${items.map(a => `
               <tr ${a.is_active ? '' : 'style="opacity: 0.6;"'}>
                 <td><strong>${escapeHtml(a.partner_name)}</strong>${a.notes ? `<div class="sku">${escapeHtml(a.notes)}</div>` : ''}</td>
-                <td><span class="tag" style="font-size: 9px; padding: 1px 5px;">${a.scope_type}</span> ${escapeHtml(a.scope_value)}</td>
+                <td>${a.scope_type === 'lp'
+                  ? '<span class="tag tag-accent" style="font-size: 9px; padding: 1px 5px;">All brands</span>'
+                  : (a.scope_value || '').split(',').map(b => `<span class="tag" style="font-size: 9px; padding: 1px 5px; margin: 1px;">${escapeHtml(b.trim())}</span>`).join('')}</td>
                 <td>${fmtRate(a.rate_type, a.rate_value)} <div class="sku">${RATE_TYPE_LABELS[a.rate_type] || a.rate_type}</div></td>
                 <td>${fmtDate(a.start_date)} → ${fmtDate(a.end_date) || 'open-ended'}</td>
                 <td>${a.is_active
@@ -5692,9 +5733,11 @@ async function renderDataLpPartners() {
         document.getElementById("dlp-dialog-title").textContent = "Edit Agreement";
         const a = data.items.find(x => x.id === id);
         if (!a) return;
-        document.getElementById("dlp-partner-name").value = a.partner_name || "";
-        document.getElementById("dlp-scope-type").value = a.scope_type || "brand";
-        document.getElementById("dlp-scope-value").value = a.scope_value || "";
+        const lp = a.partner_name || "";
+        document.getElementById("dlp-lp").value = lp;
+        selectedBrands = (a.scope_type === 'brand' && a.scope_value)
+          ? a.scope_value.split(',').map(s => s.trim()).filter(Boolean) : [];
+        lpForChips = lp;
         document.getElementById("dlp-rate-type").value = a.rate_type || "pct_wholesale";
         document.getElementById("dlp-rate-value").value = a.rate_value != null ? a.rate_value : "";
         document.getElementById("dlp-start-date").value = a.start_date || today;
@@ -5703,14 +5746,19 @@ async function renderDataLpPartners() {
         document.getElementById("dlp-is-active").checked = !!a.is_active;
       } else {
         document.getElementById("dlp-dialog-title").textContent = "New Data LP Partner Agreement";
-        ["dlp-partner-name","dlp-scope-value","dlp-rate-value","dlp-end-date","dlp-notes"].forEach(i => {
+        ["dlp-rate-value","dlp-end-date","dlp-notes"].forEach(i => {
           document.getElementById(i).value = "";
         });
-        document.getElementById("dlp-scope-type").value = "brand";
+        document.getElementById("dlp-lp").value = "";
+        selectedBrands = [];
+        lpForChips = "";
         document.getElementById("dlp-rate-type").value = "pct_wholesale";
         document.getElementById("dlp-start-date").value = today;
         document.getElementById("dlp-is-active").checked = true;
       }
+      document.getElementById("dlp-brand-input").value = "";
+      refreshBrandPicker(document.getElementById("dlp-lp").value);
+      renderBrandChips();
     };
 
     const closeDialog = () => {
@@ -5719,10 +5767,12 @@ async function renderDataLpPartners() {
 
     const saveDlp = async () => {
       const id = document.getElementById("dlp-id").value;
+      const lp = document.getElementById("dlp-lp").value.trim();
       const payload = {
-        partner_name: document.getElementById("dlp-partner-name").value.trim(),
-        scope_type: document.getElementById("dlp-scope-type").value,
-        scope_value: document.getElementById("dlp-scope-value").value.trim(),
+        partner_name: lp,
+        // No brands chosen → the agreement covers ALL brands under the LP.
+        scope_type: selectedBrands.length ? "brand" : "lp",
+        scope_value: selectedBrands.length ? selectedBrands.join(", ") : lp,
         rate_type: document.getElementById("dlp-rate-type").value,
         rate_value: parseFloat(document.getElementById("dlp-rate-value").value),
         start_date: document.getElementById("dlp-start-date").value,
@@ -5730,8 +5780,12 @@ async function renderDataLpPartners() {
         notes: document.getElementById("dlp-notes").value.trim() || null,
         is_active: document.getElementById("dlp-is-active").checked,
       };
-      if (!payload.partner_name || !payload.scope_value || isNaN(payload.rate_value) || !payload.start_date) {
-        alert("Partner name, scope value, rate value, and start date are required.");
+      if (!payload.partner_name) {
+        alert("Pick a Licensed Producer (LP).");
+        return;
+      }
+      if (isNaN(payload.rate_value) || !payload.start_date) {
+        alert("Rate value and start date are required.");
         return;
       }
       const url = id ? `/api/data-lp-partners/${id}` : `/api/data-lp-partners`;
@@ -5765,6 +5819,18 @@ async function renderDataLpPartners() {
     document.getElementById("dlp-search").addEventListener("input", renderList);
     document.getElementById("dlp-filter-status").addEventListener("change", renderList);
     document.getElementById("dlp-add-btn").addEventListener("click", () => openDialog());
+    const lpInput = document.getElementById("dlp-lp");
+    lpInput.addEventListener("input", e => refreshBrandPicker(e.target.value));
+    lpInput.addEventListener("change", e => {
+      // Committing a different LP resets the brand scope (brands are LP-specific).
+      const v = e.target.value.trim();
+      if (v !== lpForChips) { selectedBrands = []; lpForChips = v; renderBrandChips(); }
+      refreshBrandPicker(v);
+    });
+    document.getElementById("dlp-brand-add").addEventListener("click", addBrand);
+    document.getElementById("dlp-brand-input").addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); addBrand(); }
+    });
     document.getElementById("dlp-save-btn").addEventListener("click", saveDlp);
     document.getElementById("dlp-cancel-btn").addEventListener("click", closeDialog);
     document.getElementById("dlp-dialog").addEventListener("click", e => {
