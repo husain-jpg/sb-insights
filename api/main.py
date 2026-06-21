@@ -5360,6 +5360,36 @@ def trigger_bulk_market_intelligence_import(payload: dict = Body(default={})) ->
     }
 
 
+def _norm_lp(s) -> str:
+    """Normalize an LP/brand name for fuzzy matching (case- + punctuation-insensitive):
+    'PEACE NATURALS PROJECT INC.' and 'Peace Naturals Project Inc.' both → the same key."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _lp_partner_coverage(conn):
+    """Index today's active Data LP Partner agreements for tagging market-intel rows.
+    Returns (lp_by_norm, brand_by_norm): normalized LP name / brand name → partner
+    display name. scope_type='lp' covers all brands under that LP; scope_type='brand'
+    covers the comma-separated brands in scope_value."""
+    today = date.today().isoformat()
+    lp_by_norm: dict[str, str] = {}
+    brand_by_norm: dict[str, str] = {}
+    for r in conn.execute(
+        """SELECT partner_name, scope_type, scope_value FROM data_lp_partner_agreements
+           WHERE is_active = 1 AND start_date <= ?
+                 AND (end_date IS NULL OR end_date >= ?)""", (today, today)):
+        pname, stype, sval = r[0], r[1], r[2]
+        if stype == "lp":
+            lp_by_norm[_norm_lp(pname)] = pname
+            if sval:
+                lp_by_norm[_norm_lp(sval)] = pname
+        else:  # brand scope — scope_value is a comma-separated brand list
+            for b in (sval or "").split(","):
+                if b.strip():
+                    brand_by_norm[_norm_lp(b)] = pname
+    return lp_by_norm, brand_by_norm
+
+
 @app.get("/api/market-intelligence/gap-report")
 def get_gap_report(
     location_id: str,
@@ -5367,6 +5397,7 @@ def get_gap_report(
     limit: int = 100,
     subcategory: str | None = None,
     in_ocs_catalog_only: bool = True,
+    include_carried: bool = False,
 ) -> dict:
     """Top municipality SKUs you DON'T carry.
 
@@ -5392,13 +5423,17 @@ def get_gap_report(
         sql = """
             SELECT mi.sku, mi.item_name, mi.brand, mi.supplier, mi.subcategory, mi.size,
                    mi.municipality_units, mi.municipality_velocity, mi.sales_days,
+                   mi.your_units, mi.your_velocity,
                    oc.unit_price, oc.pack_size, oc.stock_status, oc.thc_min, oc.thc_max
             FROM market_intelligence_data mi
             LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = mi.sku
             WHERE mi.import_id = ?
-              AND mi.your_units IS NULL
               AND mi.municipality_units IS NOT NULL
         """
+        # Default: SKUs you DON'T carry. include_carried also surfaces carried SKUs
+        # (with your velocity) so the view doubles as a full top-municipality list.
+        if not include_carried:
+            sql += " AND mi.your_units IS NULL"
         params: list = [import_id]
         if subcategory:
             sql += " AND mi.subcategory = ?"
@@ -5411,6 +5446,13 @@ def get_gap_report(
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, r)) for r in cur.fetchall()]
 
+        # Tag rows whose LP (or brand) has an active Data LP Partner agreement.
+        lp_by_norm, brand_by_norm = _lp_partner_coverage(conn)
+        for it in items:
+            it["lp_partner"] = (lp_by_norm.get(_norm_lp(it.get("supplier")))
+                                or brand_by_norm.get(_norm_lp(it.get("brand"))))
+            it["carried"] = it.get("your_units") is not None
+
         # Get import metadata for context
         cur.execute("""
             SELECT period_start, period_end, period_days, imported_at
@@ -5418,14 +5460,16 @@ def get_gap_report(
         """, (import_id,))
         meta = cur.fetchone()
 
-        # Full category list for this import's gap universe (so the UI dropdown is
+        # Full category list for this view's universe (so the UI dropdown is
         # complete regardless of the row limit / current filter).
-        cur.execute("""
+        subcat_sql = """
             SELECT DISTINCT subcategory FROM market_intelligence_data
-            WHERE import_id = ? AND your_units IS NULL
-              AND municipality_units IS NOT NULL AND subcategory IS NOT NULL
-            ORDER BY subcategory
-        """, (import_id,))
+            WHERE import_id = ? AND municipality_units IS NOT NULL
+              AND subcategory IS NOT NULL
+        """
+        if not include_carried:
+            subcat_sql += " AND your_units IS NULL"
+        cur.execute(subcat_sql + " ORDER BY subcategory", (import_id,))
         subcats = [r[0] for r in cur.fetchall()]
 
     return {
@@ -5486,6 +5530,12 @@ def get_performance_comparison(
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        # Tag rows whose LP (or brand) has an active Data LP Partner agreement.
+        lp_by_norm, brand_by_norm = _lp_partner_coverage(conn)
+        for it in items:
+            it["lp_partner"] = (lp_by_norm.get(_norm_lp(it.get("supplier")))
+                                or brand_by_norm.get(_norm_lp(it.get("brand"))))
 
         # Compute ratio + flag
         for it in items:

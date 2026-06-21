@@ -2660,6 +2660,18 @@ function escapeHtml(s) {
     .replace(/'/g, '&#039;');
 }
 
+// Prettify an LP/supplier name that OCS stores in ALL CAPS (e.g.
+// "PEACE NATURALS PROJECT INC." -> "Peace Naturals Project Inc."). Names that are
+// already mixed-case (e.g. "HydRx Farms ltd.") are left untouched.
+function titleCaseLp(s) {
+  if (!s) return '';
+  s = String(s);
+  if (/[a-z]/.test(s)) return s;            // already mixed-case — leave it
+  return s.toLowerCase().replace(/[a-z0-9]+/g, w => w.charAt(0).toUpperCase() + w.slice(1));
+}
+// Case- and punctuation-insensitive key for matching LP/brand names.
+function normLp(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+
 async function updateStatus() {
   try {
     const h = await api("/api/health");
@@ -5528,6 +5540,16 @@ async function renderDataLpPartners() {
   try {
     const data = await api("/api/data-lp-partners?include_inactive=true");
     const lpBrands = await api("/api/data-lp-partners/lp-brands").catch(() => ({ suppliers: [], brands_by_supplier: {} }));
+    // Re-key the OCS supplier→brand map to clean display names + a normalized
+    // lookup, so the picker shows tidy LP names while matching stays robust.
+    const lpDisplay = {};       // norm -> clean display name
+    const lpBrandsByNorm = {};  // norm -> brands[]
+    for (const raw of (lpBrands.suppliers || [])) {
+      const n = normLp(raw);
+      lpDisplay[n] = titleCaseLp(raw);
+      lpBrandsByNorm[n] = lpBrands.brands_by_supplier[raw] || [];
+    }
+    const lpOptionList = Object.values(lpDisplay).sort((a, b) => a.localeCompare(b));
     let selectedBrands = [];   // brands chosen for the agreement being edited ([] = all)
     const RATE_TYPE_LABELS = {
       pct_wholesale: "% of wholesale cost",
@@ -5587,7 +5609,7 @@ async function renderDataLpPartners() {
           <div style="display: grid; gap: 8px;">
             <label style="font-size: 11px; color: var(--text-dim);">Licensed Producer (LP)
               <input type="text" id="dlp-lp" list="dlp-lp-options" autocomplete="off" placeholder="Search LP… e.g. ORGANIGRAM INC." style="width: 100%; margin-top: 4px;">
-              <datalist id="dlp-lp-options">${lpBrands.suppliers.map(s => `<option value="${escapeHtml(s)}"></option>`).join('')}</datalist>
+              <datalist id="dlp-lp-options">${lpOptionList.map(s => `<option value="${escapeHtml(s)}"></option>`).join('')}</datalist>
             </label>
             <label style="font-size: 11px; color: var(--text-dim);">Brands under this LP
               <span style="color: var(--text-faint);">— leave blank to cover ALL brands under this LP</span>
@@ -5654,7 +5676,7 @@ async function renderDataLpPartners() {
     };
 
     const refreshBrandPicker = (lp) => {
-      const brands = lpBrands.brands_by_supplier[lp] || [];
+      const brands = lpBrandsByNorm[normLp(lp)] || [];
       const dl = document.getElementById("dlp-brand-options");
       if (dl) dl.innerHTML = brands.map(b => `<option value="${escapeHtml(b)}"></option>`).join('');
       const has = (lp || "").trim().length > 0;
@@ -5703,7 +5725,7 @@ async function renderDataLpPartners() {
           <tbody>
             ${items.map(a => `
               <tr ${a.is_active ? '' : 'style="opacity: 0.6;"'}>
-                <td><strong>${escapeHtml(a.partner_name)}</strong>${a.notes ? `<div class="sku">${escapeHtml(a.notes)}</div>` : ''}</td>
+                <td><strong>${escapeHtml(titleCaseLp(a.partner_name))}</strong>${a.notes ? `<div class="sku">${escapeHtml(a.notes)}</div>` : ''}</td>
                 <td>${a.scope_type === 'lp'
                   ? '<span class="tag tag-accent" style="font-size: 9px; padding: 1px 5px;">All brands</span>'
                   : (a.scope_value || '').split(',').map(b => `<span class="tag" style="font-size: 9px; padding: 1px 5px; margin: 1px;">${escapeHtml(b.trim())}</span>`).join('')}</td>
@@ -6008,6 +6030,7 @@ let _miCurrentStore = null;
 let _miCurrentView = "gap";  // 'gap' | 'comparison' | 'imports'
 let _miWindow = 30;          // selected lookback window in days (30 = recommended)
 let _miCategory = "";        // selected subcategory filter ('' = all)
+let _miIncludeCarried = false; // gap view: also show SKUs we already carry
 let _miImportId = null;      // import_id resolved from the selected store + window
 
 // Resolve the selected store+window to a concrete import. The Power BI connector
@@ -6110,6 +6133,10 @@ async function renderMarketIntel() {
               <option value="">All categories</option>
               ${_miCategory ? `<option value="${escapeHtml(_miCategory)}" selected>${escapeHtml(_miCategory)}</option>` : ''}
             </select>` : ''}
+          ${_miCurrentView === 'gap' ? `
+            <label style="font-size: 11px; color: var(--text-dim); display: inline-flex; align-items: center; gap: 5px;" title="Also show top municipality SKUs you already carry, with your sales velocity">
+              <input type="checkbox" id="mi-include-carried" ${_miIncludeCarried ? 'checked' : ''}> Include SKUs we carry
+            </label>` : ''}
           <div style="display: flex; gap: 4px; margin-left: 12px;">
             <button class="btn ${_miCurrentView === 'gap' ? 'btn-primary' : ''}" data-view="gap" id="mi-view-gap">Gap Report</button>
             <button class="btn ${_miCurrentView === 'comparison' ? 'btn-primary' : ''}" data-view="comparison" id="mi-view-comparison">Performance vs Peers</button>
@@ -6149,6 +6176,11 @@ async function renderMarketIntel() {
     const catSel = document.getElementById("mi-category-select");
     if (catSel) catSel.addEventListener("change", e => {
       _miCategory = e.target.value;
+      loadMiContent();
+    });
+    const carriedChk = document.getElementById("mi-include-carried");
+    if (carriedChk) carriedChk.addEventListener("change", e => {
+      _miIncludeCarried = e.target.checked;
       loadMiContent();
     });
     document.querySelectorAll('[id^="mi-view-"]').forEach(btn => {
@@ -6207,6 +6239,12 @@ function _miFillCategories(subcats) {
   sel.value = _miCategory;
 }
 
+// Purple tag for a SKU whose LP/brand has an active Data LP Partner agreement.
+function miLpPartnerTag(partner) {
+  const name = titleCaseLp(partner);
+  return `<span class="tag" style="font-size: 9px; padding: 1px 5px; background: rgba(140,100,180,0.15); color: #a78bd9; border: 1px solid rgba(160,110,200,0.4);" title="Active Data LP Partner rebate agreement with ${escapeHtml(name)}">${escapeHtml(name)}</span>`;
+}
+
 function _miParams(limit) {
   const p = new URLSearchParams({ location_id: _miCurrentStore, limit: String(limit) });
   if (_miImportId) p.set('import_id', _miImportId);
@@ -6218,7 +6256,7 @@ async function loadMiGapView() {
   const container = document.getElementById("mi-content");
   container.innerHTML = `<div class="loading"><span class="spinner"></span> Loading gap report…</div>`;
   try {
-    const data = await api(`/api/market-intelligence/gap-report?${_miParams(200)}`);
+    const data = await api(`/api/market-intelligence/gap-report?${_miParams(200)}${_miIncludeCarried ? '&include_carried=true' : ''}`);
     _miFillCategories(data.subcategories);
     if (!data.items || data.items.length === 0) {
       container.innerHTML = `<div class="card" style="padding: 24px; color: var(--text-dim); font-size: 12px;">${data.warning || 'No gap data available.'}</div>`;
@@ -6237,7 +6275,7 @@ async function loadMiGapView() {
         <div style="font-size: 11px; color: var(--text-dim);">
           <strong>Period:</strong> ${period} &nbsp;·&nbsp;
           <strong>Imported:</strong> ${importedDate}${ageDays !== null ? ` (${ageDays}d ago)` : ''} &nbsp;·&nbsp;
-          <strong>Showing:</strong> top ${data.items.length} SKUs you don't carry
+          <strong>Showing:</strong> top ${data.items.length} municipality SKUs${_miIncludeCarried ? ' (incl. ones you carry)' : " you don't carry"}
         </div>
         ${stale ? '<span class="tag" style="background: rgba(214, 100, 100, 0.15); color: #d66464; font-size: 10px;">STALE — re-import recommended</span>' : ''}
       </div>
@@ -6251,7 +6289,10 @@ async function loadMiGapView() {
       { key: 'rank', label: '#', type: 'number', align: 'right',
         render: (r, i) => i + 1, sortValue: (r, i) => i },
       { key: 'item_name', label: 'Product',
-        render: r => `${escapeHtml(r.item_name || r.sku)}<div class="sku">${escapeHtml(r.brand || '—')} · ${escapeHtml(r.supplier || '—')}</div>` },
+        render: r => `${escapeHtml(r.item_name || r.sku)}${r.carried ? ' <span class="tag tag-accent" style="font-size: 8px; padding: 0 4px;">carried</span>' : ''}<div class="sku">${escapeHtml(r.brand || '—')} · ${escapeHtml(titleCaseLp(r.supplier) || '—')}</div>` },
+      { key: 'lp_partner', label: 'LP Partner', align: 'center',
+        tooltip: 'This SKU\'s LP (or brand) has an active Data LP Partner rebate agreement.',
+        render: r => r.lp_partner ? miLpPartnerTag(r.lp_partner) : '' },
       { key: 'subcategory', label: 'Category', render: r => r.subcategory || '—' },
       { key: 'size', label: 'Size', render: r => r.size || '—' },
       { key: 'municipality_units', label: 'Peer units (per store)', type: 'number', align: 'right',
@@ -6260,6 +6301,10 @@ async function loadMiGapView() {
       { key: 'municipality_velocity', label: 'Peer velocity (/day)', type: 'number', align: 'right',
         tooltip: 'Average daily units when the SKU sells — only counts days with sales.',
         render: r => r.municipality_velocity ? r.municipality_velocity.toFixed(2) : '—' },
+      ...(_miIncludeCarried ? [{
+        key: 'your_velocity', label: 'Your velocity (/day)', type: 'number', align: 'right',
+        tooltip: 'Your daily units at this store (blank = you don\'t carry it).',
+        render: r => r.your_velocity ? r.your_velocity.toFixed(2) : (r.carried ? '0.00' : '—') }] : []),
       { key: 'unit_price', label: 'Wholesale', type: 'number', align: 'right',
         render: r => r.unit_price ? fmt$2(r.unit_price) : '—' },
       { key: 'pack_size', label: 'Case', type: 'number', align: 'right',
@@ -6314,7 +6359,10 @@ async function loadMiComparisonView() {
 
     const columns = [
       { key: 'item_name', label: 'Product',
-        render: r => `${escapeHtml(r.item_name || r.sku)}<div class="sku">${escapeHtml(r.brand || '—')}</div>` },
+        render: r => `${escapeHtml(r.item_name || r.sku)}<div class="sku">${escapeHtml(r.brand || '—')} · ${escapeHtml(titleCaseLp(r.supplier) || '—')}</div>` },
+      { key: 'lp_partner', label: 'LP Partner', align: 'center',
+        tooltip: 'This SKU\'s LP (or brand) has an active Data LP Partner rebate agreement.',
+        render: r => r.lp_partner ? miLpPartnerTag(r.lp_partner) : '' },
       { key: 'subcategory', label: 'Category', render: r => r.subcategory || '—' },
       { key: 'your_units', label: 'You', type: 'number', align: 'right',
         tooltip: 'Cumulative units sold at THIS store during the period.',
