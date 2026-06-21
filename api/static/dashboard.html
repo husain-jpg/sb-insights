@@ -717,12 +717,12 @@ function _drawTable(tableId) {
 
   const tbody = displayRows.length === 0
     ? `<tr><td colspan="${s.columns.length}" class="loading">${s.opts.emptyText || 'No rows.'}</td></tr>`
-    : displayRows.map(row => {
+    : displayRows.map((row, _ri) => {
         // Optional per-row attributes (e.g. greyed-out / excluded styling)
         const attrs = s.opts.rowAttrs ? (s.opts.rowAttrs(row) || '') : '';
         return `<tr ${attrs}>` + s.columns.map(c => {
           const align = c.align === 'right' ? 'num' : '';
-          const val = c.render ? c.render(row) : (row[c.key] ?? '');
+          const val = c.render ? c.render(row, _ri) : (row[c.key] ?? '');
           return `<td class="${align}">${val}</td>`;
         }).join('') + '</tr>';
       }).join('');
@@ -5940,6 +5940,25 @@ async function renderMonthlyReports() {
 
 let _miCurrentStore = null;
 let _miCurrentView = "gap";  // 'gap' | 'comparison' | 'imports'
+let _miWindow = 30;          // selected lookback window in days (30 = recommended)
+let _miCategory = "";        // selected subcategory filter ('' = all)
+let _miImportId = null;      // import_id resolved from the selected store + window
+
+// Resolve the selected store+window to a concrete import. The Power BI connector
+// pulls several rolling windows (14/30/90/180) each run, each landing as its own
+// import tagged with period_days. Pick the newest import matching _miWindow;
+// fall back to 30, then the largest available, then just the newest import.
+function _miResolveImport(importsByStore) {
+  const imps = (importsByStore[_miCurrentStore] || []).slice()
+    .sort((a, b) => String(b.imported_at || '').localeCompare(String(a.imported_at || '')));
+  const avail = [...new Set(imps.map(i => i.period_days).filter(d => d != null))].sort((a, b) => a - b);
+  if (avail.length && !avail.includes(_miWindow)) {
+    _miWindow = avail.includes(30) ? 30 : avail[avail.length - 1];
+  }
+  const sel = (avail.length ? imps.find(i => i.period_days === _miWindow) : imps[0]) || imps[0] || null;
+  _miImportId = sel ? sel.id : null;
+  return { imps, avail, sel };
+}
 
 // Age (in days) of an imported_at timestamp, or null if unparseable.
 function _dataAgeDays(importedAt) {
@@ -5998,6 +6017,9 @@ async function renderMarketIntel() {
       _miCurrentStore = data.items[0].location_id;
     }
 
+    const { avail: miAvail, sel: miSel } = _miResolveImport(importsByStore);
+    const showFilters = _miCurrentView !== 'imports';
+
     main.innerHTML = `
       <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
         <div>
@@ -6013,6 +6035,15 @@ async function renderMarketIntel() {
               return `<option value="${loc.id}" ${sel} ${has ? '' : 'disabled'}>${escapeHtml(label)}</option>`;
             }).join('')}
           </select>
+          ${showFilters && miAvail.length ? `
+            <select id="mi-window-select" title="Lookback window — the connector pulls several each run">
+              ${miAvail.map(d => `<option value="${d}" ${d === _miWindow ? 'selected' : ''}>${d} days${d === 30 ? ' (recommended)' : ''}</option>`).join('')}
+            </select>` : ''}
+          ${showFilters ? `
+            <select id="mi-category-select" title="Filter by product category">
+              <option value="">All categories</option>
+              ${_miCategory ? `<option value="${escapeHtml(_miCategory)}" selected>${escapeHtml(_miCategory)}</option>` : ''}
+            </select>` : ''}
           <div style="display: flex; gap: 4px; margin-left: 12px;">
             <button class="btn ${_miCurrentView === 'gap' ? 'btn-primary' : ''}" data-view="gap" id="mi-view-gap">Gap Report</button>
             <button class="btn ${_miCurrentView === 'comparison' ? 'btn-primary' : ''}" data-view="comparison" id="mi-view-comparison">Performance vs Peers</button>
@@ -6021,35 +6052,37 @@ async function renderMarketIntel() {
         </div>
       </div>
 
-      ${(() => {
-        const imps = (importsByStore[_miCurrentStore] || []).slice()
-          .sort((a, b) => String(b.imported_at || '').localeCompare(String(a.imported_at || '')));
-        return imps.length ? miFreshnessBanner(imps[0].imported_at, imps[0].period_end, imps[0].period_days) : '';
-      })()}
+      ${miSel ? miFreshnessBanner(miSel.imported_at, miSel.period_end, miSel.period_days) : ''}
 
-      <div class="card" style="padding: 14px 16px; margin-bottom: 14px; font-size: 12px; line-height: 1.6;">
-        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; font-weight: 600;">About this data</div>
-        <div style="color: var(--text-dim);">OCS provides per-store sales benchmarks vs. other stores in your municipality. Updated every ~48 hours on the OCS portal.</div>
-
-        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Recommended cadence</div>
-        <div style="color: var(--text-dim);">Always pull a <strong style="color: var(--text);">trailing 30-day window</strong> (30 days captures enough sales-days to make peer velocities meaningful). Refresh it <strong style="color: var(--text);">as often as practical — weekly is ideal</strong>: the window is a rolling 30-day average, so a weekly re-pull keeps it current without changing the underlying signal. The banner turns amber after 14 days and red after 30.</div>
-
-        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Today's workflow (manual)</div>
-        <div style="color: var(--text-dim);">Download both files for each store from the OCS portal. Drop into <code style="background: var(--bg-elev-2); padding: 1px 6px; border-radius: 3px;">imports/market_intelligence/{YYYY-MM-DD}/{StoreName}/</code> then click <strong style="color: var(--text);">Imports</strong> → Import all.</div>
-
-        <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 14px 0 8px; font-weight: 600;">Automation status</div>
-        <div style="color: var(--text-dim);">Manual for now. The underlying data lives in an OCS <strong style="color: var(--text);">Power BI</strong> report behind a separate login (not the B2B portal the connector uses), so auto-pull isn't wired up. Feasibility of automating a Power BI export is being explored.</div>
-
-        <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 11px;">
-          ⚠ Top regional sellers ≠ guaranteed winners for your customers. Use as a hypothesis generator, not a directive. Adding SKUs commits real shelf space + capital.
+      <details class="card" style="margin-bottom: 14px; font-size: 12px;">
+        <summary style="padding: 10px 16px; cursor: pointer; color: var(--text-dim); list-style: none;">
+          <span style="font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;">ⓘ About this data</span>
+          <span style="margin-left: 10px; color: var(--text-faint);">OCS municipal benchmarks · pull a 30-day window weekly · top regional ≠ guaranteed winner for your customers</span>
+        </summary>
+        <div style="padding: 4px 16px 14px; line-height: 1.6; border-top: 1px solid var(--border);">
+          <div style="color: var(--text-dim); margin-top: 10px;">OCS provides per-store sales benchmarks vs. other stores in your municipality, updated every ~48 hours. The connector pulls several rolling windows (14/30/90/180 days) — use the window selector above to switch. The banner turns amber after 14 days and red after 30, so refresh weekly.</div>
+          <div style="margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 11px;">
+            ⚠ Top regional sellers ≠ guaranteed winners for your customers. Use as a hypothesis generator, not a directive. Adding SKUs commits real shelf space + capital.
+          </div>
         </div>
-      </div>
+      </details>
 
       <div id="mi-content"></div>
     `;
 
     document.getElementById("mi-store-select").addEventListener("change", e => {
       _miCurrentStore = e.target.value;
+      _miCategory = "";          // categories differ per store
+      renderMarketIntel();       // re-resolve window/import + refresh banner
+    });
+    const winSel = document.getElementById("mi-window-select");
+    if (winSel) winSel.addEventListener("change", e => {
+      _miWindow = parseInt(e.target.value, 10);
+      renderMarketIntel();       // window changes the import → refresh banner too
+    });
+    const catSel = document.getElementById("mi-category-select");
+    if (catSel) catSel.addEventListener("change", e => {
+      _miCategory = e.target.value;
       loadMiContent();
     });
     document.querySelectorAll('[id^="mi-view-"]').forEach(btn => {
@@ -6096,11 +6129,31 @@ async function loadMiContent() {
   }
 }
 
+// Populate the category dropdown from a complete subcategory list (returned by
+// the endpoint regardless of the active filter), preserving the current pick.
+function _miFillCategories(subcats) {
+  const sel = document.getElementById("mi-category-select");
+  if (!sel) return;
+  sel.innerHTML = ['<option value="">All categories</option>']
+    .concat((subcats || []).map(s =>
+      `<option value="${escapeHtml(s)}" ${s === _miCategory ? 'selected' : ''}>${escapeHtml(s)}</option>`))
+    .join('');
+  sel.value = _miCategory;
+}
+
+function _miParams(limit) {
+  const p = new URLSearchParams({ location_id: _miCurrentStore, limit: String(limit) });
+  if (_miImportId) p.set('import_id', _miImportId);
+  if (_miCategory) p.set('subcategory', _miCategory);
+  return p;
+}
+
 async function loadMiGapView() {
   const container = document.getElementById("mi-content");
   container.innerHTML = `<div class="loading"><span class="spinner"></span> Loading gap report…</div>`;
   try {
-    const data = await api(`/api/market-intelligence/gap-report?location_id=${encodeURIComponent(_miCurrentStore)}&limit=200`);
+    const data = await api(`/api/market-intelligence/gap-report?${_miParams(200)}`);
+    _miFillCategories(data.subcategories);
     if (!data.items || data.items.length === 0) {
       container.innerHTML = `<div class="card" style="padding: 24px; color: var(--text-dim); font-size: 12px;">${data.warning || 'No gap data available.'}</div>`;
       return;
@@ -6160,7 +6213,8 @@ async function loadMiComparisonView() {
   const container = document.getElementById("mi-content");
   container.innerHTML = `<div class="loading"><span class="spinner"></span> Loading performance comparison…</div>`;
   try {
-    const data = await api(`/api/market-intelligence/performance-comparison?location_id=${encodeURIComponent(_miCurrentStore)}&limit=500`);
+    const data = await api(`/api/market-intelligence/performance-comparison?${_miParams(500)}`);
+    _miFillCategories(data.subcategories);
     if (!data.items || data.items.length === 0) {
       container.innerHTML = `<div class="card" style="padding: 24px; color: var(--text-dim); font-size: 12px;">${data.warning || 'No performance data available.'}</div>`;
       return;

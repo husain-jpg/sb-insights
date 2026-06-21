@@ -5418,10 +5418,21 @@ def get_gap_report(
         """, (import_id,))
         meta = cur.fetchone()
 
+        # Full category list for this import's gap universe (so the UI dropdown is
+        # complete regardless of the row limit / current filter).
+        cur.execute("""
+            SELECT DISTINCT subcategory FROM market_intelligence_data
+            WHERE import_id = ? AND your_units IS NULL
+              AND municipality_units IS NOT NULL AND subcategory IS NOT NULL
+            ORDER BY subcategory
+        """, (import_id,))
+        subcats = [r[0] for r in cur.fetchall()]
+
     return {
         "count": len(items),
         "items": items,
         "import_id": import_id,
+        "subcategories": subcats,
         "period_start": meta[0] if meta else None,
         "period_end": meta[1] if meta else None,
         "period_days": meta[2] if meta else None,
@@ -5499,10 +5510,20 @@ def get_performance_comparison(
         """, (import_id,))
         meta = cur.fetchone()
 
+        # Full category list for SKUs we carry (complete dropdown regardless of limit).
+        cur.execute("""
+            SELECT DISTINCT subcategory FROM market_intelligence_data
+            WHERE import_id = ? AND your_units IS NOT NULL
+              AND municipality_units IS NOT NULL AND subcategory IS NOT NULL
+            ORDER BY subcategory
+        """, (import_id,))
+        subcats = [r[0] for r in cur.fetchall()]
+
     return {
         "count": len(items),
         "items": items,
         "import_id": import_id,
+        "subcategories": subcats,
         "period_start": meta[0] if meta else None,
         "period_end": meta[1] if meta else None,
         "period_days": meta[2] if meta else None,
