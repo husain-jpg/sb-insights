@@ -5366,6 +5366,14 @@ def _norm_lp(s) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+def _ocs_item_no(s) -> str:
+    """The OCS item number = the part of a variant number before the first '_'
+    ('106058_20x0.4g___' → '106058'). OCS encodes the same pack with inconsistent
+    size strings across feeds ('_20x0.35g' vs '_20x0.4g'), so deal/market-intel SKUs
+    that are the same product won't match on the full variant — match on item no."""
+    return (s or "").split("_")[0]
+
+
 def _lp_partner_coverage(conn):
     """Index today's active Data LP Partner agreements for tagging market-intel rows.
     Returns (lp_by_norm, brand_by_norm): normalized LP name / brand name → partner
@@ -5391,17 +5399,19 @@ def _lp_partner_coverage(conn):
 
 
 def _collective_coverage(conn):
-    """ocs_variant_number → collective name for SKUs on an active collective rebate
-    (data_revenue_deals, e.g. IRCC / Canna Collective / Seeker)."""
+    """OCS item number → comma-joined collective names for products on an active
+    collective rebate (data_revenue_deals; IRCC / Canna Collective / Seeker). Keyed
+    by item number (not full variant) to absorb OCS size-string drift, and a product
+    can be on several collectives at once, so all are listed."""
     today = date.today().isoformat()
     coll_name = {r[0]: r[1] for r in conn.execute("SELECT id, brand_name FROM brand_partners")}
-    by_sku: dict[str, str] = {}
+    by_item: dict[str, set] = {}
     for r in conn.execute(
         """SELECT sku_filter, brand_id FROM data_revenue_deals
-           WHERE sku_filter IS NOT NULL AND start_date <= ? AND end_date >= ?""",
-        (today, today)):
-        by_sku[r[0]] = coll_name.get(r[1]) or "Collective"
-    return by_sku
+           WHERE sku_filter IS NOT NULL AND start_date <= ?
+                 AND (end_date IS NULL OR end_date >= ?)""", (today, today)):
+        by_item.setdefault(_ocs_item_no(r[0]), set()).add(coll_name.get(r[1]) or "Collective")
+    return {k: ", ".join(sorted(v)) for k, v in by_item.items()}
 
 
 def _lto_coverage(conn):
@@ -5413,12 +5423,12 @@ def _lto_coverage(conn):
            WHERE is_active = 1 AND start_date <= ?
                  AND (end_date IS NULL OR end_date >= ?)""", (today, today)))
     names = {r[0]: (r[1] or "LTO") for r in active}
-    by_sku: dict[str, str] = {}
+    by_item: dict[str, str] = {}
     if names:
         qs = ",".join("?" * len(names))
         for r in conn.execute(
             f"SELECT lto_id, sku FROM lto_skus WHERE lto_id IN ({qs})", list(names)):
-            by_sku[r[1]] = names.get(r[0], "LTO")
+            by_item[_ocs_item_no(r[1])] = names.get(r[0], "LTO")
     by_brand: dict[str, str] = {}
     by_subcat: dict[str, str] = {}
     for r in active:
@@ -5426,7 +5436,7 @@ def _lto_coverage(conn):
             by_brand[_norm_lp(r[2])] = r[1] or "LTO"
         if r[3]:
             by_subcat[(r[3] or "").lower()] = r[1] or "LTO"
-    return by_sku, by_brand, by_subcat
+    return by_item, by_brand, by_subcat
 
 
 def _annotate_deals(conn, items):
@@ -5434,14 +5444,15 @@ def _annotate_deals(conn, items):
     collective (data_revenue_deals), lp_partner (data_lp_partner_agreements), lto."""
     coll = _collective_coverage(conn)
     lp_by_norm, brand_by_norm = _lp_partner_coverage(conn)
-    lto_sku, lto_brand, lto_subcat = _lto_coverage(conn)
+    lto_item, lto_brand, lto_subcat = _lto_coverage(conn)
     for it in items:
-        sku, brand = it.get("sku"), it.get("brand")
+        item_no = _ocs_item_no(it.get("sku"))
+        brand = it.get("brand")
         sup, sub = it.get("supplier"), (it.get("subcategory") or "").lower()
-        it["collective"] = coll.get(sku)
+        it["collective"] = coll.get(item_no)
         it["lp_partner"] = (lp_by_norm.get(_norm_lp(sup))
                             or brand_by_norm.get(_norm_lp(brand)))
-        it["lto"] = (lto_sku.get(sku) or lto_brand.get(_norm_lp(brand))
+        it["lto"] = (lto_item.get(item_no) or lto_brand.get(_norm_lp(brand))
                      or lto_subcat.get(sub))
     return items
 
