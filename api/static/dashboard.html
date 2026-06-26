@@ -503,6 +503,7 @@
         <button data-page="mix">▸ Inventory Category Mix</button>
         <button data-page="market-intel">▸ Market Intelligence</button>
         <button data-page="competitors">▸ Competitor Pricing</button>
+        <button data-page="partner-coverage">▸ Partner Coverage</button>
         <button data-page="outcomes">▸ Order Backtests</button>
       </div>
     </div>
@@ -3652,6 +3653,167 @@ async function renderAnalytics() {
   });
 
   await loadData();
+}
+
+// ========================================================================
+// Partner Coverage — how much of the in-stock cannabis menu is concentrated
+// with each active Data LP Partner (Auxly, Peace Naturals, …), by on-hand
+// cost / SKUs / trailing revenue, with an estimated rebate.
+// ========================================================================
+async function renderPartnerCoverage() {
+  const main = document.querySelector("main");
+  let locs = [];
+  try { locs = await api("/api/locations"); } catch (e) { /* ignore */ }
+  main.innerHTML = `
+    <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
+      <div>
+        <div class="kicker">Analytics · Data Revenue</div>
+        <h2 style="white-space:nowrap;">Partner Coverage</h2>
+      </div>
+      <div class="controls-row" style="flex-wrap: wrap;">
+        <select id="pc-store">
+          <option value="">All stores (chain-wide)</option>
+          ${locs.map(l => `<option value="${l.id}">${escapeHtml(l.short_name || l.name)}</option>`).join("")}
+        </select>
+        <button id="pc-refresh">Refresh</button>
+        <button id="pc-export-btn">Excel</button>
+      </div>
+    </div>
+    <div id="pc-body"><div class="loading"><span class="spinner"></span> Loading…</div></div>
+    <div class="hint-box">
+      <strong>In-stock cannabis only.</strong> A SKU counts toward a partner when its licensed producer (OCS supplier) matches an active Data LP Partner agreement.
+      <strong>On-hand cost</strong> = units on hand × landed unit cost. <strong>Est. rebate</strong> = rate × on-hand wholesale cost (a snapshot of rebate value embedded in current stock, not rebate earned to date).
+      Collective deals (IRCC / CC / Seeker) are tracked separately — their rebate depends on wholesale received during the deal window, a different basis.
+    </div>
+  `;
+
+  const storeSel = document.getElementById("pc-store");
+  async function load() {
+    document.getElementById("pc-body").innerHTML = `<div class="loading"><span class="spinner"></span> Loading…</div>`;
+    try {
+      const params = new URLSearchParams();
+      if (storeSel.value) params.set("store", storeSel.value);
+      const data = await api(`/api/analytics/partner-coverage?${params.toString()}`);
+      _pcLastData = data;
+      renderPartnerCoverageResult(data);
+    } catch (e) { showError(e); }
+  }
+  document.getElementById("pc-refresh").addEventListener("click", load);
+  document.getElementById("pc-export-btn").addEventListener("click", exportPartnerCoverageCsv);
+  await load();
+}
+
+let _pcLastData = null;
+
+function renderPartnerCoverageResult(data) {
+  const t = data.totals || {};
+  const money = (n) => "$" + (Number(n) || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const money2 = (n) => "$" + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pct = (n) => (Number(n) || 0).toFixed(1) + "%";
+
+  const kpi = (label, value, sub) => `
+    <div class="card" style="flex: 1; min-width: 170px; padding: 14px 16px;">
+      <div style="font-size: 11px; color: var(--text-dim);">${label}</div>
+      <div style="font-size: 24px; font-weight: 600; margin: 2px 0;">${value}</div>
+      <div style="font-size: 11px; color: var(--text-faint);">${sub || ""}</div>
+    </div>`;
+
+  const partnerRows = (data.partners || []).map(p => `
+    <tr style="border-bottom: 1px solid var(--border);">
+      <td style="padding: 8px 10px;"><strong>${escapeHtml(titleCaseLp ? titleCaseLp(p.partner) : p.partner)}</strong></td>
+      <td style="padding: 8px 10px; text-align: right;">${p.rate_value}%<span style="color: var(--text-faint); font-size: 10px;"> WS</span></td>
+      <td style="padding: 8px 10px; text-align: right;">${p.skus}</td>
+      <td style="padding: 8px 10px; text-align: right;">${money(p.onhand_cost)}</td>
+      <td style="padding: 8px 10px; text-align: right;">${pct(p.cost_share_pct)}</td>
+      <td style="padding: 8px 10px; text-align: right;">${money(p.revenue)}</td>
+      <td style="padding: 8px 10px; text-align: right;">${pct(p.revenue_share_pct)}</td>
+      <td style="padding: 8px 10px; text-align: right; color: #6dab84; font-weight: 600;">${money2(p.est_rebate)}</td>
+    </tr>`).join("");
+
+  const uncovered = (data.uncovered_top || []);
+  const uncoveredRows = uncovered.map(u => `
+    <tr style="border-bottom: 1px solid var(--border);">
+      <td style="padding: 6px 10px;">
+        <div style="font-size: 12px;">${escapeHtml(u.name || u.sku)}</div>
+        <div style="font-size: 10px; color: var(--text-faint);">${escapeHtml(u.supplier || "—")}</div>
+      </td>
+      <td style="padding: 6px 10px; text-align: right;">${money(u.onhand_cost)}</td>
+      <td style="padding: 6px 10px; text-align: right;">${money(u.revenue)}</td>
+    </tr>`).join("");
+
+  const storeLabel = data.store ? data.store : "All stores";
+  document.getElementById("pc-body").innerHTML = `
+    <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px;">
+      ${kpi("Partner-covered shelf cost", pct(t.covered_cost_pct), `${money(t.covered_onhand_cost)} of ${money(t.cannabis_onhand_cost)} on-hand`)}
+      ${kpi("Covered SKUs", `${t.covered_skus} / ${t.cannabis_skus}`, pct(t.covered_skus_pct) + " of in-stock cannabis")}
+      ${kpi("Covered revenue (30d)", money(t.covered_revenue_30d), pct(t.cannabis_revenue_30d ? (t.covered_revenue_30d / t.cannabis_revenue_30d * 100) : 0) + " of cannabis revenue")}
+      ${kpi("Est. rebate (on-hand)", money2(t.est_rebate_total), "embedded in current stock")}
+    </div>
+
+    <div class="card" style="margin-bottom: 14px;">
+      <div style="padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline;">
+        <strong>By partner — ${escapeHtml(storeLabel)}</strong>
+        <span style="font-size: 11px; color: var(--text-faint);">inventory as of ${data.as_of || "?"}</span>
+      </div>
+      <div style="overflow-x: auto;">
+        <table style="width: 100%; font-size: 13px; border-collapse: collapse;">
+          <thead>
+            <tr style="text-align: right; border-bottom: 2px solid var(--border); color: var(--text-dim); font-size: 11px;">
+              <th style="padding: 8px 10px; text-align: left;">Partner (LP)</th>
+              <th style="padding: 8px 10px;">Rate</th>
+              <th style="padding: 8px 10px;">SKUs</th>
+              <th style="padding: 8px 10px;">On-hand cost</th>
+              <th style="padding: 8px 10px;">Cost share</th>
+              <th style="padding: 8px 10px;">Revenue 30d</th>
+              <th style="padding: 8px 10px;">Rev share</th>
+              <th style="padding: 8px 10px;">Est. rebate</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${partnerRows || `<tr><td colspan="8" style="padding: 20px; text-align: center; color: var(--text-dim);">No active partner agreements match in-stock cannabis at this store.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="padding: 12px 16px; border-bottom: 1px solid var(--border);">
+        <strong>Biggest uncovered SKUs</strong>
+        <span style="font-size: 11px; color: var(--text-faint);"> — highest on-hand cost not with any partner (push the LP toward a deal, or shift volume)</span>
+      </div>
+      <div style="overflow-x: auto;">
+        <table style="width: 100%; font-size: 12px; border-collapse: collapse;">
+          <thead>
+            <tr style="text-align: right; border-bottom: 2px solid var(--border); color: var(--text-dim); font-size: 11px;">
+              <th style="padding: 6px 10px; text-align: left;">Product / LP</th>
+              <th style="padding: 6px 10px;">On-hand cost</th>
+              <th style="padding: 6px 10px;">Revenue 30d</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${uncoveredRows || `<tr><td colspan="3" style="padding: 20px; text-align: center; color: var(--text-dim);">Nothing uncovered.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function exportPartnerCoverageCsv() {
+  const data = _pcLastData;
+  if (!data) { alert("No data loaded"); return; }
+  const rows = [["Partner", "Rate %", "SKUs", "On-hand cost", "Cost share %", "Revenue 30d", "Rev share %", "Est. rebate"]];
+  (data.partners || []).forEach(p => rows.push([p.partner, p.rate_value, p.skus, p.onhand_cost, p.cost_share_pct, p.revenue, p.revenue_share_pct, p.est_rebate]));
+  rows.push([]);
+  rows.push(["Uncovered SKU", "Supplier", "On-hand cost", "Revenue 30d"]);
+  (data.uncovered_top || []).forEach(u => rows.push([u.name || u.sku, u.supplier || "", u.onhand_cost, u.revenue]));
+  const csv = rows.map(r => r.map(c => `"${String(c == null ? "" : c).replace(/"/g, '""')}"`).join(",")).join("\\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `partner_coverage_${data.store || "all"}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
 }
 
 let _analyticsLastData = null;
@@ -7828,6 +7990,7 @@ const routes = {
   competitors: renderCompetitors,
   outcomes: renderOutcomes,
   analytics: renderAnalytics,
+  "partner-coverage": renderPartnerCoverage,
   partners: renderPartners,
   ltos: renderLTOs,
   "data-lp-partners": renderDataLpPartners,
@@ -7849,7 +8012,7 @@ const PAGE_ACCESS = {
   // admin only — system config, users, credentials
   users: "admin", "email-scraper": "admin", "ocs-connector": "admin", "system-health": "admin",
   // GM or admin — financials + read-only settings
-  analytics: "gm", partners: "gm", ltos: "gm", "data-lp-partners": "gm",
+  analytics: "gm", "partner-coverage": "gm", partners: "gm", ltos: "gm", "data-lp-partners": "gm",
   "monthly-reports": "gm", settings: "gm",
 };
 function _myRoleRank() {

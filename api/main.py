@@ -7117,6 +7117,140 @@ def _diff_pair(curr: float, prev: float) -> dict:
     return {"diff": diff, "pct": pct}
 
 
+def _active_partner_matchers(conn):
+    """Active Data LP Partner agreements indexed for menu matching, WITH rates.
+    Returns (by_lp_norm, by_brand_norm): normalized name -> agreement dict
+    {partner, rate_type, rate_value}. 'lp' scope covers every brand under that
+    LP; 'brand' scope covers the comma-separated brands in scope_value. This is
+    the rate-carrying sibling of _lp_partner_coverage (which is name-only)."""
+    today = date.today().isoformat()
+    by_lp: dict[str, dict] = {}
+    by_brand: dict[str, dict] = {}
+    for r in conn.execute(
+        """SELECT partner_name, scope_type, scope_value, rate_type, rate_value
+           FROM data_lp_partner_agreements
+           WHERE is_active = 1 AND start_date <= ?
+                 AND (end_date IS NULL OR end_date >= ?)""", (today, today)):
+        ag = {"partner": r[0], "rate_type": r[3], "rate_value": float(r[4] or 0)}
+        if r[1] == "lp":
+            by_lp[_norm_lp(r[0])] = ag
+            if r[2]:
+                by_lp[_norm_lp(r[2])] = ag
+        else:  # brand scope — scope_value is a comma-separated brand list
+            for b in (r[2] or "").split(","):
+                if b.strip():
+                    by_brand[_norm_lp(b)] = ag
+    return by_lp, by_brand
+
+
+@app.get("/api/analytics/partner-coverage")
+def partner_coverage(store: str | None = None) -> dict:
+    """How much of the in-stock cannabis menu is concentrated with each active
+    Data LP Partner (Auxly, Peace Naturals, …), measured by on-hand cost, SKU
+    count, and 30-day trailing revenue, with an estimated rebate.
+
+    Partner deals are LP/brand-scoped and ongoing, so unlike collectives this is
+    a stable snapshot: est. rebate = rate × on-hand wholesale cost (for
+    rate_type='pct_wholesale'). Store-scoped when `store` is given, else
+    chain-wide. Collectives are intentionally NOT included here — their rebate
+    is earned on wholesale RECEIVED during an active deal window, a different
+    timing basis handled separately.
+    """
+    with db() as conn:
+        by_lp, by_brand = _active_partner_matchers(conn)
+
+        latest = get_latest_sale_date(conn)
+        rev_start = (latest - timedelta(days=29)).isoformat() if latest else "0000-00-00"
+
+        sql = """
+        SELECT ci.sku, ci.on_hand, ci.avg_unit_cost,
+               COALESCE(oc.supplier, p.lp) AS supplier, p.brand, p.name,
+               COALESCE(rev.revenue_30d, 0) AS revenue_30d
+        FROM current_inventory ci
+        JOIN products p ON p.sku = ci.sku
+        LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
+        LEFT JOIN (
+            SELECT sku, location_id, SUM(gross_revenue) AS revenue_30d
+            FROM sales_daily WHERE sale_date >= ? GROUP BY sku, location_id
+        ) rev ON rev.sku = ci.sku AND rev.location_id = ci.location_id
+        WHERE ci.on_hand > 0 AND p.top_level = 'Cannabis'
+        """
+        params: list = [rev_start]
+        if store:
+            sql += " AND ci.location_id = ?"
+            params.append(store)
+        rows = conn.execute(sql, params).fetchall()
+        as_of = conn.execute("SELECT MAX(as_of) FROM current_inventory").fetchone()[0]
+
+    total_cost = total_rev = 0.0
+    total_skus = 0
+    partners: dict[str, dict] = {}
+    uncovered: list[dict] = []
+    for sku, on_hand, cost, supplier, brand, name, rev30 in rows:
+        oh_cost = float(on_hand or 0) * float(cost or 0)
+        rev30 = float(rev30 or 0)
+        total_cost += oh_cost
+        total_rev += rev30
+        total_skus += 1
+        ag = by_lp.get(_norm_lp(supplier)) or by_brand.get(_norm_lp(brand))
+        if ag:
+            d = partners.setdefault(ag["partner"], {
+                "partner": ag["partner"], "rate_type": ag["rate_type"],
+                "rate_value": ag["rate_value"], "skus": 0,
+                "onhand_cost": 0.0, "revenue": 0.0})
+            d["skus"] += 1
+            d["onhand_cost"] += oh_cost
+            d["revenue"] += rev30
+        else:
+            uncovered.append({"sku": sku, "name": name, "brand": brand,
+                              "supplier": supplier, "onhand_cost": round(oh_cost, 2),
+                              "revenue": round(rev30, 2)})
+
+    partner_list: list[dict] = []
+    covered_cost = covered_rev = 0.0
+    covered_skus = 0
+    rebate_total = 0.0
+    for d in partners.values():
+        # Rebate basis: pct_wholesale = rate% of on-hand wholesale cost. Other
+        # rate_types fall back to 0 until their basis is defined.
+        rebate = (d["onhand_cost"] * d["rate_value"] / 100.0
+                  if d["rate_type"] == "pct_wholesale" else 0.0)
+        covered_cost += d["onhand_cost"]
+        covered_rev += d["revenue"]
+        covered_skus += d["skus"]
+        rebate_total += rebate
+        partner_list.append({
+            "partner": d["partner"],
+            "rate_type": d["rate_type"], "rate_value": d["rate_value"],
+            "skus": d["skus"],
+            "onhand_cost": round(d["onhand_cost"], 2),
+            "cost_share_pct": round(d["onhand_cost"] / total_cost * 100, 1) if total_cost else 0,
+            "revenue": round(d["revenue"], 2),
+            "revenue_share_pct": round(d["revenue"] / total_rev * 100, 1) if total_rev else 0,
+            "est_rebate": round(rebate, 2),
+        })
+    partner_list.sort(key=lambda x: -x["onhand_cost"])
+    uncovered.sort(key=lambda x: -x["onhand_cost"])
+
+    return {
+        "store": store,
+        "as_of": as_of,
+        "totals": {
+            "cannabis_skus": total_skus,
+            "cannabis_onhand_cost": round(total_cost, 2),
+            "cannabis_revenue_30d": round(total_rev, 2),
+            "covered_skus": covered_skus,
+            "covered_onhand_cost": round(covered_cost, 2),
+            "covered_revenue_30d": round(covered_rev, 2),
+            "covered_cost_pct": round(covered_cost / total_cost * 100, 1) if total_cost else 0,
+            "covered_skus_pct": round(covered_skus / total_skus * 100, 1) if total_skus else 0,
+            "est_rebate_total": round(rebate_total, 2),
+        },
+        "partners": partner_list,
+        "uncovered_top": uncovered[:50],
+    }
+
+
 @app.get("/api/analytics/sales-performance")
 def sales_performance(
     preset: str = "last30",
