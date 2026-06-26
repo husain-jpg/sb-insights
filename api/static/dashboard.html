@@ -1477,6 +1477,12 @@ async function renderReorder() {
                     title="Fill the selected store's latest OCS order template with these reorder quantities, ready to upload to OCS. Select a single store first.">
               <span style="font-size: 14px; line-height: 1;">⤒</span> Export to OCS Template
             </button>
+            <button id="reorder-compare-btn" class="btn" style="white-space: nowrap;"
+                    title="Upload an order a manager built on OCS (a CartExport/OrderExport .xlsx with quantities filled in) and compare it line-by-line to the engine's recommendation. Select a single store first.">
+              <span style="font-size: 14px; line-height: 1;">⇄</span> Compare My Order
+            </button>
+            <input type="file" id="reorder-compare-file" accept=".xlsx,.xls" style="display: none;">
+
             <button id="reorder-excel-btn" class="btn" style="white-space: nowrap;">
               <span style="font-size: 14px; line-height: 1;">⤓</span> Download Excel
             </button>
@@ -2027,7 +2033,176 @@ async function renderReorder() {
       }
     });
 
+    // ==== Compare My Order ====
+    // Upload a manager's built OCS order (CartExport/OrderExport .xlsx with
+    // quantities) and diff it against the engine's recommendation for the store.
+    const compareBtn = document.getElementById("reorder-compare-btn");
+    const compareFile = document.getElementById("reorder-compare-file");
+    if (compareBtn && compareFile) {
+      compareBtn.addEventListener("click", () => {
+        const store = storeFilter.value;
+        if (!store) {
+          alert("Select a single store (store filter, top-right) before comparing an order — orders are placed per store.");
+          return;
+        }
+        compareFile.value = "";
+        compareFile.click();
+      });
+      compareFile.addEventListener("change", async () => {
+        const file = compareFile.files[0];
+        if (!file) return;
+        const store = storeFilter.value;
+        if (!store) { alert("Select a store first."); return; }
+        const orig = compareBtn.innerHTML;
+        compareBtn.disabled = true;
+        compareBtn.textContent = "Comparing…";
+        try {
+          const fd = new FormData();
+          fd.append("file", file);
+          fd.append("location_id", store);
+          const res = await fetch("/api/order-fill/compare", { method: "POST", body: fd, credentials: "same-origin" });
+          const d = await res.json().catch(() => ({ detail: res.statusText }));
+          if (!res.ok) throw new Error(d.detail || "Comparison failed");
+          showOrderCompare(d, store, file.name);
+        } catch (e) {
+          alert("Comparison failed: " + e.message);
+        } finally {
+          compareBtn.disabled = false;
+          compareBtn.innerHTML = orig;
+        }
+      });
+    }
+
   } catch (e) { showError(e); }
+}
+
+// ========================================================================
+// Reorder Report — "Compare My Order" modal
+// ========================================================================
+// Renders the variance report from /api/order-fill/compare: a manager's built
+// OCS order vs the engine's recommendation, bucketed into missed / under /
+// over / on-target with dollar deltas.
+function showOrderCompare(data, store, fileName) {
+  const s = data.summary || {};
+  const lines = data.lines || [];
+  const b = s.buckets || {};
+  const money = (n) => (n < 0 ? "-$" : "$") + Math.abs(Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const bucketMeta = {
+    missed:    { label: "Missed", color: "#d66464", bg: "rgba(214,100,100,0.15)", desc: "Engine wanted it — none ordered" },
+    under:     { label: "Under-ordered", color: "#dc965a", bg: "rgba(220,150,90,0.15)", desc: "Ordered less than recommended" },
+    over:      { label: "Over-ordered", color: "#6aa6d6", bg: "rgba(106,166,214,0.15)", desc: "Ordered more than recommended" },
+    on_target: { label: "On target", color: "#6fcf85", bg: "rgba(80,180,100,0.15)", desc: "Matches the recommendation" },
+  };
+  const bucketTag = (bk) => {
+    const m = bucketMeta[bk] || { label: bk, color: "#999", bg: "rgba(150,150,150,0.15)" };
+    return `<span class="tag" style="background: ${m.bg}; color: ${m.color}; font-size: 9px; padding: 1px 6px; white-space: nowrap;">${m.label}</span>`;
+  };
+  const urgencyTag = (u) => {
+    if (!u) return "";
+    const cls = urgencyTagClass(u);
+    return `<span class="tag ${cls}" style="font-size: 9px; padding: 1px 5px;">${u}</span>`;
+  };
+
+  // Bucket summary chips
+  const chip = (bk) => {
+    const m = bucketMeta[bk];
+    return `<div style="flex: 1; min-width: 110px; background: ${m.bg}; border: 1px solid ${m.color}33; border-radius: 6px; padding: 8px 10px;">
+      <div style="font-size: 20px; font-weight: 600; color: ${m.color};">${b[bk] || 0}</div>
+      <div style="font-size: 11px; color: var(--text-dim);">${m.label}</div>
+      <div style="font-size: 10px; color: var(--text-faint);">${m.desc}</div>
+    </div>`;
+  };
+
+  const critWarn = (s.missed_critical_count || 0) > 0
+    ? `<div style="margin: 10px 0 0; padding: 8px 12px; background: rgba(214,100,100,0.12); border: 1px solid rgba(214,100,100,0.4); border-radius: 6px; font-size: 12px; color: #d66464;">
+         ⚠ <strong>${s.missed_critical_count}</strong> stockout/critical SKU(s) the engine flagged were <strong>not ordered</strong>. These are likely lost sales — review the Missed rows below.
+       </div>`
+    : "";
+
+  const rowHtml = (l) => {
+    const dColor = l.delta_cost > 0 ? "#6aa6d6" : (l.delta_cost < 0 ? "#dc965a" : "var(--text-dim)");
+    const heroStar = l.is_top_sku ? ' <span style="color:#c89b32;" title="Hero SKU">★</span>' : "";
+    const notOffered = !l.in_template ? ' <span class="tag" style="font-size:8px;padding:0 4px;background:rgba(150,150,150,0.15);color:#999;">not offered</span>' : "";
+    return `<tr style="border-bottom: 1px solid var(--border);">
+      <td style="padding: 6px 8px;">${bucketTag(l.bucket)}</td>
+      <td style="padding: 6px 8px;">
+        <div style="font-size: 12px;">${escapeHtml(l.product_name || l.sku)}${heroStar}${notOffered}</div>
+        <div style="font-size: 10px; color: var(--text-faint);">${escapeHtml(l.brand || "")}${l.brand ? " · " : ""}${escapeHtml(l.sku)}</div>
+      </td>
+      <td style="padding: 6px 8px; text-align: center;">${urgencyTag(l.urgency)}</td>
+      <td style="padding: 6px 8px; text-align: right;">${l.on_hand != null ? l.on_hand : "—"}</td>
+      <td style="padding: 6px 8px; text-align: right;">${l.daily_velocity != null ? l.daily_velocity.toFixed(2) : "—"}</td>
+      <td style="padding: 6px 8px; text-align: right; font-weight: 600;">${l.ordered_cases}</td>
+      <td style="padding: 6px 8px; text-align: right; font-weight: 600;">${l.engine_cases}</td>
+      <td style="padding: 6px 8px; text-align: right; color: ${dColor};">${l.delta_cases > 0 ? "+" : ""}${l.delta_cases}</td>
+      <td style="padding: 6px 8px; text-align: right; color: ${dColor};">${money(l.delta_cost)}</td>
+    </tr>`;
+  };
+
+  const overlay = document.createElement("div");
+  overlay.id = "compare-overlay";
+  overlay.style.cssText = "position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;";
+  overlay.innerHTML = `
+    <div style="background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; max-width: 1000px; width: 100%; max-height: 92vh; overflow: auto;">
+      <div style="padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline;">
+        <div>
+          <h3 style="margin: 0;">Order vs. Recommendation — ${escapeHtml(store)}</h3>
+          <div style="font-size: 11px; color: var(--text-faint); margin-top: 2px;">${escapeHtml(fileName || "")} · engine as of ${s.as_of_date || "?"}</div>
+        </div>
+        <button id="compare-close" class="btn" style="font-size: 11px;">Close</button>
+      </div>
+      <div style="padding: 16px 20px;">
+        <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 14px;">
+          <div style="flex: 1; min-width: 150px;">
+            <div style="font-size: 11px; color: var(--text-dim);">Manager ordered</div>
+            <div style="font-size: 22px; font-weight: 600;">${money(s.ordered_cost_total)}</div>
+            <div style="font-size: 11px; color: var(--text-faint);">${s.ordered_cases_total || 0} cases · ${s.ordered_lines || 0} lines</div>
+          </div>
+          <div style="flex: 1; min-width: 150px;">
+            <div style="font-size: 11px; color: var(--text-dim);">Engine recommended</div>
+            <div style="font-size: 22px; font-weight: 600;">${money(s.engine_cost_total)}</div>
+            <div style="font-size: 11px; color: var(--text-faint);">${s.engine_cases_total || 0} cases · ${s.engine_lines || 0} lines</div>
+          </div>
+          <div style="flex: 1; min-width: 150px;">
+            <div style="font-size: 11px; color: var(--text-dim);">Net variance</div>
+            <div style="font-size: 22px; font-weight: 600; color: ${(s.delta_cost_total||0) < 0 ? '#dc965a' : '#6aa6d6'};">${money(s.delta_cost_total)}</div>
+            <div style="font-size: 11px; color: var(--text-faint);">+${money(s.over_spend)} over · −${money(s.under_spend)} short</div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 4px;">
+          ${chip("missed")}${chip("under")}${chip("over")}${chip("on_target")}
+        </div>
+        ${critWarn}
+        <p style="font-size: 11px; color: var(--text-faint); margin: 14px 0 6px;">
+          Quantities in <strong>cases</strong>. Δ = ordered − recommended. Engine anchored to the latest sales date, same as the Reorder Report. Sorted by biggest dollar gap.
+        </p>
+        <div style="overflow-x: auto;">
+          <table style="width: 100%; font-size: 12px; border-collapse: collapse;">
+            <thead>
+              <tr style="text-align: left; border-bottom: 2px solid var(--border); color: var(--text-dim); font-size: 11px;">
+                <th style="padding: 6px 8px;">Status</th>
+                <th style="padding: 6px 8px;">Product</th>
+                <th style="padding: 6px 8px; text-align: center;">Urgency</th>
+                <th style="padding: 6px 8px; text-align: right;">On hand</th>
+                <th style="padding: 6px 8px; text-align: right;">Velocity</th>
+                <th style="padding: 6px 8px; text-align: right;">Ordered</th>
+                <th style="padding: 6px 8px; text-align: right;">Rec.</th>
+                <th style="padding: 6px 8px; text-align: right;">Δ cases</th>
+                <th style="padding: 6px 8px; text-align: right;">Δ $</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${lines.length ? lines.map(rowHtml).join("") : `<tr><td colspan="9" style="padding: 20px; text-align: center; color: var(--text-dim);">No differences to show — the order matches the recommendation, or nothing was ordered.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById("compare-close").addEventListener("click", () => overlay.remove());
+  overlay.addEventListener("click", e => { if (e.target === overlay) overlay.remove(); });
 }
 
 function urgencyTagClass(u) {

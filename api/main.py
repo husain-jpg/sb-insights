@@ -4185,6 +4185,51 @@ async def order_fill(
     }
 
 
+@app.post("/api/order-fill/compare")
+async def order_fill_compare(
+    file: UploadFile = File(...),
+    location_id: str = Form(...),
+    ceiling_days: int | None = Form(None),
+    min_velocity: float | None = Form(None),
+) -> dict:
+    """Compare a manager's built OCS order (a CartExport/OrderExport .xlsx with
+    the Quantity column filled in) against the engine's reorder recommendation
+    for the same store. Returns a per-SKU variance report. Stateless — nothing
+    is stored. Operational tool (not admin-gated): managers placing orders use it.
+    """
+    from io import BytesIO
+    from jobs.ocs_order_fill import compare_order
+    from dataclasses import asdict
+
+    if not location_id:
+        raise HTTPException(status_code=400, detail="Select the store this order is for.")
+
+    contents = await file.read()
+    if len(contents) > 25_000_000:  # 25MB safety net
+        raise HTTPException(status_code=413, detail="file too large")
+    name = (file.filename or "").lower()
+    if not name.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Expected an .xlsx order export")
+
+    buf = BytesIO(contents)
+    try:
+        with db() as conn:
+            kw = {}
+            if ceiling_days is not None: kw["ceiling_days"] = ceiling_days
+            if min_velocity is not None: kw["min_velocity"] = min_velocity
+            lines, summary = compare_order(conn, buf, location_id=location_id, **kw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {e}")
+
+    return {
+        "summary": summary,
+        "lines": [asdict(l) for l in lines],
+        "original_filename": file.filename,
+    }
+
+
 @app.post("/api/order-fill/import")
 async def import_order_fill_upload(
     file: UploadFile = File(...),
