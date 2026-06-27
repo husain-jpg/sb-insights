@@ -68,7 +68,6 @@ def fill_template(
     ceiling_days: int | None = None,
     min_velocity: float | None = None,
     extra_order_units: dict[str, int] | None = None,
-    trial_one_case: bool = False,
 ) -> tuple[list[OrderLine], pd.DataFrame, dict]:
     """
     Read the OCS template, compute engine recs for the store, fill quantities.
@@ -101,8 +100,7 @@ def fill_template(
         kw["ceiling_days"] = ceiling_days
     if min_velocity is not None:
         kw["min_velocity"] = min_velocity
-    recs = compute_all_reorders(conn, location_id=location_id,
-                                trial_one_case=trial_one_case, **kw)
+    recs = compute_all_reorders(conn, location_id=location_id, **kw)
 
     # Map engine recs by ocs_variant for fast lookup
     recs_by_variant: dict[str, object] = {}

@@ -535,7 +535,6 @@ def compute_all_reorders(
     mix_multipliers: dict[str, float] | None = None,
     use_top_sku_tier: bool = True,
     apply_successors: bool = False,
-    trial_one_case: bool = False,
 ) -> list[ReorderRec]:
     """
     Compute reorder recs for every (SKU, location) with stock or recent sales.
@@ -757,17 +756,6 @@ def compute_all_reorders(
             days_supply=days_supply, velocity=velocity,
             stockout_days=stockout_days, stockout_min_velocity=stockout_min_vel,
         )
-
-        # Trial mode: cap any positive recommendation to a single OCS case, so
-        # the whole order becomes a conservative one-pack-per-SKU trial. The
-        # engine's normal "what to order" decisions are untouched (a SKU that
-        # rounds to 0 stays 0); only the quantity is clamped. Real demand stays
-        # visible via raw_qty (and the Diagnose view). Heroes included.
-        if trial_one_case and rounded_qty > 0:
-            if pack_size and pack_size > 0:
-                rounded_qty, cases = pack_size, 1
-            else:
-                rounded_qty, cases = 1, None
 
         recs.append(ReorderRec(
             sku=sku,
