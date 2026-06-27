@@ -1520,6 +1520,10 @@ async function renderReorder() {
             <input type="checkbox" id="mix-aware" style="margin: 0;">
             Mix-aware
           </label>
+          <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Trial mode: cap every suggested line to a single OCS case (1 pack), so the whole order is a conservative 1-case-per-SKU trial. The engine's 'what to order' decisions are unchanged — only the quantity is clamped. Applies to the table, the suggested-$ KPI, the Excel download and the OCS template export. (Manual pins and Suggested-Addition trials keep their own quantities.)">
+            <input type="checkbox" id="trial-mode" style="margin: 0;">
+            Trial mode (1 case each)
+          </label>
           <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; user-select: none; cursor: pointer;" title="Show only Hero SKUs — these are top-5 within each (category, size) bucket and get protected reorder treatment.">
             <input type="checkbox" id="anchors-only" style="margin: 0;">
             Heroes only
@@ -1766,6 +1770,7 @@ async function renderReorder() {
     const urgencyFilter = document.getElementById("urgency-filter");
     const ocsOutToggle = document.getElementById("include-ocs-out");
     const mixAwareToggle = document.getElementById("mix-aware");
+    const trialModeToggle = document.getElementById("trial-mode");
     const anchorsOnlyToggle = document.getElementById("anchors-only");
     const mixSummaryEl = document.getElementById("mix-multiplier-summary");
 
@@ -1872,6 +1877,7 @@ async function renderReorder() {
       }
       if (ocsOutToggle.checked) params.set("include_ocs_out", "true");
       if (mixAwareToggle.checked) params.set("mix_aware", "true");
+      if (trialModeToggle && trialModeToggle.checked) params.set("trial_mode", "true");
       // Exposed so the Suggested Additions panel can refresh the table after
       // 'Add' (the new trial-add row needs to appear).
       window._reorderRefetch = refetch;
@@ -1912,6 +1918,7 @@ async function renderReorder() {
     urgencyFilter.addEventListener("change", refetch);
     ocsOutToggle.addEventListener("change", refetch);
     mixAwareToggle.addEventListener("change", refetch);
+    if (trialModeToggle) trialModeToggle.addEventListener("change", refetch);
     anchorsOnlyToggle.addEventListener("change", applyTextFilter);
     document.getElementById("data-fees-only").addEventListener("change", applyTextFilter);
     document.getElementById("sale-flagged-only").addEventListener("change", applyTextFilter);
@@ -1994,6 +2001,7 @@ async function renderReorder() {
       if (urgencyFilter.value && urgencyFilter.value !== "all") params.set("urgency", urgencyFilter.value);
       if (ocsOutToggle.checked) params.set("include_ocs_out", "true");
       if (mixAwareToggle.checked) params.set("mix_aware", "true");
+      if (trialModeToggle && trialModeToggle.checked) params.set("trial_mode", "true");
       downloadUrl(`/api/export/reorder?${params.toString()}`);
     });
     search.addEventListener("input", applyTextFilter);
@@ -2012,7 +2020,8 @@ async function renderReorder() {
       exportOcsBtn.disabled = true;
       exportOcsBtn.textContent = "Preparing…";
       try {
-        const res = await fetch(`/api/reorder/export-ocs-template?store=${encodeURIComponent(store)}`, { credentials: "same-origin" });
+        const trialQs = (trialModeToggle && trialModeToggle.checked) ? "&trial_mode=true" : "";
+        const res = await fetch(`/api/reorder/export-ocs-template?store=${encodeURIComponent(store)}${trialQs}`, { credentials: "same-origin" });
         if (!res.ok) {
           const err = await res.json().catch(() => ({ detail: res.statusText }));
           throw new Error(err.detail || "Export failed");

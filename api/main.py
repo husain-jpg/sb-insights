@@ -1130,6 +1130,7 @@ def get_reorder(
     min_velocity: float | None = None,
     mix_aware: bool = False,                 # NEW: apply category mix multipliers
     mix_days: int = 90,                      # window for mix signal (default 90d)
+    trial_mode: bool = False,                # cap every suggestion to 1 OCS case
 ) -> dict:
     # Resolve top_level default (Cannabis) before anything else
     tl = top_level if top_level is not None else "Cannabis"
@@ -1158,6 +1159,7 @@ def get_reorder(
             min_velocity=min_velocity,
             mix_multipliers=mix_multipliers,
             apply_successors=True,  # Phase 3: resolve re-listed orphans to successors
+            trial_one_case=trial_mode,  # cap each suggestion to 1 OCS case
         )
         price_map = get_price_map(conn)
 
@@ -1456,6 +1458,7 @@ def get_reorder(
             "include_ocs_out": include_ocs_out,
             "mix_aware": mix_aware,
             "mix_days": mix_days if mix_aware else None,
+            "trial_mode": trial_mode,
         },
         "mix_multipliers": mix_multipliers if mix_aware else None,
     }
@@ -3408,11 +3411,12 @@ def export_reorder(
     urgency: str | None = None,
     include_ocs_out: bool = False,
     mix_aware: bool = False,
+    trial_mode: bool = False,
 ) -> Response:
     """Download Reorder queue as Excel, respecting current filters."""
     data = get_reorder(
         store=store, top_level=top_level, urgency=urgency,
-        include_ocs_out=include_ocs_out, mix_aware=mix_aware,
+        include_ocs_out=include_ocs_out, mix_aware=mix_aware, trial_mode=trial_mode,
     )
     recs = data["recommendations"]
 
@@ -4290,7 +4294,7 @@ async def import_order_fill_upload(
 
 
 @app.get("/api/reorder/export-ocs-template")
-def export_ocs_template(store: str | None = None):
+def export_ocs_template(store: str | None = None, trial_mode: bool = False):
     """Fill the store's latest auto-pulled OrderExport with the engine's reorder
     quantities and return it ready to upload to OCS — no manual upload needed.
 
@@ -4335,7 +4339,8 @@ def export_ocs_template(store: str | None = None):
                         (variant,)).fetchone()
                     extra[variant] = int(pk[0]) if pk and pk[0] else 1
             _lines, filled_df, _summary = fill_template(
-                conn, path, location_id=store, extra_order_units=extra)
+                conn, path, location_id=store, extra_order_units=extra,
+                trial_one_case=trial_mode)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         out = BytesIO()
