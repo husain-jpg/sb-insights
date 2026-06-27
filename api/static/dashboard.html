@@ -1387,6 +1387,39 @@ function fmtShortDate(iso) {
   return `${months[+m[2] - 1]} ${+m[3]}`;
 }
 
+// Render the "Deals" cell for a reorder row: one tag per active data-revenue
+// program the SKU is on — LP Partner (direct), Collective (IRCC/CC/Seeker), or
+// LTO. Driven by r.deal_components from the resolver, which already applies the
+// stacking rules (a partner/LTO supersedes a collective).
+function dealsCell(r) {
+  const comps = (r && r.deal_components) || [];
+  if (!comps.length) return '<span class="muted">—</span>';
+  const tag = (bg, color, text, tip) =>
+    `<span class="tag" style="background:${bg}; color:${color}; border-color:${color}55; font-size:9px; padding:1px 5px; margin:0 2px 2px 0; display:inline-block; vertical-align:middle;" title="${tip}">${text}</span>`;
+  return comps.map(c => {
+    const disp = c.rate_value_display ? escapeHtml(c.rate_value_display) : '';
+    if (c.kind === 'partner') {
+      let name = (c.label || '').replace(/^Partner:\s*/i, '');
+      name = (typeof titleCaseLp === 'function') ? titleCaseLp(name) : name;
+      return tag('rgba(140,100,180,0.15)', '#a78bd9',
+        `LP: ${escapeHtml(name)}`,
+        `Direct LP partnership — ${escapeHtml(name)}${disp ? ' (' + disp + ')' : ''}`);
+    }
+    if (c.kind === 'lto') {
+      const name = (c.label || '').replace(/^LTO:\s*/i, '');
+      return tag('rgba(220,150,90,0.15)', '#dc965a',
+        `LTO: ${escapeHtml(name)}`,
+        `Limited-time offer${disp ? ' — ' + disp : ''}`);
+    }
+    // collective (IRCC / Canna Collective / Seeker)
+    const cname = c.label === 'Canna Collective' ? 'CC' : escapeHtml(c.label || 'Collective');
+    const cpct = c.rate ? Number(c.rate).toFixed(1).replace(/\.0$/, '') : '';
+    return tag('rgba(70,140,90,0.15)', '#6dab84',
+      `${cname}${cpct ? ' ' + cpct + '%' : ''}`,
+      `Collective rebate — ${escapeHtml(c.label || '')}${disp ? ' (' + disp + ')' : ''}`);
+  }).join('');
+}
+
 async function renderReorder() {
   const main = document.getElementById("main");
   main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading reorder queue…</div>`;
@@ -1659,17 +1692,8 @@ async function renderReorder() {
           // Name on line 1 (just a slim ★ for Heroes); everything else lives
           // on the small line 2 so the product name stays scannable.
           const anchor = r.is_top_sku ? `<span style="color: #c89b32; margin-right: 4px;" title="Hero — top seller in its format at this store by trailing revenue; protected by tiered reorder logic">★</span>` : '';
-          const dataFee = (() => {
-            if (r.data_fee_is_direct) {
-              return `<span class="tag" style="background: rgba(140, 100, 180, 0.15); color: #a78bd9; border-color: rgba(160, 110, 200, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Direct deal with ${r.data_fee_partner} — this SKU is excluded from collective rebate programs">DIRECT</span>`;
-            }
-            if (r.data_fee_pct) {
-              const basis = r.data_fee_basis === 'wholesale_cost' ? 'WS' : r.data_fee_basis === 'retail_sales' ? 'RT' : '';
-              const partnerShort = r.data_fee_partner === 'Canna Collective' ? 'CC' : (r.data_fee_partner || '');
-              return `<span class="tag" style="background: rgba(70, 140, 90, 0.15); color: #6dab84; border-color: rgba(80, 160, 100, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Active data revenue deal: ${r.data_fee_partner} pays ${r.data_fee_pct}% of ${r.data_fee_basis === 'wholesale_cost' ? 'wholesale cost' : 'retail sales'} for this SKU">${partnerShort}: ${r.data_fee_pct}% ${basis}</span>`;
-            }
-            return '';
-          })();
+          // (Data-revenue deal tag moved out from under the product name into
+          // its own "Deals" column — see the dealsCell() column below.)
           // Order Fill badges (visibility from latest Order Fill import)
           const ofBadges = (() => {
             const out = [];
@@ -1715,7 +1739,7 @@ async function renderReorder() {
             }
             return '';
           })();
-          const badges = `${dataFee}${ofBadges}${saleTag}`;
+          const badges = `${ofBadges}${saleTag}`;
           return `${anchor}${escapeHtml(r.product_name)}<div class="sku">${r.sku} · ${r.category || "—"}${badges ? `<span style="margin-left: 6px;">${badges}</span>` : ''}</div>`;
         } },
       { key: 'location_id', label: 'Store', render: r => storeLabel(r.location_id) },
@@ -1749,6 +1773,9 @@ async function renderReorder() {
         } },
       { key: 'line_total', label: 'Est. $', type: 'number', align: 'right',
         render: r => r.line_total ? fmt$(r.line_total) : '—' },
+      { key: 'deals', label: 'Deals',
+        tooltip: "Active data-revenue programs for this SKU: LP Partner (a direct LP/brand agreement), Collective (IRCC / Canna Collective / Seeker), or LTO. Per the stacking rules, a Partner or LTO supersedes a collective, so a collective only shows when no Partner/LTO applies.",
+        render: r => dealsCell(r) },
       { key: 'ocs_stock_status', label: 'OCS Avail.', align: 'right',
         tooltip: "Whether OCS will deliver this SKU. 'Yes' = in warehouse stock; 'Flow-Through'/'Click-to-Buy' = orderable this cycle via the Order Fill (flow-through ships from the LP, so it's available even when the warehouse shows out); 'No' = out and not in this cycle's Order Fill; '—' = not in the current OCS catalog.",
         render: r => {

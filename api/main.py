@@ -1267,11 +1267,16 @@ def get_reorder(
             d["data_fee_partner"] = deal["partner"]
             d["data_fee_basis"] = deal["basis"]
             d["data_fee_is_direct"] = deal["is_direct"]
+            # Full program breakdown for the Deals column: each component is
+            # {kind: 'partner'|'collective'|'lto', label, rate, rate_value_display}.
+            # Reflects the stacking rules (a partner/LTO supersedes a collective).
+            d["deal_components"] = deal.get("components")
         else:
             d["data_fee_pct"] = None
             d["data_fee_partner"] = None
             d["data_fee_basis"] = None
             d["data_fee_is_direct"] = False
+            d["deal_components"] = None
 
         # Attach Order Fill metadata (visibility only — does not affect reorder math).
         # Look up via OCS variant number, which is how Order Fill keys SKUs.
@@ -1409,6 +1414,7 @@ def get_reorder(
             "data_fee_partner": deal["partner"] if deal else None,
             "data_fee_basis": deal["basis"] if deal else None,
             "data_fee_is_direct": bool(deal and deal["is_direct"]),
+            "deal_components": deal.get("components") if deal else None,
             "avg_rating": None, "rating_count": 0, "comment_count": 0,
             "sale_flag": None, "sale_flag_detail": None,
             "order_fill_flow_thru": None,
@@ -5868,6 +5874,7 @@ def _build_pin_rows(conn, store: str | None, recs, tl: str, gap_deal_map: dict) 
             "data_fee_partner": deal["partner"] if deal else None,
             "data_fee_basis": deal["basis"] if deal else None,
             "data_fee_is_direct": bool(deal and deal["is_direct"]),
+            "deal_components": deal.get("components") if deal else None,
             "avg_rating": None, "rating_count": 0, "comment_count": 0,
             "sale_flag": None, "sale_flag_detail": None, "order_fill_flow_thru": None,
         })
