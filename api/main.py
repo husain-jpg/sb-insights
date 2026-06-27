@@ -5732,21 +5732,20 @@ def get_performance_comparison(
 #   - User actions (snooze/dismiss/add) per (location, sku) — Bradford might
 #     dismiss a SKU that Amherstview wants to consider.
 
-def _trial_order_qty(pack_size: int, peer_vel: float) -> tuple[int, int]:
-    """Conservative trial-order size for a SKU the store doesn't carry yet.
-    Returns (units, cases). Singles: cap at 7 units (or peer 7-day demand).
-    Cases: 1 case normally, 2 only if peer velocity would burn through 1 in
-    under 3 days. Once stocked, the regular reorder engine takes over.
-    Shared by the Suggested Additions list, the trial-add reorder rows, and
-    the OCS template fill so all three agree."""
+def _trial_order_qty(pack_size: int, peer_vel: float = 0) -> tuple[int, int]:
+    """Trial-order size for a SKU the store doesn't carry yet: always a SINGLE
+    case (one pack). Trials are deliberately the smallest orderable quantity —
+    once the SKU starts selling, the regular reorder engine sizes it from real
+    velocity. Returns (units, cases).
+
+    peer_vel is still accepted (callers pass it) but no longer affects the size;
+    previously a fast peer mover could be bumped to 2 cases, which the user
+    didn't want. Shared by the Suggested Additions list, the trial-add reorder
+    rows, and the OCS template fill so all three agree."""
     pack_size = pack_size or 1
-    peer_vel = peer_vel or 0
     if pack_size <= 1:
-        units = min(7, max(1, math.ceil(peer_vel * 7)))
-        return units, units
-    cases_for_three_day = math.ceil((peer_vel * 3) / pack_size) if pack_size > 0 else 1
-    cases = max(1, min(2, cases_for_three_day))
-    return cases * pack_size, cases
+        return 1, 1
+    return pack_size, 1
 
 
 def _added_gap_rows(conn, location_id: str) -> list[dict]:
