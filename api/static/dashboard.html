@@ -1376,6 +1376,17 @@ async function showReorderDiagnose() {
   }
 }
 
+// Format an ISO date ('2026-07-09') as a short, readable 'Jul 9'. Parses the
+// parts manually to avoid timezone shifts from new Date(isoString). Returns ''
+// for null/unparseable input.
+function fmtShortDate(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+  if (!m) return "";
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${months[+m[2] - 1]} ${+m[3]}`;
+}
+
 async function renderReorder() {
   const main = document.getElementById("main");
   main.innerHTML = `<div class="loading"><span class="spinner"></span> Loading reorder queue…</div>`;
@@ -1674,11 +1685,17 @@ async function renderReorder() {
             // it "Click-to-Buy", so a CTB tag here was pure duplication.)
             if (r.order_fill_flow_thru === true) {
               const tier = r.order_fill_delivery_tier;
-              const eta = r.order_fill_estimated_delivery ? ` (delivery ${r.order_fill_estimated_delivery})` : '';
+              // Show OCS's committed delivery date inline so managers see when a
+              // flow-through order will arrive (not just on hover). The Order Fill
+              // is pulled daily, so this date is current for ordering today.
+              const etaRaw = r.order_fill_estimated_delivery;
+              const etaFmt = fmtShortDate(etaRaw);
+              const etaText = etaFmt ? ` · ${etaFmt}` : '';
+              const etaTip = etaRaw ? ` — OCS est. delivery ${etaRaw}` : '';
               if (tier === 'Expedited') {
-                out.push(`<span class="tag" style="background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Flow Through Expedited: longer lead time than CTB${eta}">FT-EXP</span>`);
+                out.push(`<span class="tag" style="background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Flow Through Expedited: ships from the LP${etaTip}">FT-EXP${etaText}</span>`);
               } else if (tier === 'Standard') {
-                out.push(`<span class="tag" style="background: rgba(180, 130, 100, 0.15); color: #c08560; border-color: rgba(190, 140, 110, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Flow Through Standard: longest lead time${eta}">FT-STD</span>`);
+                out.push(`<span class="tag" style="background: rgba(180, 130, 100, 0.15); color: #c08560; border-color: rgba(190, 140, 110, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Flow Through Standard: ships from the LP${etaTip}">FT-STD${etaText}</span>`);
               }
             }
             return out.join('');
