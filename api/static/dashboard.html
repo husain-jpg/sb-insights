@@ -1495,10 +1495,20 @@ async function renderReorder() {
       if (k.active_stockouts > 0 && !(heavy && stockoutShare > 0.5)) {
         pts.push(`<strong>${fmtN(k.active_stockouts)} selling SKUs are stocked out</strong> — these are the priority to restock.`);
       }
-      if ((k.weekly_burn_cost || 0) > 0) {
+      // Order sense-check: this week's order vs the last 7 days' COGS. A weekly
+      // order should roughly replace a week's cost of sales, so this is the quick
+      // "does this order make sense" gut check, color-flagged by band.
+      if ((k.cogs_7d || 0) > 0 && k.order_vs_cogs_pct != null) {
+        const pct = k.order_vs_cogs_pct;
+        let flag, color;
+        if (pct < 80) { flag = 'under-ordering'; color = '#dc965a'; }
+        else if (pct <= 120) { flag = 'on track'; color = '#6dab84'; }
+        else { flag = 'building inventory'; color = '#6aa6d6'; }
+        pts.push(`<strong>Order sense-check:</strong> this week's order (<strong>${fmt$(reorder$)}</strong> wholesale) is <strong style="color:${color}">${pct}% of the last 7 days' COGS</strong> (${fmt$(k.cogs_7d)}) — <span style="color:${color}; font-weight:600;">${flag}</span>. <span style="color:var(--text-faint);">~100% ≈ replacing what sold.</span>`);
+      } else if ((k.weekly_burn_cost || 0) > 0) {
+        // Fallback when there's no recent 7-day COGS (e.g. a new/quiet store).
         const pct = Math.round(reorder$ / k.weekly_burn_cost * 100);
-        // Note the mixed cost basis so the ratio isn't read as a 1:1 comparison.
-        pts.push(`This week's suggested order is <strong>${fmt$(reorder$)}</strong> at OCS wholesale — about ${pct}% of weekly sales at actual landed cost.`);
+        pts.push(`This week's suggested order is <strong>${fmt$(reorder$)}</strong> at OCS wholesale — about ${pct}% of weekly sales at landed cost.`);
       }
       if (!pts.length) return '';
       return `

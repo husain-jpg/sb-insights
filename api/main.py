@@ -1001,6 +1001,21 @@ def compute_reorder_kpis(conn, *, store: str | None, top_level: str, as_of: date
     """, [win_start, as_of.isoformat()] + tl_params + loc_param)
     cogs_30d = cur.fetchone()[0] or 0.0
 
+    # Trailing-7-day COGS — the sense-check denominator. A weekly order should
+    # roughly replace a week's cost of sales; the report compares the order $
+    # against this. Same cost basis as above (landed → OCS wholesale → 60% retail).
+    win7_start = (as_of - timedelta(days=6)).isoformat()
+    cur.execute(f"""
+        SELECT COALESCE(SUM(x.units_sold * {COST_COGS}), 0)
+        FROM sales_daily x
+        JOIN products p ON p.sku = x.sku
+        LEFT JOIN current_inventory ci ON ci.sku = x.sku AND ci.location_id = x.location_id
+        LEFT JOIN prices pr ON pr.sku = x.sku AND pr.location_id = x.location_id
+        LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
+        WHERE x.sale_date >= ? AND x.sale_date <= ? {tl_clause} {loc_clause}
+    """, [win7_start, as_of.isoformat()] + tl_params + loc_param)
+    cogs_7d = cur.fetchone()[0] or 0.0
+
     # Slow / dead stock by recency of last sale (on-hand only).
     cur.execute(f"""
         SELECT
@@ -1036,6 +1051,7 @@ def compute_reorder_kpis(conn, *, store: str | None, top_level: str, as_of: date
         "on_hand_value": round(float(on_hand_value), 2),
         "on_hand_units": int(on_hand_units or 0),
         "cogs_30d": round(float(cogs_30d), 2),
+        "cogs_7d": round(float(cogs_7d), 2),
         "daily_burn_cost": round(daily_burn, 2),
         "weekly_burn_cost": round(daily_burn * 7, 2),
         "days_on_hand": round(float(on_hand_value) / daily_burn, 1) if daily_burn > 0 else None,
@@ -1431,9 +1447,15 @@ def get_reorder(
 
     # Assemble header KPIs: inventory-derived metrics + this week's reorder
     # totals + active stockout count (selling SKUs at 0 on-hand).
+    _reorder_cost = round(sum(p["line_total"] for p in actionable), 2)
+    _cogs_7d = kpis_inv.get("cogs_7d") or 0
     kpis = {
         **kpis_inv,
-        "reorder_cost": round(sum(p["line_total"] for p in actionable), 2),
+        "reorder_cost": _reorder_cost,
+        # Sense-check: the order's wholesale $ as a % of the last 7 days' COGS.
+        # ~100% = replacing what sold; <<100% = under-ordering (inventory
+        # shrinking); >>100% = building/catch-up. None when no recent COGS.
+        "order_vs_cogs_pct": round(_reorder_cost / _cogs_7d * 100) if _cogs_7d else None,
         "reorder_units": sum(p["reorder_qty"] for p in actionable),
         # Count only rows with an actual order — needs_review rows (qty 0) are
         # visible in the table but aren't "SKUs being reordered".
