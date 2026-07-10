@@ -1500,11 +1500,19 @@ async function renderReorder() {
       // "does this order make sense" gut check, color-flagged by band.
       if ((k.cogs_7d || 0) > 0 && k.order_vs_cogs_pct != null) {
         const pct = k.order_vs_cogs_pct;
+        // An overstocked store SHOULD order below its COGS (drawing down the
+        // glut), so don't cry "under-ordering" there — read days-on-hand too.
+        const overstocked = k.days_on_hand != null && k.days_on_hand > 28;
         let flag, color;
-        if (pct < 80) { flag = 'under-ordering'; color = '#dc965a'; }
-        else if (pct <= 120) { flag = 'on track'; color = '#6dab84'; }
+        if (pct < 80) {
+          if (overstocked) { flag = 'drawing down excess'; color = '#6dab84'; }
+          else { flag = 'under-ordering'; color = '#dc965a'; }
+        } else if (pct <= 120) { flag = 'on track'; color = '#6dab84'; }
         else { flag = 'building inventory'; color = '#6aa6d6'; }
-        pts.push(`<strong>Order sense-check:</strong> this week's order (<strong>${fmt$(reorder$)}</strong> wholesale) is <strong style="color:${color}">${pct}% of the last 7 days' COGS</strong> (${fmt$(k.cogs_7d)}) — <span style="color:${color}; font-weight:600;">${flag}</span>. <span style="color:var(--text-faint);">~100% ≈ replacing what sold.</span>`);
+        const tail = (pct < 80 && overstocked)
+          ? ` <span style="color:var(--text-faint);">(~${k.days_on_hand}d on hand — correct to buy under sales while working it down.)</span>`
+          : ` <span style="color:var(--text-faint);">~100% ≈ replacing what sold.</span>`;
+        pts.push(`<strong>Order sense-check:</strong> this week's order (<strong>${fmt$(reorder$)}</strong> wholesale) is <strong style="color:${color}">${pct}% of the last 7 days' COGS</strong> (${fmt$(k.cogs_7d)}) — <span style="color:${color}; font-weight:600;">${flag}</span>.${tail}`);
       } else if ((k.weekly_burn_cost || 0) > 0) {
         // Fallback when there's no recent 7-day COGS (e.g. a new/quiet store).
         const pct = Math.round(reorder$ / k.weekly_burn_cost * 100);
