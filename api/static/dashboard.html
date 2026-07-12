@@ -1399,6 +1399,7 @@ function dealsCell(r) {
     const disp = c.rate_value_display ? escapeHtml(c.rate_value_display) : '';
     if (c.kind === 'partner') {
       let name = (c.label || '').replace(/^Partner:\s*/i, '');
+      name = lpTradeName(name);
       name = (typeof titleCaseLp === 'function') ? titleCaseLp(name) : name;
       return tag('rgba(140,100,180,0.15)', '#a78bd9',
         `LP: ${escapeHtml(name)}`,
@@ -2899,6 +2900,14 @@ function titleCaseLp(s) {
   if (/[a-z]/.test(s)) return s;            // already mixed-case — leave it
   return s.toLowerCase().replace(/[a-z0-9]+/g, w => w.charAt(0).toUpperCase() + w.slice(1));
 }
+// Reduce a licensed-producer legal name to its trade name: for a numbered corp
+// doing business as a brand ('10392804 Canada Inc. DBA Sweet Vengeance'), keep
+// only the part after 'DBA'. Otherwise return the name unchanged.
+function lpTradeName(s) {
+  if (!s) return s;
+  const m = /\bd\.?b\.?a\.?\b[:\s]*(.+)$/i.exec(String(s));
+  return m ? m[1].trim() : s;
+}
 // Case- and punctuation-insensitive key for matching LP/brand names.
 function normLp(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ''); }
 
@@ -3774,7 +3783,7 @@ function renderPartnerCoverageResult(data) {
 
   const partnerRows = (data.partners || []).map(p => `
     <tr style="border-bottom: 1px solid var(--border);">
-      <td style="padding: 8px 10px;"><strong>${escapeHtml(titleCaseLp ? titleCaseLp(p.partner) : p.partner)}</strong></td>
+      <td style="padding: 8px 10px;"><strong>${escapeHtml(titleCaseLp ? titleCaseLp(lpTradeName(p.partner)) : lpTradeName(p.partner))}</strong></td>
       <td style="padding: 8px 10px; text-align: right;">${p.rate_value}%<span style="color: var(--text-faint); font-size: 10px;"> WS</span></td>
       <td style="padding: 8px 10px; text-align: right;">${p.skus}</td>
       <td style="padding: 8px 10px; text-align: right;">${money(p.onhand_cost)}</td>
