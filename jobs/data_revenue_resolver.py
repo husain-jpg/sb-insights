@@ -35,8 +35,17 @@ This module is called from:
 """
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Iterable
+
+
+def _rnorm(s) -> str:
+    """Normalize an LP / supplier / brand name for matching: lowercase + strip
+    all non-alphanumerics. So 'Valens Agritech Ltd.' and 'VALENS AGRITECH LTD'
+    collapse to the same key. Mirrors _norm_lp in api/main.py."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
 
 # Lower number = higher priority within collectives.
 COLLECTIVE_PRIORITY = {
@@ -101,15 +110,18 @@ def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = No
         try:
             cur.execute(f"""
                 SELECT p.sku, p.ocs_variant_number, p.brand, p.lp,
-                       oc.category, oc.subcategory
+                       oc.category, oc.subcategory, oc.supplier
                 FROM products p
                 LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = p.ocs_variant_number
                 WHERE p.sku IN ({placeholders}) OR p.ocs_variant_number IN ({placeholders})
             """, list(batch) + list(batch))
         except Exception:
             continue
-        for cova_sku, ocs_var, brand, lp, cat, subcat in cur.fetchall():
-            meta = {"brand": brand, "lp": lp, "category": cat, "subcategory": subcat}
+        for cova_sku, ocs_var, brand, lp, cat, subcat, supplier in cur.fetchall():
+            # supplier = OCS licensed producer (the reliable LP key; products.lp
+            # is often abbreviated/blank, e.g. 'VALENS' vs 'Valens Agritech Ltd.').
+            meta = {"brand": brand, "lp": lp, "category": cat,
+                    "subcategory": subcat, "supplier": supplier}
             if cova_sku and cova_sku in sku_set:
                 sku_meta[cova_sku] = meta
             if ocs_var and ocs_var in sku_set:
@@ -135,9 +147,20 @@ def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = No
               AND (end_date IS NULL OR end_date >= ?)
         """, (today_iso, today_iso))
         for row in cur.fetchall():
+            stype, sval = row[2], (row[3] or "")
+            # Precompute the set of normalized names this agreement matches.
+            # 'lp' scope: the LP name (matched against a SKU's OCS supplier or
+            # products.lp). 'brand' scope: the comma-separated brand list, split
+            # so a multi-brand agreement matches each brand individually.
+            if stype == "brand":
+                match_keys = {_rnorm(b) for b in sval.split(",") if b.strip()}
+            else:
+                match_keys = {_rnorm(sval), _rnorm(row[1])}  # scope_value + partner_name
+            match_keys.discard("")
             partner_agreements.append({
                 "id": row[0], "partner_name": row[1],
-                "scope_type": row[2], "scope_value": (row[3] or "").strip().lower(),
+                "scope_type": stype, "scope_value": sval.strip().lower(),
+                "match_keys": match_keys,
                 "rate_type": row[4], "rate_value": float(row[5] or 0),
                 "start_date": row[6], "end_date": row[7],
             })
@@ -206,13 +229,17 @@ def get_active_deals_for_skus(conn, skus: Iterable[str], today: date | None = No
                 return False
         return True
 
-    # Helper: does Data Partner agreement match SKU?
+    # Helper: does Data Partner agreement match SKU? Normalized, and LP scope
+    # matches on the OCS supplier first (the reliable key) then products.lp.
     def _partner_matches(a: dict, meta: dict) -> bool:
+        keys = a["match_keys"]
+        if not keys:
+            return False
         if a["scope_type"] == "brand":
-            return (meta.get("brand") or "").strip().lower() == a["scope_value"]
-        if a["scope_type"] == "lp":
-            return (meta.get("lp") or "").strip().lower() == a["scope_value"]
-        return False
+            return _rnorm(meta.get("brand")) in keys
+        # 'lp' scope
+        return (_rnorm(meta.get("supplier")) in keys
+                or _rnorm(meta.get("lp")) in keys)
 
     # 4) Load active collective deals. Same chunked pattern as before.
     collective_deals_by_sku: dict[str, dict] = {}
