@@ -1250,8 +1250,7 @@ function showReorderLegend() {
         <table style="font-size: 13px; margin-bottom: 20px;">
           ${row(tag("background: rgba(80, 180, 100, 0.18); color: #6fcf85; border-color: rgba(90, 200, 110, 0.45);", "BACK IN STOCK"), "Back in stock", "Back in stock at OCS as of the latest Order Fill template.")}
           ${row(tag("background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45);", "NEW"), "New arrival", "Newly listed in OCS's latest Order Fill.")}
-          ${row(tag("background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4);", "FT-EXP"), "Flow Through Expedited", "Cova-managed Flow Through, expedited tier. Mid lead time (~12 days). (Click-to-Buy isn't tagged — see the OCS Avail. column.)")}
-          ${row(tag("background: rgba(180, 130, 100, 0.15); color: #c08560; border-color: rgba(190, 140, 110, 0.4);", "FT-STD"), "Flow Through Standard", "Cova-managed Flow Through, standard tier. Longest lead time (~19 days).")}
+          ${row(tag("background: rgba(70, 140, 90, 0.18); color: #6dab84; border-color: rgba(80, 160, 100, 0.45);", "Flow-Through Std / Exp"), "Flow Through (in OCS Avail. column)", "Shown in the OCS Avail. column, not as a product badge. Flow-Through ships from the LP (orderable even when the warehouse shows 0). Exp = expedited tier (mid lead time ~12 days); Std = standard (~19 days). OCS's committed delivery date shows beneath it.")}
         </table>
 
         <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim);">Mix Multiplier</h4>
@@ -1721,25 +1720,9 @@ async function renderReorder() {
             if (r.order_fill_new_arrival) {
               out.push(`<span class="tag" style="background: rgba(214, 180, 70, 0.18); color: #d6b446; border-color: rgba(220, 190, 80, 0.45); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Newly listed in the latest Order Fill">NEW</span>`);
             }
-            // Flow Through tier badge — only for the Flow-Through tiers, which
-            // carry delivery-tier detail the OCS Avail column doesn't show.
-            // (Click-to-Buy has no badge: the OCS Avail column already labels
-            // it "Click-to-Buy", so a CTB tag here was pure duplication.)
-            if (r.order_fill_flow_thru === true) {
-              const tier = r.order_fill_delivery_tier;
-              // Show OCS's committed delivery date inline so managers see when a
-              // flow-through order will arrive (not just on hover). The Order Fill
-              // is pulled daily, so this date is current for ordering today.
-              const etaRaw = r.order_fill_estimated_delivery;
-              const etaFmt = fmtShortDate(etaRaw);
-              const etaText = etaFmt ? ` · ${etaFmt}` : '';
-              const etaTip = etaRaw ? ` — OCS est. delivery ${etaRaw}` : '';
-              if (tier === 'Expedited') {
-                out.push(`<span class="tag" style="background: rgba(220, 150, 90, 0.15); color: #dc965a; border-color: rgba(230, 165, 100, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Flow Through Expedited: ships from the LP${etaTip}">FT-EXP${etaText}</span>`);
-              } else if (tier === 'Standard') {
-                out.push(`<span class="tag" style="background: rgba(180, 130, 100, 0.15); color: #c08560; border-color: rgba(190, 140, 110, 0.4); font-size: 9px; padding: 1px 5px; margin-right: 4px; vertical-align: middle;" title="Flow Through Standard: ships from the LP${etaTip}">FT-STD${etaText}</span>`);
-              }
-            }
+            // Flow-Through tier + delivery date are shown in the OCS Avail.
+            // column now (as 'Flow-Through Std/Exp' + the date), not as a badge
+            // under the product name — keeps the product cell uncluttered.
             return out.join('');
           })();
           // Sale flags — currently/recently discounted SKUs may have inflated velocity
@@ -1795,15 +1778,24 @@ async function renderReorder() {
         tooltip: "Active data-revenue programs for this SKU: LP Partner (a direct LP/brand agreement), Collective (IRCC / Canna Collective / Seeker), or LTO. Per the stacking rules, a Partner or LTO supersedes a collective, so a collective only shows when no Partner/LTO applies.",
         render: r => dealsCell(r) },
       { key: 'ocs_stock_status', label: 'OCS Avail.', align: 'right',
-        tooltip: "Whether OCS will deliver this SKU. 'Yes' = in warehouse stock; 'Flow-Through'/'Click-to-Buy' = orderable this cycle via the Order Fill (flow-through ships from the LP, so it's available even when the warehouse shows out); 'No' = out and not in this cycle's Order Fill; '—' = not in the current OCS catalog.",
+        tooltip: "Whether OCS will deliver this SKU. 'Yes' = in warehouse stock; 'Flow-Through Std/Exp' = orderable this cycle via the Order Fill, ships from the LP (Std/Exp = delivery tier), with OCS's committed delivery date shown beneath; 'Click-to-Buy' = direct from OCS warehouse this cycle; 'No' = out and not in this cycle's Order Fill; '—' = not in the current OCS catalog.",
         render: r => {
           if (r.ocs_stock_status === 'YES') return '<span class="tag tag-accent">Yes</span>';
           // Orderable via the latest Order Fill even if warehouse stock is "NO"
           // (flow-through ships from the LP). Don't flag these as out of stock.
           const inFill = r.order_fill_flow_thru !== null && r.order_fill_flow_thru !== undefined;
           if (inFill || r.order_fill_back_in_stock || (r.order_fill_available_qty || 0) > 0) {
-            const label = r.order_fill_flow_thru === true ? 'Flow-Through'
-                        : r.order_fill_flow_thru === false ? 'Click-to-Buy' : 'Orderable';
+            if (r.order_fill_flow_thru === true) {
+              // Flow-Through: note the delivery tier (Std/Exp) + OCS's committed
+              // delivery date (moved here from the old product-column badge).
+              const tierAbbr = r.order_fill_delivery_tier === 'Expedited' ? ' Exp'
+                             : r.order_fill_delivery_tier === 'Standard' ? ' Std' : '';
+              const etaFmt = fmtShortDate(r.order_fill_estimated_delivery);
+              const dateNote = etaFmt ? `<div class="sku" style="color: var(--text-dim);">${etaFmt}</div>` : '';
+              const tip = `Flow-Through${r.order_fill_delivery_tier ? ' (' + r.order_fill_delivery_tier + ')' : ''}: ships from the LP — orderable even when the OCS warehouse shows 0.${r.order_fill_estimated_delivery ? ' OCS est. delivery ' + r.order_fill_estimated_delivery + '.' : ''}`;
+              return `<span class="tag tag-accent" title="${tip}">Flow-Through${tierAbbr}</span>${dateNote}`;
+            }
+            const label = r.order_fill_flow_thru === false ? 'Click-to-Buy' : 'Orderable';
             return `<span class="tag tag-accent" title="Not in OCS warehouse stock, but available to order this cycle via the Order Fill (${label}).">${label}</span>`;
           }
           if (r.ocs_stock_status === 'NO') return '<span class="tag tag-critical" style="font-weight: 600;">No</span>';
