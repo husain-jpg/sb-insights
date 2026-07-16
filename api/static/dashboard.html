@@ -1673,11 +1673,24 @@ async function renderReorder() {
     function reorderSummaryHTML(rows, badges = []) {
       const orderedCount = rows.filter(r => r.reorder_qty > 0).length;
       const manualCount = rows.filter(r => r.needs_review).length;
+      // Data-revenue share of this order by wholesale $. Computed over the same
+      // `rows` the summary uses (which reflects the current include/exclude +
+      // filters), so it updates live as you tick SKUs in/out — same basis as the
+      // Est. wholesale figure. "Data-revenue" = has an active collective or
+      // LP-partner deal (same test as the Rebate-qualified filter). Target 80–90%.
+      const ordered = rows.filter(r => r.reorder_qty > 0);
+      const orderTotal = ordered.reduce((s, r) => s + (r.line_total || 0), 0);
+      const dataTotal = ordered
+        .filter(r => r.data_fee_pct || r.data_fee_is_direct)
+        .reduce((s, r) => s + (r.line_total || 0), 0);
+      const dataPct = orderTotal > 0 ? Math.round(dataTotal / orderTotal * 100) : 0;
+      const dataColor = dataPct >= 80 ? '#6dab84' : dataPct >= 50 ? '#d6b446' : '#dc965a';
       return `
         <div>SKUs to order<strong>${orderedCount}</strong> ${badges.join(' ')}</div>
         ${manualCount > 0 ? `<div title="Stockouts below the case threshold — engine won't auto-order; decide manually.">Manual review<strong style="color: #c89b32;">${manualCount}</strong></div>` : ''}
         <div>Total units<strong>${fmtN(rows.reduce((s, r) => s + r.reorder_qty, 0))}</strong></div>
         <div>Est. wholesale<strong>${fmt$(rows.reduce((s, r) => s + (r.line_total || 0), 0))}</strong></div>
+        <div title="Share of this order's wholesale $ that's on an active collective or LP-partner deal (i.e. generates data revenue). Updates as you include/exclude SKUs. Target 80–90%.">Data-revenue<strong style="color: ${dataColor};">${dataPct}%</strong></div>
       `;
     }
 
