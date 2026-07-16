@@ -4054,6 +4054,17 @@ async function renderPartners() {
         <button class="btn-tab" data-section="deals">Data Revenue Deals</button>
       </div>
     </div>
+    <div class="card" style="padding: 14px 16px; margin-bottom: 14px;">
+      <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+        <div style="min-width: 220px;">
+          <div style="font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Import monthly buysheet</div>
+          <div style="font-size: 11px; color: var(--text-faint); margin-top: 2px;">IRCC / Seeker / Canna Collective .xlsx — auto-detected. Re-importing a month <strong>replaces</strong> that collective's deals for the period.</div>
+        </div>
+        <input type="file" id="buysheet-file" accept=".xlsx,.xls" style="font-size: 12px;">
+        <button class="btn btn-primary" id="buysheet-import-btn">Import buysheet</button>
+        <span id="buysheet-status" style="font-size: 12px; color: var(--text-dim);"></span>
+      </div>
+    </div>
     <div id="partners-content">
       <div class="loading"><span class="spinner"></span> Loading…</div>
     </div>
@@ -4061,6 +4072,36 @@ async function renderPartners() {
       <strong>Brands</strong> are your commercial partners (IRCC, Canna Collective, Seeker, etc.). <strong>Data revenue deals</strong> are per-SKU rebate agreements managed by these collectives. For brand-specific or LP-specific LTOs and direct rebate agreements, use the <strong>LTOs</strong> and <strong>Data LP Partners</strong> tabs.
     </div>
   `;
+
+  // Monthly buysheet upload → prod import (admin). Auto-detects the collective.
+  const bBtn = document.getElementById("buysheet-import-btn");
+  const bStatus = document.getElementById("buysheet-status");
+  const setBStatus = (msg, ok) => {
+    bStatus.textContent = msg;
+    bStatus.style.color = ok === true ? '#6dab84' : ok === false ? '#dc965a' : 'var(--text-dim)';
+  };
+  if (bBtn) bBtn.addEventListener("click", async () => {
+    const f = document.getElementById("buysheet-file").files[0];
+    if (!f) { setBStatus("Pick a buysheet .xlsx first.", false); return; }
+    bBtn.disabled = true; setBStatus("Importing…");
+    try {
+      const fd = new FormData(); fd.append("file", f);
+      const res = await fetch("/api/buysheet/import", { method: "POST", body: fd, credentials: "same-origin" });
+      const d = await res.json().catch(() => ({ detail: res.statusText }));
+      if (!res.ok) throw new Error(d.detail || "Import failed");
+      const parts = (d.results || []).map(r =>
+        `${r.partner}: ${fmtN(r.deals_inserted)} deals (${fmtN(r.deals_replaced)} replaced) · ${r.period_start}→${r.period_end}`);
+      setBStatus("✓ " + parts.join("  ·  "), true);
+      // Refresh whichever section is open so the new deals show immediately.
+      const active = document.querySelector(".btn-tab.active");
+      const c = document.getElementById("partners-content");
+      if (active && c) {
+        if (active.dataset.section === "deals") await renderDealsSection(c);
+        else await renderBrandsSection(c);
+      }
+    } catch (e) { setBStatus("Error: " + e.message, false); }
+    finally { bBtn.disabled = false; }
+  });
 
   const tabs = document.querySelectorAll(".btn-tab");
   tabs.forEach(t => t.addEventListener("click", async () => {

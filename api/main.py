@@ -4258,6 +4258,80 @@ async def order_fill_compare(
     }
 
 
+@app.post("/api/buysheet/import")
+async def import_buysheet_upload(
+    file: UploadFile = File(...),
+    _admin: dict = Depends(require_admin),
+) -> dict:
+    """Upload a monthly collective buysheet (IRCC / Seeker / Canna Collective
+    .xlsx) and import it into prod. Auto-detects which collective; re-importing
+    a period replaces that collective's deals for it. Admin only.
+
+    This is the production route for the monthly collective offers — they don't
+    arrive via the Cova email scraper (that's Cova-only), so before this the only
+    way onto the droplet was a manual file drop.
+    """
+    from pathlib import Path as _Path
+    from jobs.import_cova_exports import run_import
+    from jobs.import_buysheet_irc import is_irc_file
+    from jobs.import_buysheet_seeker import is_seeker_file
+    from jobs.import_buysheet import is_buysheet_file
+
+    contents = await file.read()
+    if len(contents) > 25_000_000:  # 25MB safety net
+        raise HTTPException(status_code=413, detail="file too large")
+    name = _Path(file.filename or "").name
+    if not name.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Expected an .xlsx buysheet")
+
+    imports_dir = _Path("imports")
+    imports_dir.mkdir(exist_ok=True)
+    dest = imports_dir / name
+    with open(dest, "wb") as f:
+        f.write(contents)
+
+    # Validate it's a recognized collective buysheet before importing.
+    try:
+        recognized = is_irc_file(dest) or is_seeker_file(dest) or is_buysheet_file(dest)
+    except Exception:
+        recognized = False
+    if not recognized:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail="Not a recognized collective buysheet (IRCC / Seeker / Canna Collective).")
+
+    try:
+        results = run_import(dest, DB_PATH)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Import failed: {e}")
+
+    # Move the imported file aside so a later folder scan won't re-import it.
+    try:
+        processed = imports_dir / "processed"
+        processed.mkdir(exist_ok=True)
+        target = processed / dest.name
+        i = 1
+        while target.exists():
+            target = processed / f"{dest.stem}_{i}{dest.suffix}"
+            i += 1
+        dest.rename(target)
+    except OSError:
+        pass
+
+    reset_overview_cache()  # so KPI/overview reflect the refreshed deals
+
+    buysheet_results = [r for r in results if isinstance(r, dict) and "deals_inserted" in r]
+    if not buysheet_results:
+        raise HTTPException(
+            status_code=400,
+            detail="File imported but produced no collective deals — check it's the right buysheet.")
+    return {"ok": True, "results": buysheet_results}
+
+
 @app.post("/api/order-fill/import")
 async def import_order_fill_upload(
     file: UploadFile = File(...),
