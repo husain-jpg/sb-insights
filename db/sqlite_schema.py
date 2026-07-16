@@ -639,6 +639,26 @@ CREATE TABLE IF NOT EXISTS data_revenue_deals (
 );
 CREATE INDEX IF NOT EXISTS ix_data_deals_brand ON data_revenue_deals (brand_id, start_date DESC);
 
+-- Append-only history of collective (data-revenue) deals. Before any buysheet
+-- import replaces deals (delete-then-insert), the outgoing rows are copied here
+-- so no historical deal set is ever lost — for later rebate/coverage analysis.
+CREATE TABLE IF NOT EXISTS data_revenue_deals_archive (
+    id               INTEGER PRIMARY KEY,
+    orig_id          INTEGER,
+    brand_id         INTEGER,
+    partner_name     TEXT,
+    start_date       TEXT,
+    end_date         TEXT,
+    percentage       REAL,
+    basis            TEXT,
+    sku_filter       TEXT,
+    notes            TEXT,
+    deal_created_at  TEXT,
+    replaced_by_file TEXT,
+    archived_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_deals_archive ON data_revenue_deals_archive (brand_id, archived_at DESC);
+
 -- Limited-Time Offers: brand-funded promotions, volume rebates, wholesale
 -- discounts, or feature flags. Multiple SKUs per LTO via lto_skus.
 CREATE TABLE IF NOT EXISTS ltos (

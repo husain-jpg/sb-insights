@@ -297,6 +297,8 @@ def import_irc_file(conn, file_path: Path,
     # Idempotency: this upload is the authoritative IRC snapshot — clear ALL
     # existing IRCC deals before re-inserting from this file.
     cur = conn.cursor()
+    from jobs.deal_archive import archive_deals
+    archive_deals(conn, "d.brand_id = ?", (brand_id,), file_path.name)
     cur.execute("DELETE FROM data_revenue_deals WHERE brand_id = ?", (brand_id,))
     deleted = cur.rowcount
 

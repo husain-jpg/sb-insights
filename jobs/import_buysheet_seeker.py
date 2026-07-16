@@ -167,6 +167,9 @@ def import_seeker_file(conn, file_path: Path) -> dict:
 
     # Idempotency
     cur = conn.cursor()
+    from jobs.deal_archive import archive_deals
+    archive_deals(conn, "d.brand_id = ? AND d.start_date = ? AND d.end_date = ?",
+                  (brand_id, start_date.isoformat(), end_date.isoformat()), file_path.name)
     cur.execute("""
         DELETE FROM data_revenue_deals
         WHERE brand_id = ? AND start_date = ? AND end_date = ?
