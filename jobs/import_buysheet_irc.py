@@ -373,6 +373,12 @@ def import_irc_file(conn, file_path: Path,
         "sheet": sheet_name,
         "sheet_month": sheet_month,
         "sheet_year": sheet_year,
+        # period_start/period_end: the span of the imported deals' per-row dates.
+        # Named to match the Seeker/Canna importers so run_import's logging and
+        # the buysheet-upload endpoint can read them uniformly (IRC uses per-row
+        # Offer Start/End, so this is a range, not a single month).
+        "period_start": min(seen_starts) if seen_starts else None,
+        "period_end": max(seen_ends) if seen_ends else None,
         "deals_replaced": deleted,
         "deals_inserted": inserted,
         "ongoing_deals": ongoing_count,
