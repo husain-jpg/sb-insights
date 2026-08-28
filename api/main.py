@@ -7211,15 +7211,27 @@ def _derive_metrics(raw: dict) -> dict:
     out["gross_sales"] = raw["regular_total"]
     out["net_sales"] = raw["revenue"]
     out["avg_transaction"] = (raw["revenue"] / raw["transactions"]) if raw["transactions"] else 0
-    out["margin_dollars"] = raw["revenue_with_cost"] - raw["cost_total"]
+    # Margin % is measured on the cost-covered subset (SKUs matched to an
+    # ocs_catalog wholesale price).
+    covered_margin = raw["revenue_with_cost"] - raw["cost_total"]
     out["margin_pct"] = (
-        (out["margin_dollars"] / raw["revenue_with_cost"] * 100)
+        (covered_margin / raw["revenue_with_cost"] * 100)
         if raw["revenue_with_cost"] else 0
     )
     out["margin_coverage_pct"] = (
         (raw["revenue_with_cost"] / raw["revenue"] * 100)
         if raw["revenue"] else 0
     )
+    # GP$ = net sales x margin% (the covered-subset margin rate applied to ALL
+    # net sales). Using the raw covered profit (revenue_with_cost - cost_total)
+    # made GP$ swing with cost COVERAGE, not performance: historical periods
+    # cover less revenue (old SKUs drop out of today's OCS catalogue and lack a
+    # cost), so their GP$ was understated and YoY could show GP$ UP while sales
+    # were DOWN. Normalizing to net sales keeps GP$ consistent with margin% and
+    # comparable across periods. margin_dollars_covered keeps the actual matched
+    # profit for reference.
+    out["margin_dollars"] = raw["revenue"] * (out["margin_pct"] / 100.0)
+    out["margin_dollars_covered"] = covered_margin
     out["discount_pct"] = (
         (raw["discount_total"] / raw["regular_total"] * 100)
         if raw["regular_total"] else 0

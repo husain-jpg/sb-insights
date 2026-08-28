@@ -3927,7 +3927,10 @@ function renderAnalyticsResult(data) {
   const total = data.rows.find(r => r.is_total);
   if (total) {
     const cov = total.current.margin_coverage_pct.toFixed(0);
-    info += `<div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">Margin computed on ${cov}% of revenue (SKUs with wholesale cost mapping).</div>`;
+    const covPrior = (total.prior && total.prior.margin_coverage_pct != null)
+      ? total.prior.margin_coverage_pct.toFixed(0) : null;
+    const priorNote = covPrior ? ` (prior year: ${covPrior}%)` : '';
+    info += `<div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">Margin % measured on ${cov}%${priorNote} of revenue (SKUs with wholesale-cost mapping); <strong>GP $ = net sales × margin %</strong>, so it stays comparable even when cost coverage differs between periods.</div>`;
   }
   document.getElementById("an-period-info").innerHTML = info;
 
