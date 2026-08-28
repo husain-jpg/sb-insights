@@ -3670,9 +3670,9 @@ async function renderAnalytics() {
         <label style="font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 4px;">
           <input id="an-yoy" type="checkbox" checked> YoY comparison
         </label>
-        <select id="an-yoy-align" title="How to pick the prior-year period. 'Same weekday' shifts back 52 weeks so e.g. a Thursday compares to a Thursday — better for day-of-week-sensitive sales. 'Same date' uses the exact calendar date a year ago.">
-          <option value="weekday" selected>vs. same weekday (52 wks)</option>
-          <option value="calendar">vs. same date last year</option>
+        <select id="an-yoy-align" title="How to pick the prior-year period. 'Same day of the week' shifts back 52 weeks so e.g. a Saturday compares to a Saturday (not the exact calendar date, which drifts by a day or two) — better for day-of-week-sensitive sales. 'Same date' uses the exact calendar date a year ago.">
+          <option value="weekday" selected>vs. same day of the week (PY)</option>
+          <option value="calendar">vs. same date (PY)</option>
         </select>
         <button id="an-refresh">Refresh</button>
         <button id="an-export-btn">Excel</button>
@@ -3685,7 +3685,7 @@ async function renderAnalytics() {
     <div class="hint-box">
       <strong>Discount %</strong> = total discounts ÷ total regular price (standard retail metric).
       <strong>Margin %</strong> is computed only on SKUs with wholesale cost data — coverage shown above.
-      <strong>YoY comparison</strong> — pick how the prior-year period is chosen: <em>same weekday</em> (52 weeks / 364 days back, so Thu compares to Thu — best for day-of-week-sensitive sales) or <em>same calendar date</em> (exact date a year ago). New stores not active in the prior period show $0 prior with the current value as the difference.
+      <strong>YoY comparison</strong> — pick how the prior-year period is chosen: <em>same day of the week</em> (52 weeks / 364 days back, so a Saturday compares to a Saturday — best for day-of-week-sensitive sales) or <em>same date</em> (exact calendar date a year ago). New stores not active in the prior period show $0 prior with the current value as the difference.
     </div>
   `;
 
@@ -3913,7 +3913,7 @@ function renderAnalyticsResult(data) {
   const clampNote = p.clamped ? ` <span style="color: var(--warning, #c89b32);">(end clamped to available data)</span>` : '';
   let info = `<div style="font-size: 12px;"><strong>Current:</strong> ${p.start} → ${p.end}${p.days ? ` <span style="color: var(--text-dim);">(${p.days} day${p.days === 1 ? '' : 's'})</span>` : ''}${clampNote}`;
   if (pp) {
-    const alignLabel = pp.align === 'weekday' ? 'same weekday, 52 wks back' : 'same calendar date';
+    const alignLabel = pp.align === 'weekday' ? 'same day of the week, 52 wks back' : 'same calendar date';
     // Show the weekday of the current vs prior single-day period to make the
     // alignment obvious (parse as UTC to avoid a local-tz off-by-one).
     const wd = iso => new Date(iso + 'T00:00:00Z').toLocaleDateString(undefined, { weekday: 'short', timeZone: 'UTC' });
