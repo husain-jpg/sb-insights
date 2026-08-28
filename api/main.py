@@ -7112,8 +7112,23 @@ def _resolve_date_range(preset: str, custom_start: str | None,
     raise HTTPException(status_code=400, detail=f"unknown preset: {preset}")
 
 
-def _shift_period_back_one_year(start: date, end: date) -> tuple[date, date]:
-    """Return same date range one year earlier. Handles Feb 29 by clamping."""
+def _shift_period_back_one_year(start: date, end: date,
+                                align: str = "calendar") -> tuple[date, date]:
+    """Return the comparable date range one year earlier.
+
+    align='calendar' (default): the SAME CALENDAR DATE last year
+        (Aug 26 → Aug 26). Simple, but the weekday shifts ~1-2 days, so a
+        single-day or short-window comparison lands on a different day of week.
+    align='weekday': shift back 364 days (= 52 weeks). 364 is a multiple of 7,
+        so the prior period lands on the SAME WEEKDAY (Wed → Wed), with the
+        calendar date only ~1-2 days off. This is the standard retail
+        "same weekday last year" comparison and is far more apples-to-apples
+        for day-of-week-sensitive sales.
+    """
+    if align == "weekday":
+        shift = timedelta(days=364)
+        return start - shift, end - shift
+
     def safe_subtract(d: date) -> date:
         try:
             return d.replace(year=d.year - 1)
@@ -7360,6 +7375,7 @@ def sales_performance(
     end: str | None = None,
     store: str | None = None,
     yoy: bool = True,
+    yoy_align: str = "calendar",   # 'calendar' = same date | 'weekday' = same weekday (52 wks back)
 ) -> dict:
     """
     Sales performance metrics by store with optional YoY comparison.
@@ -7391,9 +7407,10 @@ def sales_performance(
 
         current = _query_period_metrics(conn, p_start, actual_end, store)
 
+        _align = "weekday" if yoy_align == "weekday" else "calendar"
         prior_data = None
         if yoy:
-            prev_start, prev_end = _shift_period_back_one_year(p_start, actual_end)
+            prev_start, prev_end = _shift_period_back_one_year(p_start, actual_end, _align)
             prior_data = _query_period_metrics(conn, prev_start, prev_end, store)
 
         # Get location names for nicer display
@@ -7453,10 +7470,11 @@ def sales_performance(
         "rows": rows,
     }
     if yoy and prior_data:
-        prev_start, prev_end = _shift_period_back_one_year(p_start, actual_end)
+        prev_start, prev_end = _shift_period_back_one_year(p_start, actual_end, _align)
         response["prior_period"] = {
             "start": prev_start.isoformat(),
             "end": prev_end.isoformat(),
+            "align": _align,
         }
     return response
 
