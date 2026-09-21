@@ -6225,12 +6225,19 @@ async function renderDataLpPartners() {
       if (rt === "flat_per_unit") return `$${(val || 0).toFixed(4)}/unit`;
       return String(val);
     };
-    const fmtPeriod = (a) => {
-      // Every agreement here is open-ended in practice. The old cell rendered
-      // "Jun 26, 2026 → —" because fmtDate returns "—" for null, which is
-      // truthy, so the intended 'open-ended' fallback could never fire.
-      if (!a.end_date) return `Since ${fmtDate(a.start_date)}`;
-      return `${fmtDate(a.start_date)} → ${fmtDate(a.end_date)}`;
+    // The column shows when the agreement was entered here, NOT when it began.
+    // start_date defaults to "today" in the dialog, so for 16 of 18 existing
+    // rows it is simply the day someone typed the record in — presenting that
+    // as "Since Jun 26, 2026" read as a real commencement date and wasn't one.
+    // A start_date that genuinely differs (deliberately backdated) still has
+    // meaning, so it's surfaced underneath; likewise any end date.
+    const fmtAdded = (a) => {
+      const created = (a.created_at || "").slice(0, 10);
+      const head = created ? fmtDate(created) : "—";
+      const bits = [];
+      if (a.start_date && a.start_date !== created) bits.push(`effective ${fmtDate(a.start_date)}`);
+      if (a.end_date) bits.push(`ends ${fmtDate(a.end_date)}`);
+      return `${head}${bits.length ? `<div class="sku">${bits.join(" · ")}</div>` : ""}`;
     };
     const fmtDate = (d) => {
       if (!d) return "—";
@@ -6271,6 +6278,8 @@ async function renderDataLpPartners() {
           <strong>Data Collectives</strong> (IRCC / CC / Seeker) are per-SKU rebates through a third-party program; <strong>LTOs</strong> are time-bound promotions.
           <br><br>
           <strong>Hierarchy:</strong> LTOs and Data LP Partner agreements stack — if a SKU has both, both contribute to effective margin. When either is present, Data Collective rebates are NOT applied to that SKU.
+          <br><br>
+          <strong>Added</strong> is when the agreement was entered here, which is not the same as when the deal began — the effective-from date defaults to the day you create the record. Where it was set to something different, that shows underneath.
         </div>
       </details>
 
@@ -6308,7 +6317,7 @@ async function renderDataLpPartners() {
               </label>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
-              <label style="font-size: 11px; color: var(--text-dim);">Start date
+              <label style="font-size: 11px; color: var(--text-dim);">Effective from <span style="color: var(--text-faint);">— rebate counts from this date</span>
                 <input type="date" id="dlp-start-date" value="${today}" style="width: 100%; margin-top: 4px;">
               </label>
               <label style="font-size: 11px; color: var(--text-dim);">End date (optional — leave blank for open-ended)
@@ -6422,7 +6431,7 @@ async function renderDataLpPartners() {
                 </td>
                 <td>${scope}</td>
                 <td style="white-space: nowrap;">${fmtRate(a.rate_type, a.rate_value)}</td>
-                <td style="white-space: nowrap; color: var(--text-dim);">${fmtPeriod(a)}</td>
+                <td style="white-space: nowrap; color: var(--text-dim);">${fmtAdded(a)}</td>
                 <td style="text-align: right; white-space: nowrap;">
                   <button class="btn-link dlp-edit-btn" data-id="${a.id}" style="font-size: 10px;">Edit</button>
                   <button class="btn-link dlp-del-btn" data-id="${a.id}" style="font-size: 10px; color: var(--critical);">Delete</button>
@@ -6437,7 +6446,7 @@ async function renderDataLpPartners() {
               <th>LP / Partner</th>
               <th>Scope</th>
               <th>Rate</th>
-              <th>Period</th>
+              <th title="When this agreement was entered into SB Insights — not necessarily when the deal began.">Added</th>
               <th style="width: 90px;"></th>
             </tr>
           </thead>
