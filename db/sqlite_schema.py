@@ -145,6 +145,12 @@ CREATE TABLE IF NOT EXISTS sales_daily (
 );
 CREATE INDEX IF NOT EXISTS ix_sales_sku_date ON sales_daily (sku, sale_date DESC);
 CREATE INDEX IF NOT EXISTS ix_sales_loc_date ON sales_daily (location_id, sale_date DESC);
+-- sale_date on its own. The two composites above both have sale_date as their
+-- SECOND column, so "SELECT MAX(sale_date) FROM sales_daily" — which runs on
+-- every dashboard page load (freshness) and every Analytics request (period
+-- anchoring) — had to probe once per leading-column group: ~134ms on 1M rows.
+-- With this it's a single index seek.
+CREATE INDEX IF NOT EXISTS ix_sales_date ON sales_daily (sale_date);
 
 -- Line-level transaction detail from Cova Itemized Sales export.
 -- One row per line item per transaction. Enables analyses that aggregations
