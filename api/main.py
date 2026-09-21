@@ -7378,7 +7378,7 @@ def _active_partner_matchers(conn):
 
 
 @app.get("/api/analytics/partner-coverage")
-def partner_coverage(store: str | None = None) -> dict:
+def partner_coverage(store: str | None = None, days: int = 90) -> dict:
     """How much of the in-stock cannabis menu is concentrated with each active
     Data LP Partner (Auxly, Peace Naturals, …), measured by on-hand cost, SKU
     count, and 30-day trailing revenue, with an estimated rebate.
@@ -7394,7 +7394,8 @@ def partner_coverage(store: str | None = None) -> dict:
         by_lp, by_brand = _active_partner_matchers(conn)
 
         latest = get_latest_sale_date(conn)
-        rev_start = (latest - timedelta(days=29)).isoformat() if latest else "0000-00-00"
+        days = max(1, min(int(days or 90), 730))
+        rev_start = (latest - timedelta(days=days - 1)).isoformat() if latest else "0000-00-00"
 
         sql = """
         SELECT ci.sku, ci.on_hand, ci.avg_unit_cost,
@@ -7417,28 +7418,50 @@ def partner_coverage(store: str | None = None) -> dict:
         as_of = conn.execute("SELECT MAX(as_of) FROM current_inventory").fetchone()[0]
 
     total_cost = total_rev = 0.0
-    total_skus = 0
     partners: dict[str, dict] = {}
-    uncovered: list[dict] = []
+    # NOTE: `rows` is one row per (sku, location) — chain-wide a SKU stocked at
+    # all 8 stores appears 8 times. Money adds up correctly across stores, but
+    # SKU COUNTS must be de-duplicated or they report shelf positions, not
+    # products (the old list showed the same SKU up to 3 times in one view).
+    all_skus: set[str] = set()
+    covered_sku_set: set[str] = set()
+    unc_lp: dict[str, dict] = {}
+    unc_sku: dict[str, dict] = {}
     for sku, on_hand, cost, supplier, brand, name, rev30 in rows:
         oh_cost = float(on_hand or 0) * float(cost or 0)
         rev30 = float(rev30 or 0)
         total_cost += oh_cost
         total_rev += rev30
-        total_skus += 1
+        all_skus.add(sku)
         ag = by_lp.get(_norm_lp(supplier)) or by_brand.get(_norm_lp(brand))
         if ag:
             d = partners.setdefault(ag["partner"], {
                 "partner": ag["partner"], "rate_type": ag["rate_type"],
-                "rate_value": ag["rate_value"], "skus": 0,
+                "rate_value": ag["rate_value"], "sku_set": set(),
                 "onhand_cost": 0.0, "revenue": 0.0})
-            d["skus"] += 1
+            d["sku_set"].add(sku)
             d["onhand_cost"] += oh_cost
             d["revenue"] += rev30
+            covered_sku_set.add(sku)
         else:
-            uncovered.append({"sku": sku, "name": name, "brand": brand,
-                              "supplier": supplier, "onhand_cost": round(oh_cost, 2),
-                              "revenue": round(rev30, 2)})
+            # Roll up to the LP — that's who you'd actually sign an agreement
+            # with. A single uncovered LP is routinely 100+ small SKUs that
+            # each look trivial on their own.
+            key = supplier or "(unknown supplier)"
+            g = unc_lp.setdefault(key, {"supplier": key, "sku_set": set(),
+                                        "brands": set(), "onhand_cost": 0.0,
+                                        "revenue": 0.0})
+            g["sku_set"].add(sku)
+            if brand:
+                g["brands"].add(brand)
+            g["onhand_cost"] += oh_cost
+            g["revenue"] += rev30
+            # SKU detail, merged across stores, for the per-LP drill-down.
+            u = unc_sku.setdefault(sku, {"sku": sku, "name": name, "brand": brand,
+                                         "supplier": key, "onhand_cost": 0.0,
+                                         "revenue": 0.0})
+            u["onhand_cost"] += oh_cost
+            u["revenue"] += rev30
 
     partner_list: list[dict] = []
     covered_cost = covered_rev = 0.0
@@ -7449,9 +7472,9 @@ def partner_coverage(store: str | None = None) -> dict:
         # rate_types fall back to 0 until their basis is defined.
         rebate = (d["onhand_cost"] * d["rate_value"] / 100.0
                   if d["rate_type"] == "pct_wholesale" else 0.0)
+        d["skus"] = len(d["sku_set"])
         covered_cost += d["onhand_cost"]
         covered_rev += d["revenue"]
-        covered_skus += d["skus"]
         rebate_total += rebate
         partner_list.append({
             "partner": d["partner"],
@@ -7464,24 +7487,54 @@ def partner_coverage(store: str | None = None) -> dict:
             "est_rebate": round(rebate, 2),
         })
     partner_list.sort(key=lambda x: -x["onhand_cost"])
-    uncovered.sort(key=lambda x: -x["onhand_cost"])
+    covered_skus = len(covered_sku_set)
+    total_skus = len(all_skus)
+
+    # Uncovered, rolled up by LP and ranked by REVENUE — the targeting question
+    # is "whose sales are we not earning data revenue on", which is a flow, not
+    # the capital-parked view the old on-hand sort gave.
+    unc_rev_total = sum(g["revenue"] for g in unc_lp.values())
+    uncovered_lps = []
+    for g in unc_lp.values():
+        uncovered_lps.append({
+            "supplier": g["supplier"],
+            "skus": len(g["sku_set"]),
+            "brands": sorted(g["brands"])[:6],
+            "brand_count": len(g["brands"]),
+            "onhand_cost": round(g["onhand_cost"], 2),
+            "revenue": round(g["revenue"], 2),
+            "revenue_share_pct": round(g["revenue"] / unc_rev_total * 100, 1) if unc_rev_total else 0,
+            "pct_of_cannabis_revenue": round(g["revenue"] / total_rev * 100, 1) if total_rev else 0,
+        })
+    uncovered_lps.sort(key=lambda x: -x["revenue"])
+
+    uncovered = sorted(unc_sku.values(), key=lambda x: -x["revenue"])
+    for u in uncovered:
+        u["onhand_cost"] = round(u["onhand_cost"], 2)
+        u["revenue"] = round(u["revenue"], 2)
 
     return {
         "store": store,
         "as_of": as_of,
+        "days": days,
+        "period_start": rev_start,
+        "period_end": latest.isoformat() if latest else None,
         "totals": {
             "cannabis_skus": total_skus,
             "cannabis_onhand_cost": round(total_cost, 2),
-            "cannabis_revenue_30d": round(total_rev, 2),
+            "cannabis_revenue": round(total_rev, 2),
             "covered_skus": covered_skus,
             "covered_onhand_cost": round(covered_cost, 2),
-            "covered_revenue_30d": round(covered_rev, 2),
+            "covered_revenue": round(covered_rev, 2),
             "covered_cost_pct": round(covered_cost / total_cost * 100, 1) if total_cost else 0,
             "covered_skus_pct": round(covered_skus / total_skus * 100, 1) if total_skus else 0,
+            "uncovered_revenue": round(unc_rev_total, 2),
+            "uncovered_lp_count": len(uncovered_lps),
             "est_rebate_total": round(rebate_total, 2),
         },
         "partners": partner_list,
-        "uncovered_top": uncovered[:50],
+        "uncovered_by_lp": uncovered_lps,
+        "uncovered_skus": uncovered,   # per-LP drill-down, de-duplicated
     }
 
 

@@ -513,7 +513,7 @@
       </button>
       <div class="nav-group-items">
         <button data-page="analytics">▸ Historical Financials</button>
-        <button data-page="partner-coverage">▸ Partner Coverage</button>
+        <button data-page="partner-coverage">▸ LP Data Partners</button>
         <button data-page="partners">▸ Data Collectives</button>
         <button data-page="ltos">▸ LTOs</button>
         <button data-page="data-lp-partners">▸ Data LP Partners</button>
@@ -3844,12 +3844,19 @@ async function renderPartnerCoverage() {
     <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
       <div>
         <div class="kicker">Analytics · Data Revenue</div>
-        <h2 style="white-space:nowrap;">Partner Coverage</h2>
+        <h2 style="white-space:nowrap;">LP Data Partners</h2>
       </div>
       <div class="controls-row" style="flex-wrap: wrap;">
         <select id="pc-store">
           <option value="" ${gsSel("")}>All stores (chain-wide)</option>
           ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${escapeHtml(l.short_name || l.name)}</option>`).join("")}
+        </select>
+        <select id="pc-days" title="Sales window used for the revenue columns. Inventory figures are always the current snapshot.">
+          <option value="30">Last 30 days</option>
+          <option value="60">Last 60 days</option>
+          <option value="90" selected>Last 90 days</option>
+          <option value="180">Last 180 days</option>
+          <option value="365">Last 12 months</option>
         </select>
         <button id="pc-refresh">Refresh</button>
         <button id="pc-export-btn">Excel</button>
@@ -3860,6 +3867,7 @@ async function renderPartnerCoverage() {
       <strong>In-stock cannabis only.</strong> A SKU counts toward a partner when its licensed producer (OCS supplier) matches an active Data LP Partner agreement.
       <strong>On-hand cost</strong> = units on hand × landed unit cost. <strong>Est. rebate</strong> = rate × on-hand wholesale cost (a snapshot of rebate value embedded in current stock, not rebate earned to date).
       Collective deals (IRCC / CC / Seeker) are tracked separately — their rebate depends on wholesale received during the deal window, a different basis.
+      <strong>Uncovered LPs</strong> rolls up every in-stock SKU with no agreement to the licensed producer you'd actually negotiate with, ranked by the sales you're earning no data revenue on. The per-SKU view is still there — click an LP to expand it. Revenue columns follow the window selector; inventory figures are always the current snapshot. SKU counts are distinct products, not shelf positions, so a SKU stocked at six stores counts once.
     </div>
   `;
 
@@ -3869,12 +3877,15 @@ async function renderPartnerCoverage() {
     try {
       const params = new URLSearchParams();
       if (storeSel.value) params.set("store", storeSel.value);
+      params.set("days", document.getElementById("pc-days").value);
       const data = await api(`/api/analytics/partner-coverage?${params.toString()}`);
       _pcLastData = data;
       renderPartnerCoverageResult(data);
     } catch (e) { showError(e); }
   }
   document.getElementById("pc-refresh").addEventListener("click", load);
+  document.getElementById("pc-days").addEventListener("change", load);
+  storeSel.addEventListener("change", load);
   document.getElementById("pc-export-btn").addEventListener("click", exportPartnerCoverageCsv);
   await load();
 }
@@ -3906,23 +3917,47 @@ function renderPartnerCoverageResult(data) {
       <td style="padding: 8px 10px; text-align: right; color: #6dab84; font-weight: 600;">${money2(p.est_rebate)}</td>
     </tr>`).join("");
 
-  const uncovered = (data.uncovered_top || []);
-  const uncoveredRows = uncovered.map(u => `
-    <tr style="border-bottom: 1px solid var(--border);">
-      <td style="padding: 6px 10px;">
-        <div style="font-size: 12px;">${escapeHtml(u.name || u.sku)}</div>
-        <div style="font-size: 10px; color: var(--text-faint);">${escapeHtml(u.supplier || "—")}</div>
+  // Uncovered rolled up to the LP you'd actually negotiate with. Each row
+  // expands to that LP's SKUs so the old per-SKU detail is still reachable.
+  const lpName = x => (typeof titleCaseLp === "function" && typeof lpTradeName === "function")
+    ? titleCaseLp(lpTradeName(x)) : x;
+  const uncLps = (data.uncovered_by_lp || []);
+  const topTenShare = uncLps.slice(0, 10).reduce((a, g) => a + (g.revenue_share_pct || 0), 0);
+  const uncSkus = (data.uncovered_skus || []);
+  let runningShare = 0;
+  const uncoveredRows = uncLps.map((g, i) => {
+    runningShare += (g.revenue_share_pct || 0);
+    const brands = (g.brands || []).join(", ") + (g.brand_count > (g.brands || []).length ? ` +${g.brand_count - g.brands.length} more` : "");
+    const mine = uncSkus.filter(u => u.supplier === g.supplier).slice(0, 25);
+    const detail = mine.map(u => `
+      <tr style="background: var(--bg-sunken, rgba(255,255,255,0.02));">
+        <td style="padding: 4px 10px 4px 26px; font-size: 11px; color: var(--text-dim);">${escapeHtml(u.name || u.sku)}</td>
+        <td style="padding: 4px 10px; text-align: right; font-size: 11px; color: var(--text-dim);">${money(u.onhand_cost)}</td>
+        <td style="padding: 4px 10px; text-align: right; font-size: 11px; color: var(--text-dim);">${money(u.revenue)}</td>
+        <td colspan="2"></td>
+      </tr>`).join("");
+    return `
+    <tr style="border-bottom: 1px solid var(--border); cursor: pointer;" class="pc-lp-row" data-lp="${i}">
+      <td style="padding: 8px 10px;">
+        <span style="color: var(--text-faint); font-size: 10px;" id="pc-caret-${i}">▸</span>
+        <strong>${escapeHtml(lpName(g.supplier))}</strong>
+        <div style="font-size: 10px; color: var(--text-faint); padding-left: 14px;">${escapeHtml(brands) || "—"}</div>
       </td>
-      <td style="padding: 6px 10px; text-align: right;">${money(u.onhand_cost)}</td>
-      <td style="padding: 6px 10px; text-align: right;">${money(u.revenue)}</td>
-    </tr>`).join("");
+      <td style="padding: 8px 10px; text-align: right;">${money(g.onhand_cost)}</td>
+      <td style="padding: 8px 10px; text-align: right; font-weight: 600;">${money(g.revenue)}</td>
+      <td style="padding: 8px 10px; text-align: right;">${pct(g.revenue_share_pct)}</td>
+      <td style="padding: 8px 10px; text-align: right; color: var(--text-dim);">${g.skus}</td>
+    </tr>
+    <tbody id="pc-detail-${i}" style="display: none;">${detail}${mine.length >= 25 ? `<tr><td colspan="5" style="padding: 4px 10px 8px 26px; font-size: 10px; color: var(--text-faint);">showing top 25 of ${g.skus} SKUs</td></tr>` : ""}</tbody>`;
+  }).join("");
 
   const storeLabel = data.store ? data.store : "All stores";
   document.getElementById("pc-body").innerHTML = `
     <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px;">
       ${kpi("Partner-covered shelf cost", pct(t.covered_cost_pct), `${money(t.covered_onhand_cost)} of ${money(t.cannabis_onhand_cost)} on-hand`)}
       ${kpi("Covered SKUs", `${t.covered_skus} / ${t.cannabis_skus}`, pct(t.covered_skus_pct) + " of in-stock cannabis")}
-      ${kpi("Covered revenue (30d)", money(t.covered_revenue_30d), pct(t.cannabis_revenue_30d ? (t.covered_revenue_30d / t.cannabis_revenue_30d * 100) : 0) + " of cannabis revenue")}
+      ${kpi(`Covered revenue (${data.days}d)`, money(t.covered_revenue), pct(t.cannabis_revenue ? (t.covered_revenue / t.cannabis_revenue * 100) : 0) + " of cannabis revenue")}
+      ${kpi(`Uncovered revenue (${data.days}d)`, money(t.uncovered_revenue), `${t.uncovered_lp_count} LPs with no agreement`)}
       ${kpi("Est. rebate (on-hand)", money2(t.est_rebate_total), "embedded in current stock")}
     </div>
 
@@ -3940,7 +3975,7 @@ function renderPartnerCoverageResult(data) {
               <th style="padding: 8px 10px;">SKUs</th>
               <th style="padding: 8px 10px;">On-hand cost</th>
               <th style="padding: 8px 10px;">Cost share</th>
-              <th style="padding: 8px 10px;">Revenue 30d</th>
+              <th style="padding: 8px 10px;">Revenue ${data.days}d</th>
               <th style="padding: 8px 10px;">Rev share</th>
               <th style="padding: 8px 10px;">Est. rebate</th>
             </tr>
@@ -3954,35 +3989,56 @@ function renderPartnerCoverageResult(data) {
 
     <div class="card">
       <div style="padding: 12px 16px; border-bottom: 1px solid var(--border);">
-        <strong>Biggest uncovered SKUs</strong>
-        <span style="font-size: 11px; color: var(--text-faint);"> — highest on-hand cost not with any partner (push the LP toward a deal, or shift volume)</span>
+        <strong>Uncovered LPs — who to target</strong>
+        <span style="font-size: 11px; color: var(--text-faint);"> — licensed producers with no active data agreement, ranked by the sales you're earning nothing on. Click a row for its SKUs.</span>
+        <div style="font-size: 11px; color: var(--text-dim); margin-top: 6px;">
+          <strong>${money(t.uncovered_revenue)}</strong> over ${data.days} days across <strong>${t.uncovered_lp_count}</strong> LPs.
+          The top 10 are <strong>${pct(topTenShare)}</strong> of it.
+        </div>
       </div>
       <div style="overflow-x: auto;">
-        <table style="width: 100%; font-size: 12px; border-collapse: collapse;">
+        <table style="width: 100%; font-size: 13px; border-collapse: collapse;">
           <thead>
             <tr style="text-align: right; border-bottom: 2px solid var(--border); color: var(--text-dim); font-size: 11px;">
-              <th style="padding: 6px 10px; text-align: left;">Product / LP</th>
-              <th style="padding: 6px 10px;">On-hand cost</th>
-              <th style="padding: 6px 10px;">Revenue 30d</th>
+              <th style="padding: 8px 10px; text-align: left;">LP (supplier) / brands</th>
+              <th style="padding: 8px 10px;">On-hand cost</th>
+              <th style="padding: 8px 10px;">Revenue ${data.days}d</th>
+              <th style="padding: 8px 10px;">Share of uncovered</th>
+              <th style="padding: 8px 10px;">SKUs</th>
             </tr>
           </thead>
-          <tbody>
-            ${uncoveredRows || `<tr><td colspan="3" style="padding: 20px; text-align: center; color: var(--text-dim);">Nothing uncovered.</td></tr>`}
-          </tbody>
+          ${uncoveredRows || `<tbody><tr><td colspan="5" style="padding: 20px; text-align: center; color: var(--text-dim);">Nothing uncovered.</td></tr></tbody>`}
         </table>
       </div>
     </div>
   `;
+
+  // Expand/collapse an LP to reveal its SKUs.
+  document.querySelectorAll(".pc-lp-row").forEach(row => {
+    row.addEventListener("click", () => {
+      const i = row.dataset.lp;
+      const body = document.getElementById(`pc-detail-${i}`);
+      const caret = document.getElementById(`pc-caret-${i}`);
+      if (!body) return;
+      const open = body.style.display !== "none";
+      body.style.display = open ? "none" : "";
+      if (caret) caret.textContent = open ? "▸" : "▾";
+    });
+  });
 }
 
 function exportPartnerCoverageCsv() {
   const data = _pcLastData;
   if (!data) { alert("No data loaded"); return; }
-  const rows = [["Partner", "Rate %", "SKUs", "On-hand cost", "Cost share %", "Revenue 30d", "Rev share %", "Est. rebate"]];
+  const d = data.days || 90;
+  const rows = [["Partner", "Rate %", "SKUs", "On-hand cost", "Cost share %", `Revenue ${d}d`, "Rev share %", "Est. rebate"]];
   (data.partners || []).forEach(p => rows.push([p.partner, p.rate_value, p.skus, p.onhand_cost, p.cost_share_pct, p.revenue, p.revenue_share_pct, p.est_rebate]));
   rows.push([]);
-  rows.push(["Uncovered SKU", "Supplier", "On-hand cost", "Revenue 30d"]);
-  (data.uncovered_top || []).forEach(u => rows.push([u.name || u.sku, u.supplier || "", u.onhand_cost, u.revenue]));
+  rows.push(["Uncovered LP", "Brands", "SKUs", "On-hand cost", `Revenue ${d}d`, "Share of uncovered %"]);
+  (data.uncovered_by_lp || []).forEach(g => rows.push([g.supplier, (g.brands || []).join(" / "), g.skus, g.onhand_cost, g.revenue, g.revenue_share_pct]));
+  rows.push([]);
+  rows.push(["Uncovered SKU", "Supplier", "On-hand cost", `Revenue ${d}d`]);
+  (data.uncovered_skus || []).forEach(u => rows.push([u.name || u.sku, u.supplier || "", u.onhand_cost, u.revenue]));
   const csv = rows.map(r => r.map(c => `"${String(c == null ? "" : c).replace(/"/g, '""')}"`).join(",")).join("\\n");
   const blob = new Blob([csv], { type: "text/csv" });
   const a = document.createElement("a");
