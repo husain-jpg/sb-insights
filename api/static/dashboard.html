@@ -262,6 +262,17 @@
     text-align: right; font-family: ui-monospace, Menlo, monospace;
   }
   tbody td.muted { color: var(--text-dim); }
+  /* Dense variant for short reference tables (e.g. LP agreements), where the
+     default 14px row padding turns ~18 rows into a full screen of scrolling. */
+  .table-compact thead th { padding: 7px 12px; }
+  .table-compact tbody td { padding: 7px 12px; font-size: 12px; }
+  /* Collapsed explainers: keep the guidance without pushing data below the fold. */
+  details.hint-box > summary::before {
+    content: "▸"; display: inline-block; width: 12px;
+    color: var(--text-faint); font-size: 9px;
+  }
+  details.hint-box[open] > summary::before { content: "▾"; }
+  details.hint-box > summary::-webkit-details-marker { display: none; }
   tbody tr:hover td { background: var(--bg-elev-2); }
 
   /* Sticky-column support: wrap a table in <div class="sticky-cols-1"> etc.
@@ -6200,19 +6211,26 @@ async function renderDataLpPartners() {
     }
     const lpOptionList = Object.values(lpDisplay).sort((a, b) => a.localeCompare(b));
     let selectedBrands = [];   // brands chosen for the agreement being edited ([] = all)
-    const RATE_TYPE_LABELS = {
-      pct_wholesale: "% of wholesale cost",
-      pct_retail: "% of retail sales",
-      pct_gross_margin: "% of gross margin",
-      flat_per_month: "Flat $/month",
-      flat_per_unit: "Flat $/unit sold",
+    // One self-describing line. The old cell stacked "5.0%" over a second line
+    // reading "% of wholesale cost" — two rows of height for one fact.
+    const RATE_BASIS_SHORT = {
+      pct_wholesale: "of wholesale",
+      pct_retail: "of retail",
+      pct_gross_margin: "of gross margin",
     };
     const fmtRate = (rt, val) => {
       if (!rt) return "—";
-      if (rt.startsWith("pct_")) return `${(val || 0).toFixed(1)}%`;
-      if (rt === "flat_per_month") return `$${(val || 0).toFixed(2)}/mo`;
+      if (rt.startsWith("pct_")) return `${(val || 0).toFixed(1)}% ${RATE_BASIS_SHORT[rt] || ""}`.trim();
+      if (rt === "flat_per_month") return `$${(val || 0).toFixed(2)}/month`;
       if (rt === "flat_per_unit") return `$${(val || 0).toFixed(4)}/unit`;
       return String(val);
+    };
+    const fmtPeriod = (a) => {
+      // Every agreement here is open-ended in practice. The old cell rendered
+      // "Jun 26, 2026 → —" because fmtDate returns "—" for null, which is
+      // truthy, so the intended 'open-ended' fallback could never fire.
+      if (!a.end_date) return `Since ${fmtDate(a.start_date)}`;
+      return `${fmtDate(a.start_date)} → ${fmtDate(a.end_date)}`;
     };
     const fmtDate = (d) => {
       if (!d) return "—";
@@ -6238,17 +6256,23 @@ async function renderDataLpPartners() {
         </div>
       </div>
 
-      <div class="hint-box">
-        <strong>What's this tab?</strong> Track ongoing rebate agreements with brands/LPs.
-        These are <strong>different from</strong> Data Collectives (IRCC/CC/Seeker, per-SKU rebates via a third-party program) and <strong>different from</strong> LTOs (time-bound promotions).
-        These are open-ended arrangements: "Spinach pays us 5% of wholesale every month."
-        <br><br>
-        <strong>Hierarchy:</strong> LTOs and Data LP Partners stack with each other. If a SKU has both, both contribute to your effective margin. When either is present, Data Collective rebates are NOT applied for that SKU.
-      </div>
+      <div id="dlp-summary" style="font-size: 12px; color: var(--text-dim); margin-bottom: 10px;"></div>
 
       <div class="card">
         <div id="dlp-list" style="padding: 0;"></div>
       </div>
+
+      <details class="hint-box" style="display: block;">
+        <summary style="cursor: pointer; color: var(--text); font-size: 11px; list-style: none;">
+          How is this different from Data Collectives and LTOs?
+        </summary>
+        <div style="margin-top: 8px;">
+          Ongoing rebate agreements with an LP or brand — open-ended arrangements like "Spinach pays us 5% of wholesale every month."
+          <strong>Data Collectives</strong> (IRCC / CC / Seeker) are per-SKU rebates through a third-party program; <strong>LTOs</strong> are time-bound promotions.
+          <br><br>
+          <strong>Hierarchy:</strong> LTOs and Data LP Partner agreements stack — if a SKU has both, both contribute to effective margin. When either is present, Data Collective rebates are NOT applied to that SKU.
+        </div>
+      </details>
 
       <!-- Create / Edit dialog -->
       <div id="dlp-dialog" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
@@ -6357,43 +6381,83 @@ async function renderDataLpPartners() {
       const list = document.getElementById("dlp-list");
       if (items.length === 0) {
         list.innerHTML = '<div style="padding: 32px; text-align: center; color: var(--text-dim); font-size: 12px;">No agreements found. Click <strong>+ New Agreement</strong> to add one.</div>';
+        const sum0 = document.getElementById("dlp-summary");
+        if (sum0) sum0.textContent = "No agreements match this filter.";
         return;
       }
-      list.innerHTML = `
-        <table style="width: 100%;">
-          <thead>
-            <tr>
-              <th>Partner</th>
-              <th>Scope</th>
-              <th>Rate</th>
-              <th>Active period</th>
-              <th>Status</th>
-              <th style="width: 100px;"></th>
-            </tr>
-          </thead>
-          <tbody>
-            ${items.map(a => `
-              <tr ${a.is_active ? '' : 'style="opacity: 0.6;"'}>
-                <td><strong>${escapeHtml(titleCaseLp(a.partner_name))}</strong>${a.notes ? `<div class="sku">${escapeHtml(a.notes)}</div>` : ''}</td>
-                <td>${a.scope_type === 'lp'
-                  ? '<span class="tag tag-accent" style="font-size: 9px; padding: 1px 5px;">All brands</span>'
-                  : (a.scope_value || '').split(',').map(b => `<span class="tag" style="font-size: 9px; padding: 1px 5px; margin: 1px;">${escapeHtml(b.trim())}</span>`).join('')}</td>
-                <td>${fmtRate(a.rate_type, a.rate_value)} <div class="sku">${RATE_TYPE_LABELS[a.rate_type] || a.rate_type}</div></td>
-                <td>${fmtDate(a.start_date)} → ${fmtDate(a.end_date) || 'open-ended'}</td>
-                <td>${a.is_active
-                  ? '<span class="tag tag-accent" style="font-size: 9px; padding: 1px 5px;">ACTIVE</span>'
-                  : '<span class="tag" style="font-size: 9px; padding: 1px 5px;">INACTIVE</span>'}</td>
-                <td style="text-align: right;">
+      // Group by LP: several agreements per LP is the norm (different brands at
+      // different rates), and repeating the name down the column was most of
+      // the visual noise. Name prints once; sibling rows indent under it.
+      items.sort((a, b) =>
+        (titleCaseLp(a.partner_name) || "").localeCompare(titleCaseLp(b.partner_name) || "")
+        || (b.rate_value || 0) - (a.rate_value || 0));
+
+      // Status column dropped: with the default "Active only" filter every row
+      // carried an identical ACTIVE tag. Inactive rows are dimmed and tagged
+      // inline instead, so the state only takes space when it's the exception.
+      let prevLp = null;
+      const body = items.map(a => {
+        const lp = titleCaseLp(a.partner_name) || "";
+        const isRepeat = lp === prevLp;
+        prevLp = lp;
+        // Cap the chips: a 6-brand scope otherwise wraps to three lines and
+        // sets the height of the whole row. Full list stays in the tooltip.
+        const brandList = (a.scope_value || '').split(',').map(b => b.trim()).filter(Boolean);
+        const SHOWN = 3;
+        const chip = b => `<span class="tag" style="font-size: 9px; padding: 1px 5px; margin: 1px;">${escapeHtml(b)}</span>`;
+        const scope = a.scope_type === 'lp'
+          ? '<span class="tag tag-accent" style="font-size: 9px; padding: 1px 5px;">All brands</span>'
+          : brandList.slice(0, SHOWN).map(chip).join('')
+            + (brandList.length > SHOWN
+                ? `<span class="tag" style="font-size: 9px; padding: 1px 5px; margin: 1px; color: var(--text-dim);" title="${escapeHtml(brandList.join(', '))}">+${brandList.length - SHOWN}</span>`
+                : '');
+        return `
+              <tr ${a.is_active ? '' : 'style="opacity: 0.55;"'}>
+                <td style="${isRepeat ? 'border-top: none;' : ''}">
+                  ${isRepeat
+                    ? `<span style="color: var(--text-faint); padding-left: 10px;">↳</span>`
+                    : `<strong>${escapeHtml(lp)}</strong>`}
+                  ${a.is_active ? '' : '<span class="tag" style="font-size: 9px; padding: 1px 5px; margin-left: 6px;">INACTIVE</span>'}
+                  ${a.notes ? `<div class="sku">${escapeHtml(a.notes)}</div>` : ''}
+                </td>
+                <td>${scope}</td>
+                <td style="white-space: nowrap;">${fmtRate(a.rate_type, a.rate_value)}</td>
+                <td style="white-space: nowrap; color: var(--text-dim);">${fmtPeriod(a)}</td>
+                <td style="text-align: right; white-space: nowrap;">
                   <button class="btn-link dlp-edit-btn" data-id="${a.id}" style="font-size: 10px;">Edit</button>
                   <button class="btn-link dlp-del-btn" data-id="${a.id}" style="font-size: 10px; color: var(--critical);">Delete</button>
                 </td>
-              </tr>
-            `).join("")}
-          </tbody>
+              </tr>`;
+      }).join("");
+
+      list.innerHTML = `
+        <table style="width: 100%;" class="table-compact">
+          <thead>
+            <tr>
+              <th>LP / Partner</th>
+              <th>Scope</th>
+              <th>Rate</th>
+              <th>Period</th>
+              <th style="width: 90px;"></th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
         </table>
       `;
       list.querySelectorAll(".dlp-edit-btn").forEach(b => b.addEventListener("click", () => openDialog(parseInt(b.dataset.id))));
       list.querySelectorAll(".dlp-del-btn").forEach(b => b.addEventListener("click", () => deleteDlp(parseInt(b.dataset.id))));
+
+      const sum = document.getElementById("dlp-summary");
+      if (sum) {
+        const lps = new Set(items.map(a => titleCaseLp(a.partner_name)));
+        const pcts = items.filter(a => (a.rate_type || "").startsWith("pct_")).map(a => a.rate_value || 0);
+        const range = pcts.length
+          ? ` · rates ${Math.min(...pcts).toFixed(1)}%–${Math.max(...pcts).toFixed(1)}%` : "";
+        const inactive = items.filter(a => !a.is_active).length;
+        sum.innerHTML = `<strong>${items.length}</strong> agreement${items.length === 1 ? "" : "s"}`
+          + ` across <strong>${lps.size}</strong> LP${lps.size === 1 ? "" : "s"}${range}`
+          + (inactive ? ` · ${inactive} inactive` : "");
+      }
     };
 
     const openDialog = (id = null) => {
