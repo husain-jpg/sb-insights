@@ -562,6 +562,14 @@ _GM_PREFIXES = (
     "/api/brand-partners",  # Data Collectives
     "/api/data-revenue-deals",
     "/api/ltos",
+    "/api/lps",             # Licensed Producers + their contacts/LTOs. Covers
+                            # /api/lps-from-catalog too (same screen). These carry
+                            # commercial terms (payment terms, agreement status)
+                            # and 9 write endpoints — including
+                            # /api/lps/{id}/ltos, which otherwise sidesteps the
+                            # /api/ltos gate. The LTOs + Data LP Partners pages
+                            # are already gm-only in the nav; this closes the
+                            # matching server-side hole.
     "/api/data-lp-partners",
     "/api/monthly-reports",
 )
@@ -8526,11 +8534,25 @@ def health() -> dict:
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM products"); products = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM sales_daily"); sales = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM inventory_snapshots"); inv = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM locations"); locs = cur.fetchone()[0]
+        # NOTE: COUNT(*) on inventory_snapshots scans ~4.8M rows (~320ms) and
+        # sales_daily ~1M (~32ms). This endpoint runs on every page load to
+        # paint the sidebar, so neither count is worth the latency — the
+        # sidebar now shows data FRESHNESS, which is what anyone actually
+        # needs to know before trusting a number. System Health still reports
+        # full row counts via /api/system/health.
+        fresh = get_data_freshness(conn)
+        cur.execute("SELECT MAX(as_of) FROM current_inventory")
+        row = cur.fetchone()
+        inventory_as_of = row[0] if row and row[0] else None
     return {
         "status": "ok", "db_path": DB_PATH,
         "locations": locs, "products": products,
-        "sales_rows": sales, "inventory_snapshots": inv,
+        # Data freshness — drives the sidebar indicator.
+        "last_sale_date": fresh["last_sale_date"],
+        "last_sale_at": fresh["last_sale_at"],
+        "has_today": fresh["has_today"],
+        "business_today": business_today().isoformat(),
+        "business_now": fresh["business_now"],
+        "inventory_as_of": inventory_as_of,
     }

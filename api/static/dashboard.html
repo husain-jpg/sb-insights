@@ -480,40 +480,40 @@
 
     <div class="nav-group" data-group="inventory">
       <button class="nav-group-header" data-toggle="inventory">
-        <span class="arrow">▾</span> Inventory Reports
+        <span class="arrow">▾</span> Inventory
       </button>
       <div class="nav-group-items">
         <button data-page="inventory">▸ Inventory On Hand</button>
-        <button data-page="ocs-catalogue">▸ OCS Catalogue</button>
         <button data-page="reorder">▸ Reorder Report <span class="badge" id="badge-reorder" style="display:none"></span></button>
         <button data-page="stockouts">▸ Stockouts <span class="badge" id="badge-stockouts" style="display:none"></span></button>
         <button data-page="deadstock">▸ Dead Stock / Overstock</button>
         <button data-page="transfers">▸ Suggested Transfers</button>
         <button data-page="cross-store">▸ Cross-Store Opportunities</button>
+        <button data-page="mix">▸ Inventory Category Mix</button>
+        <button data-page="outcomes">▸ Order Backtests</button>
       </div>
     </div>
 
     <button data-page="promos">▸ Promotions</button>
 
-    <div class="nav-group" data-group="analytics">
-      <button class="nav-group-header" data-toggle="analytics">
-        <span class="arrow">▾</span> Analytics
+    <div class="nav-group" data-group="market">
+      <button class="nav-group-header" data-toggle="market">
+        <span class="arrow">▾</span> Market
       </button>
       <div class="nav-group-items">
-        <button data-page="mix">▸ Inventory Category Mix</button>
+        <button data-page="ocs-catalogue">▸ OCS Catalogue</button>
         <button data-page="market-intel">▸ Market Intelligence</button>
         <button data-page="competitors">▸ Competitor Pricing</button>
-        <button data-page="partner-coverage">▸ Partner Coverage</button>
-        <button data-page="outcomes">▸ Order Backtests</button>
       </div>
     </div>
 
-    <div class="nav-group" data-group="admin">
-      <button class="nav-group-header" data-toggle="admin">
-        <span class="arrow">▾</span> Admin
+    <div class="nav-group" data-group="financial">
+      <button class="nav-group-header" data-toggle="financial">
+        <span class="arrow">▾</span> Financial
       </button>
       <div class="nav-group-items">
-        <button data-page="analytics">▸ Financial</button>
+        <button data-page="analytics">▸ Historical Financials</button>
+        <button data-page="partner-coverage">▸ Partner Coverage</button>
         <button data-page="partners">▸ Data Collectives</button>
         <button data-page="ltos">▸ LTOs</button>
         <button data-page="data-lp-partners">▸ Data LP Partners</button>
@@ -521,9 +521,9 @@
       </div>
     </div>
 
-    <div class="nav-group" data-group="settings">
-      <button class="nav-group-header" data-toggle="settings">
-        <span class="arrow">▾</span> Settings
+    <div class="nav-group" data-group="system">
+      <button class="nav-group-header" data-toggle="system">
+        <span class="arrow">▾</span> System
       </button>
       <div class="nav-group-items">
         <button data-page="settings">▸ System Settings</button>
@@ -535,8 +535,8 @@
     </div>
   </nav>
   <div class="status-pane" id="status-pane">
-    <div><span class="status-dot status-ok"></span>Local database</div>
-    <div><span class="status-dot status-warn"></span>Cova API (pending)</div>
+    <div id="status-freshness"><span class="status-dot status-warn"></span>Checking data…</div>
+    <div id="status-store" style="margin-top: 6px;"></div>
     <div id="status-info" style="margin-top: 8px;"></div>
   </div>
   <div id="user-pane" style="border-top: 1px solid var(--border); padding: 10px 14px; font-size: 11px; color: var(--text-dim);">
@@ -771,7 +771,50 @@ function _drawTable(tableId) {
 // ========================================================================
 // OVERVIEW
 // ========================================================================
-let _overviewStore = "";  // "" = all stores
+// ==== Global store context ====================================================
+// Every report screen used to carry its own store dropdown that reset to "All
+// stores" on each visit, so drilling into one store meant re-picking it on
+// every page. The selection is now one shared, persisted value: screens render
+// with it pre-selected (no double fetch) and write back when changed.
+const STORE_KEY = "sb-global-store";
+let _globalStore = "";
+try { _globalStore = localStorage.getItem(STORE_KEY) || ""; } catch (e) { /* private mode */ }
+
+function setGlobalStore(v) {
+  _globalStore = v || "";
+  try { localStorage.setItem(STORE_KEY, _globalStore); } catch (e) { /* ignore */ }
+  renderStoreContext();
+}
+/** `selected` for the option matching the active store — used inline in templates. */
+function gsSel(id) { return ((id || "") === _globalStore) ? "selected" : ""; }
+
+function renderStoreContext() {
+  const el = document.getElementById("status-store");
+  if (!el) return;
+  el.innerHTML = _globalStore
+    ? `<span class="status-dot status-ok"></span>Viewing <strong>${storeLabel(_globalStore)}</strong>`
+    : `<span class="status-dot status-ok"></span>Viewing <strong>all stores</strong>`;
+}
+
+// Store dropdowns across the app. After a screen renders we attach a writeback
+// listener so changing the filter anywhere updates the shared selection. The
+// screens keep their own change handlers (which refetch); this only records.
+const STORE_FILTER_IDS = [
+  "overview-store-filter", "store-filter", "stockout-store-filter",
+  "ds-store-filter", "inv-store-filter", "mix-store-filter",
+  "oo-store-filter", "pc-store", "promos-store-filter", "cs-target-store",
+];
+function wireStoreFilters() {
+  for (const id of STORE_FILTER_IDS) {
+    const el = document.getElementById(id);
+    if (!el || el.dataset.gsWired) continue;
+    el.dataset.gsWired = "1";
+    el.addEventListener("change", () => setGlobalStore(el.value));
+  }
+  renderStoreContext();
+}
+
+
 
 async function renderOverview() {
   const main = document.getElementById("main");
@@ -787,14 +830,14 @@ async function renderOverview() {
   </div>`;
   try {
     const locs = await api("/api/locations");
-    const params = _overviewStore ? `?store=${_overviewStore}` : "";
+    const params = _globalStore ? `?store=${_globalStore}` : "";
     const [kpis, stores, inv] = await Promise.all([
       api("/api/kpis" + params),
       api("/api/store-performance" + params),
       api("/api/inventory-summary" + params),
     ]);
-    const selectedStoreName = _overviewStore
-      ? (locs.find(l => l.id === _overviewStore)?.short_name || _overviewStore)
+    const selectedStoreName = _globalStore
+      ? (locs.find(l => l.id === _globalStore)?.short_name || _globalStore)
       : null;
 
     main.innerHTML = `
@@ -805,8 +848,8 @@ async function renderOverview() {
         </div>
         <div class="controls-row">
           <select id="overview-store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}" ${l.id === _overviewStore ? 'selected' : ''}>${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <span class="tag tag-accent">Live · local data</span>
         </div>
@@ -906,7 +949,7 @@ async function renderOverview() {
         `;
       })()}
 
-      ${_overviewStore ? '' : `
+      ${_globalStore ? '' : `
       <div class="kicker" style="margin: 24px 0 12px">Store Performance</div>
       <div class="card" style="padding: 8px 0">
         <div class="store-header-row">
@@ -927,12 +970,12 @@ async function renderOverview() {
 
     // Store filter: re-render whole Overview when changed
     document.getElementById("overview-store-filter").addEventListener("change", e => {
-      _overviewStore = e.target.value;
+      setGlobalStore(e.target.value);
       renderOverview();
     });
 
     // Store performance rows — only render if visible
-    if (!_overviewStore) {
+    if (!_globalStore) {
       const body = document.getElementById("store-perf-body");
       body.innerHTML = stores.map(s => {
         const d7 = s.wow_delta_pct;
@@ -1569,8 +1612,8 @@ async function renderReorder() {
             <option value="">All categories</option>
           </select>
           <select id="store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
         </div>
         <div class="controls-row" style="font-size: 11px; flex-wrap: wrap;">
@@ -2308,8 +2351,8 @@ async function renderStockouts() {
             <option value="Accessories">Accessories only</option>
           </select>
           <select id="stockout-store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <span class="tag tag-critical" id="stockout-risk">${fmt$(data.revenue_at_risk)}/mo at risk</span>
           ${excelButtonHtml("stockout-excel-btn")}
@@ -2461,8 +2504,8 @@ async function renderDeadStock() {
             <option value="Accessories">Accessories only</option>
           </select>
           <select id="ds-store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <select id="ds-window" title="For DEAD bucket: how many days of sales history define 'dead'. Longer = stricter.">
             <option value="14">14d window</option>
@@ -2756,8 +2799,8 @@ async function renderInventory() {
           </select>
           <select id="inv-category-filter"><option value="">All categories</option></select>
           <select id="inv-store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <select id="inv-stock-filter">
             <option value="in_stock">In stock only</option>
@@ -2924,11 +2967,55 @@ function lpTradeName(s) {
 // Case- and punctuation-insensitive key for matching LP/brand names.
 function normLp(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ''); }
 
+// How current is the sales data? This is the question to answer before anyone
+// trusts a number on any screen — previously the sidebar showed row counts
+// (which nobody acts on) and two hardcoded status dots that never updated.
+function renderFreshness(h) {
+  const el = document.getElementById("status-freshness");
+  if (!el) return;
+  const today = h.business_today;
+  const last = h.last_sale_date;
+  if (!last) {
+    el.innerHTML = `<span class="status-dot status-warn"></span>No sales data`;
+    return;
+  }
+  const t = hhmmLabel(h.last_sale_at);
+  const dayGap = Math.round(
+    (new Date(today + "T00:00:00Z") - new Date(last + "T00:00:00Z")) / 86400000);
+  let dot = "status-ok", text;
+  if (h.has_today) {
+    text = `Sales data <strong>live</strong>${t ? ` — today through ${t}` : " — today"}`;
+  } else if (dayGap <= 1) {
+    const wd = new Date(last + "T00:00:00Z")
+      .toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+    text = `Sales data through <strong>${wd}</strong>${t ? `, ${t}` : ""}`;
+  } else {
+    dot = "status-warn";
+    text = `Sales data <strong>${dayGap} days behind</strong> — through ${last}`;
+  }
+  el.innerHTML = `<span class="status-dot ${dot}"></span>${text}`;
+  el.title = `Business time now: ${h.business_now || "?"} (America/Toronto)`
+           + (h.inventory_as_of ? `
+Inventory as of: ${h.inventory_as_of}` : "");
+}
+
+/** "2026-09-19 21:56:39" -> "9:56 PM". Values are business-local wall clock. */
+function hhmmLabel(t) {
+  if (!t) return "";
+  const m = String(t).match(/(\d{1,2}):(\d{2})/);
+  if (!m) return "";
+  let h = parseInt(m[1], 10);
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  return `${h}:${m[2]} ${ap}`;
+}
+
 async function updateStatus() {
   try {
     const h = await api("/api/health");
+    renderFreshness(h);
     document.getElementById("status-info").innerHTML =
-      `${h.locations} store${h.locations !== 1 ? 's' : ''} · ${fmtN(h.products)} SKUs · ${fmtN(h.sales_rows)} sales rows`;
+      `${h.locations} store${h.locations !== 1 ? 's' : ''} · ${fmtN(h.products)} SKUs`;
 
     const k = await api("/api/kpis");
     const reorderBadge = document.getElementById("badge-reorder");
@@ -3075,8 +3162,8 @@ async function renderMixAnalysis() {
             <option value="Accessories">Accessories</option>
           </select>
           <select id="mix-store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <select id="mix-days-filter">
             <option value="30">30 days</option>
@@ -3413,8 +3500,8 @@ async function renderOutcomes() {
             <option value="sku">Per-SKU rolling</option>
           </select>
           <select id="oo-store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <select id="oo-window-days">
             <option value="14">14-day window</option>
@@ -3761,8 +3848,8 @@ async function renderPartnerCoverage() {
       </div>
       <div class="controls-row" style="flex-wrap: wrap;">
         <select id="pc-store">
-          <option value="">All stores (chain-wide)</option>
-          ${locs.map(l => `<option value="${l.id}">${escapeHtml(l.short_name || l.name)}</option>`).join("")}
+          <option value="" ${gsSel("")}>All stores (chain-wide)</option>
+          ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${escapeHtml(l.short_name || l.name)}</option>`).join("")}
         </select>
         <button id="pc-refresh">Refresh</button>
         <button id="pc-export-btn">Excel</button>
@@ -5267,8 +5354,8 @@ async function renderCrossStore() {
         </div>
         <div class="controls-row">
           <select id="cs-target-store" title="Target store: where you want to find new product opportunities.">
-            <option value="">All stores (per-target view)</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores (per-target view)</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <select id="cs-window" title="Sales window for evaluating velocity at OTHER stores.">
             <option value="30">30 days</option>
@@ -5408,8 +5495,8 @@ async function renderPromos() {
         </div>
         <div class="controls-row">
           <select id="promos-store-filter">
-            <option value="">All stores</option>
-            ${locs.map(l => `<option value="${l.id}">${l.short_name || l.name}</option>`).join("")}
+            <option value="" ${gsSel("")}>All stores</option>
+            ${locs.map(l => `<option value="${l.id}" ${gsSel(l.id)}>${l.short_name || l.name}</option>`).join("")}
           </select>
           <select id="promos-type-filter" title="Cannabis is shelf-life sensitive — that's where the cascade applies. Other types: ageing matters less.">
             <option value="Cannabis" selected>Cannabis only</option>
@@ -8190,17 +8277,47 @@ function canAccessPage(page) {
   return _myRoleRank() >= (ROLE_RANK[need] || 3);
 }
 
-function goto(page) {
+// The current page lives in the URL hash, so screens can be bookmarked and
+// shared, Back/Forward work, and a refresh returns you where you were instead
+// of dumping you on Overview.
+let _navigating = false;
+
+async function goto(page, opts = {}) {
+  if (!routes[page]) page = "overview";
   if (!canAccessPage(page)) {
     document.getElementById("main").innerHTML =
       `<div class="error"><strong>Not authorized</strong>You don't have access to this section.</div>`;
     return;
   }
+  if (opts.updateHash !== false) {
+    const want = `#${page}`;
+    if (location.hash !== want) {
+      _navigating = true;                       // don't let our own write re-enter
+      location.hash = want;
+      setTimeout(() => { _navigating = false; }, 0);
+    }
+  }
   document.querySelectorAll("nav button[data-page]").forEach(b => b.classList.remove("active"));
   const btn = document.querySelector(`nav button[data-page="${page}"]`);
   if (btn) btn.classList.add("active");
-  if (routes[page]) routes[page]();
+  try {
+    await routes[page]();
+  } finally {
+    // Screens render their own store dropdown; adopt it into the shared context.
+    wireStoreFilters();
+  }
 }
+
+function currentHashPage() {
+  const p = (location.hash || "").replace(/^#/, "").trim();
+  return routes[p] ? p : null;
+}
+
+window.addEventListener("hashchange", () => {
+  if (_navigating) return;
+  const page = currentHashPage();
+  if (page) goto(page, { updateHash: false });
+});
 
 // Page-navigation buttons (those with data-page attribute)
 document.querySelectorAll("nav button[data-page]").forEach(btn => {
@@ -8233,8 +8350,12 @@ document.querySelectorAll(".nav-group[data-group]").forEach(group => {
 });
 
 updateStatus();
-ensureStoreNames().then(() => renderOverview());
-loadCurrentUser();
+// Order matters: goto() consults canAccessPage(), which needs the current
+// user's role. Routing before the role loads would bounce a GM landing on a
+// bookmarked #analytics straight to "Not authorized".
+loadCurrentUser()
+  .then(ensureStoreNames)
+  .then(() => goto(currentHashPage() || "overview"));
 </script>
 </body>
 </html>
