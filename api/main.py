@@ -69,6 +69,34 @@ _load_dotenv()
 DB_PATH = os.environ.get("TERROIR_DB", "terroir.db")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
+# ---------------------------------------------------------------------------
+# Business timezone
+# ---------------------------------------------------------------------------
+# The droplet runs in UTC, but the stores (and the Cova reports) are in
+# Ontario. Plain date.today() therefore rolls over to "tomorrow" at 8pm local
+# during EDT (7pm during EST) — which silently shifted every relative preset
+# ("Today", "Yesterday", MTD…) by a day for the whole evening. Anything that
+# means "the business day the stores are trading in" must use these helpers,
+# not date.today().
+BUSINESS_TZ_NAME = os.environ.get("TERROIR_TZ", "America/Toronto")
+try:
+    from zoneinfo import ZoneInfo
+    BUSINESS_TZ = ZoneInfo(BUSINESS_TZ_NAME)
+except Exception:  # pragma: no cover - missing tzdata: degrade to server local
+    BUSINESS_TZ = None
+
+
+def business_now() -> datetime:
+    """Current wall-clock time in the stores' timezone (naive, tz stripped)."""
+    if BUSINESS_TZ is None:
+        return datetime.now()
+    return datetime.now(BUSINESS_TZ).replace(tzinfo=None)
+
+
+def business_today() -> date:
+    """Today's date as the stores experience it — NOT the server's UTC date."""
+    return business_now().date()
+
 # docs_url/openapi_url disabled: this is an internet-facing app and the
 # interactive docs would hand an attacker the full API surface. Re-enable
 # locally by editing here if ever needed for development.
@@ -914,7 +942,48 @@ def get_latest_sale_date(conn) -> date:
     row = cur.fetchone()
     if row and row[0]:
         return date.fromisoformat(row[0])
-    return date.today()
+    return business_today()
+
+
+def get_data_freshness(conn) -> dict:
+    """How current the sales data is, in business-local terms.
+
+    Cova's scheduled exports are cumulative day-to-date, so an intraday run
+    (noon / 4pm / 8pm) replaces that day's rows with a larger running total.
+    That makes "today" real but PARTIAL — the last transaction timestamp is
+    how far into the day the data actually goes.
+
+    Returns:
+      last_sale_date  — latest date with any sales rows (ISO) or None
+      last_sale_at    — latest transaction timestamp (ISO, business local)
+      has_today       — whether today's business date has any sales yet
+      latest_complete — last date we consider fully closed out (yesterday,
+                        or the last date with data if imports are lagging)
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(sale_date) FROM sales_daily")
+    row = cur.fetchone()
+    last_date = row[0] if row and row[0] else None
+    last_at = None
+    if last_date:
+        cur.execute("SELECT MAX(sale_datetime) FROM sale_lines WHERE sale_date = ?",
+                    (last_date,))
+        r2 = cur.fetchone()
+        last_at = r2[0] if r2 and r2[0] else None
+
+    today = business_today()
+    has_today = bool(last_date and date.fromisoformat(last_date) == today)
+    if last_date:
+        latest_complete = min(date.fromisoformat(last_date), today - timedelta(days=1))
+    else:
+        latest_complete = today - timedelta(days=1)
+    return {
+        "last_sale_date": last_date,
+        "last_sale_at": last_at,
+        "has_today": has_today,
+        "latest_complete": latest_complete,
+        "business_now": business_now().isoformat(timespec="seconds"),
+    }
 
 
 def get_price_map(conn) -> dict:
@@ -1923,7 +1992,7 @@ def get_dead_stock(
         else:
             cur.execute("SELECT MAX(sale_date) FROM sales_daily")
         row = cur.fetchone()
-        as_of = date.fromisoformat(row[0]) if row and row[0] else date.today()
+        as_of = date.fromisoformat(row[0]) if row and row[0] else business_today()
         window_start = (as_of - timedelta(days=window_days)).isoformat()
 
         # Compute velocity over the requested window for every (sku, location)
@@ -3304,7 +3373,7 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
         # data_revenue_deals.brand_id points at the COLLECTIVE in brand_partners
         # (Canna Collective / IRCC / Seeker), not the product brand.
         from datetime import date as _date
-        today = _date.today().isoformat()
+        today = business_today().isoformat()
         coll_name = {r["id"]: r["brand_name"]
                      for r in conn.execute("SELECT id, brand_name FROM brand_partners")}
         rebate_by_ocs: dict = {}
@@ -3417,7 +3486,7 @@ def _xlsx_response(content: bytes, filename: str) -> Response:
 
 def _today_str() -> str:
     from datetime import date as _d
-    return _d.today().isoformat()
+    return business_today().isoformat()
 
 
 def _filter_suffix(parts: dict) -> str:
@@ -4444,7 +4513,7 @@ def export_ocs_template(store: str | None = None):
         write_filled_template(filled_df, out)
         out.seek(0)
 
-    fname = f"OCS_Order_{store}_{date.today().isoformat()}.xlsx"
+    fname = f"OCS_Order_{store}_{business_today().isoformat()}.xlsx"
     return StreamingResponse(
         out,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -5526,7 +5595,7 @@ def _lp_partner_coverage(conn):
     Returns (lp_by_norm, brand_by_norm): normalized LP name / brand name → partner
     display name. scope_type='lp' covers all brands under that LP; scope_type='brand'
     covers the comma-separated brands in scope_value."""
-    today = date.today().isoformat()
+    today = business_today().isoformat()
     lp_by_norm: dict[str, str] = {}
     brand_by_norm: dict[str, str] = {}
     for r in conn.execute(
@@ -5550,7 +5619,7 @@ def _collective_coverage(conn):
     collective rebate (data_revenue_deals; IRCC / Canna Collective / Seeker). Keyed
     by item number (not full variant) to absorb OCS size-string drift, and a product
     can be on several collectives at once, so all are listed."""
-    today = date.today().isoformat()
+    today = business_today().isoformat()
     coll_name = {r[0]: r[1] for r in conn.execute("SELECT id, brand_name FROM brand_partners")}
     by_item: dict[str, set] = {}
     for r in conn.execute(
@@ -5564,7 +5633,7 @@ def _collective_coverage(conn):
 def _lto_coverage(conn):
     """Active-LTO lookups. Returns (by_sku, by_brand_norm, by_subcat). An LTO can
     target an explicit SKU list (lto_skus) or a whole brand/subcategory."""
-    today = date.today().isoformat()
+    today = business_today().isoformat()
     active = list(conn.execute(
         """SELECT id, name, applies_to_brand, applies_to_subcategory FROM ltos
            WHERE is_active = 1 AND start_date <= ?
@@ -6035,7 +6104,7 @@ def get_suggested_additions(
       - Excludes SKUs the store has any sales activity for in the last 90 days
         (treated as "we tried this, just stocked out — handled by regular reorder")
     """
-    today = date.today()
+    today = business_today()
     today_iso = today.isoformat()
     ninety_ago = (today - timedelta(days=90)).isoformat()
 
@@ -6198,7 +6267,7 @@ def update_gap_status(sku: str, payload: dict = Body(...)) -> dict:
         snoozed_until = None
         if action == "snooze":
             days = int(payload.get("snooze_days") or 60)
-            snoozed_until = (date.today() + timedelta(days=days)).isoformat()
+            snoozed_until = (business_today() + timedelta(days=days)).isoformat()
 
         # Map action to status value
         status_value = {"snooze": "snoozed", "dismiss": "dismissed", "added": "added"}[action]
@@ -6412,7 +6481,7 @@ def list_data_revenue_deals(brand_id: int | None = None, active_on: str | None =
         include_archived -- if False (default), hide deals where end_date < today
     """
     from datetime import date as _date
-    today_iso = _date.today().isoformat()
+    today_iso = business_today().isoformat()
     where = []
     params = []
     if brand_id is not None:
@@ -6532,7 +6601,7 @@ def list_ltos(brand_id: int | None = None, lp_id: int | None = None,
     list = applies via brand/category scope rules, not SKU junction).
     """
     from datetime import date as _date
-    today_iso = _date.today().isoformat()
+    today_iso = business_today().isoformat()
     where = []
     params = []
     if brand_id is not None:
@@ -6977,7 +7046,7 @@ def sku_rolling_outcomes(
         all_lines = cur.fetchall()
 
         latest = get_latest_sale_date(conn)
-        latest_iso = latest.isoformat() if latest else date.today().isoformat()
+        latest_iso = latest.isoformat() if latest else business_today().isoformat()
 
         # For efficiency: pull post-delivery sales in one pass per (variant, location)
         # Variants are reused across stores so we key by both.
@@ -7070,12 +7139,29 @@ def sku_rolling_outcomes(
 # ---------------------------------------------------------------------------
 
 def _resolve_date_range(preset: str, custom_start: str | None,
-                       custom_end: str | None, today: date) -> tuple[date, date]:
-    """Convert a preset string (or 'custom') into (start, end) inclusive dates."""
+                       custom_end: str | None, today: date,
+                       anchor: date | None = None) -> tuple[date, date]:
+    """Convert a preset string (or 'custom') into (start, end) inclusive dates.
+
+    Two different reference dates, deliberately:
+
+    `today`  — the real business date. Named presets ("Today", "Yesterday",
+               MTD, YTD…) resolve against this so the label always means what
+               it says. Previously everything was anchored to the newest date
+               in the data, so with reports landing overnight "Today" silently
+               rendered yesterday and "Yesterday" the day before that.
+
+    `anchor` — the newest day we have DATA for. Only the trailing-window
+               presets (last7 / last30 / last12) use it, so that "Last 30
+               days" is always 30 days of actual data rather than a window
+               with empty days on the end.
+    """
     if preset == "custom":
         if not custom_start or not custom_end:
             raise HTTPException(status_code=400, detail="custom range requires start and end")
         return date.fromisoformat(custom_start), date.fromisoformat(custom_end)
+
+    trail = anchor or today
 
     # Common business shortcuts
     if preset == "today":
@@ -7086,9 +7172,9 @@ def _resolve_date_range(preset: str, custom_start: str | None,
         start = today - timedelta(days=today.weekday())
         return start, today
     if preset == "last7":
-        return today - timedelta(days=6), today
+        return trail - timedelta(days=6), trail
     if preset == "last30":
-        return today - timedelta(days=29), today
+        return trail - timedelta(days=29), trail
     if preset == "mtd":
         return today.replace(day=1), today
     if preset == "last_month":
@@ -7108,7 +7194,7 @@ def _resolve_date_range(preset: str, custom_start: str | None,
     if preset == "ytd":
         return date(today.year, 1, 1), today
     if preset == "last12":
-        return today - timedelta(days=365), today
+        return trail - timedelta(days=365), trail
     raise HTTPException(status_code=400, detail=f"unknown preset: {preset}")
 
 
@@ -7139,7 +7225,8 @@ def _shift_period_back_one_year(start: date, end: date,
 
 
 def _query_period_metrics(conn, start: date, end: date,
-                          store: str | None) -> dict:
+                          store: str | None,
+                          end_time_cutoff: str | None = None) -> dict:
     """
     Aggregate sale_lines metrics for the given period, grouped by location.
     Returns {location_id: metrics_dict, '_total': metrics_dict}.
@@ -7150,6 +7237,16 @@ def _query_period_metrics(conn, start: date, end: date,
     """
     where = ["sl.sale_date >= ?", "sl.sale_date <= ?"]
     params: list = [start.isoformat(), end.isoformat()]
+    if end_time_cutoff:
+        # Partial-day comparison: only count the final day up to the same
+        # clock time the live day has reached, so a half-finished today is
+        # never compared against a full trading day last year. Rows with no
+        # timestamp fall back to being counted (older imports).
+        where.append(
+            "(sl.sale_date < ? OR sl.sale_datetime IS NULL "
+            " OR TIME(sl.sale_datetime) <= ?)"
+        )
+        params.extend([end.isoformat(), end_time_cutoff])
     if store:
         where.append("sl.location_id = ?"); params.append(store)
     where_sql = " AND ".join(where)
@@ -7252,7 +7349,7 @@ def _active_partner_matchers(conn):
     {partner, rate_type, rate_value}. 'lp' scope covers every brand under that
     LP; 'brand' scope covers the comma-separated brands in scope_value. This is
     the rate-carrying sibling of _lp_partner_coverage (which is name-only)."""
-    today = date.today().isoformat()
+    today = business_today().isoformat()
     by_lp: dict[str, dict] = {}
     by_brand: dict[str, dict] = {}
     for r in conn.execute(
@@ -7400,22 +7497,35 @@ def sales_performance(
       - prior_period: {start, end} (if yoy=true)
       - rows: list of per-store metrics with current + prior + diffs
     """
-    today = date.today()
+    today = business_today()
 
     with db() as conn:
-        # Anchor relative presets ("today", "last 30 days", MTD, …) to the most
-        # recent day of SALES DATA, not the calendar date. The old approach
-        # resolved from the calendar and then clamped only the END to the data
-        # — so with imports lagging 2 days, "Last 30 days" silently became a
-        # 28-day window still labeled 30. Now the whole window shifts with the
-        # data, so a 30-day preset is always 30 data-days.
+        # Named presets resolve against the real business date so "Today"
+        # means today; trailing windows (last7/30/12) resolve against the
+        # newest day of DATA so a 30-day preset is always 30 data-days.
+        fresh = get_data_freshness(conn)
         latest = get_latest_sale_date(conn)
-        anchor = min(today, latest) if latest else today
-        p_start, p_end = _resolve_date_range(preset, start, end, anchor)
+        trail_anchor = min(today, latest) if latest else today
+        p_start, p_end = _resolve_date_range(preset, start, end, today, trail_anchor)
         if p_start > p_end:
             raise HTTPException(status_code=400, detail="start must be <= end")
-        # Custom ranges can still name an end beyond the data — clamp those.
-        actual_end = min(p_end, anchor)
+        # Never claim data we don't have: clamp the end to the newest data day,
+        # EXCEPT for "today" — an empty today should read as "no sales yet",
+        # not silently fall back to yesterday's numbers under a Today label.
+        if preset == "today":
+            actual_end = p_end
+        else:
+            actual_end = min(p_end, latest) if latest else p_end
+        if actual_end < p_start:
+            actual_end = p_start
+
+        # A period ending on the live business day is only filled in as far as
+        # the last intraday report went. Capture that cutoff so the prior-year
+        # window can be truncated to the same point in the day.
+        partial = actual_end >= today and fresh["has_today"]
+        cutoff = None
+        if partial and fresh["last_sale_at"]:
+            cutoff = str(fresh["last_sale_at"])[11:19] or None
 
         current = _query_period_metrics(conn, p_start, actual_end, store)
 
@@ -7423,7 +7533,10 @@ def sales_performance(
         prior_data = None
         if yoy:
             prev_start, prev_end = _shift_period_back_one_year(p_start, actual_end, _align)
-            prior_data = _query_period_metrics(conn, prev_start, prev_end, store)
+            # Same-time-of-day truncation: comparing a day that is only half
+            # traded against a full prior-year day would read as a collapse.
+            prior_data = _query_period_metrics(conn, prev_start, prev_end, store,
+                                               end_time_cutoff=cutoff)
 
         # Get location names for nicer display
         cur = conn.cursor()
@@ -7478,6 +7591,13 @@ def sales_performance(
             "days": (actual_end - p_start).days + 1,
             "data_through": latest.isoformat() if latest else None,
             "clamped": actual_end < p_end,
+            # Partial-day reporting (intraday Cova runs)
+            "partial": bool(partial),
+            "partial_through": cutoff,
+            "business_today": today.isoformat(),
+            "business_now": fresh["business_now"],
+            "last_sale_at": fresh["last_sale_at"],
+            "has_today": bool(fresh["has_today"]),
         },
         "rows": rows,
     }
@@ -7487,6 +7607,7 @@ def sales_performance(
             "start": prev_start.isoformat(),
             "end": prev_end.isoformat(),
             "align": _align,
+            "time_truncated_to": cutoff,
         }
     return response
 
@@ -7930,7 +8051,7 @@ def list_ltos_for_lp(lp_id: int, active_only: bool = False,
     Pass include_archived=True to see them.
     """
     from datetime import date as _date
-    today_iso = _date.today().isoformat()
+    today_iso = business_today().isoformat()
     with db() as conn:
         cur = conn.cursor()
         sql = """
@@ -8180,7 +8301,7 @@ def get_email_log(
 def get_system_health() -> dict:
     """Comprehensive health snapshot. Returns everything the UI needs in one
     call to avoid the N+1 round-trip pattern."""
-    today = date.today()
+    today = business_today()
 
     def _age_days(d_iso: str | None) -> int | None:
         if not d_iso:

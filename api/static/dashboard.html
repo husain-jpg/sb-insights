@@ -3649,7 +3649,7 @@ async function renderAnalytics() {
       </div>
       <div class="controls-row" style="flex-wrap: wrap;">
         <select id="an-preset">
-          <option value="today">Today</option>
+          <option value="today">Today (live)</option>
           <option value="yesterday">Yesterday</option>
           <option value="wtd">Week-to-date</option>
           <option value="last7">Last 7 days</option>
@@ -3686,6 +3686,7 @@ async function renderAnalytics() {
       <strong>Discount %</strong> = total discounts ÷ total regular price (standard retail metric).
       <strong>Margin %</strong> is computed only on SKUs with wholesale cost data — coverage shown above.
       <strong>YoY comparison</strong> — pick how the prior-year period is chosen: <em>same day of the week</em> (52 weeks / 364 days back, so a Saturday compares to a Saturday — best for day-of-week-sensitive sales) or <em>same date</em> (exact calendar date a year ago). New stores not active in the prior period show $0 prior with the current value as the difference.
+      <strong>Today (live)</strong> really means today, in store time (America/Toronto) — not the last day we have a report for. Cova's scheduled exports are cumulative day-to-date, so each intraday run replaces today's figures with a larger running total and the tab picks it up within ~5 minutes. Today is therefore <em>partial</em> until the final overnight run: the header shows how far into the day the data goes, and the prior-year day is cut off at that same clock time so you're never comparing a half-traded day against a full one. <em>Yesterday</em> and the month/quarter/year presets are also anchored to the real calendar; only the trailing windows (Last 7 / 30 days, Last 12 months) end on the newest day with data, so they always contain a full N days.
     </div>
   `;
 
@@ -3911,7 +3912,21 @@ function renderAnalyticsResult(data) {
   const p = data.period;
   const pp = data.prior_period;
   const clampNote = p.clamped ? ` <span style="color: var(--warning, #c89b32);">(end clamped to available data)</span>` : '';
-  let info = `<div style="font-size: 12px;"><strong>Current:</strong> ${p.start} → ${p.end}${p.days ? ` <span style="color: var(--text-dim);">(${p.days} day${p.days === 1 ? '' : 's'})</span>` : ''}${clampNote}`;
+  // Times come back as business-local (America/Toronto) wall clock — render
+  // them as-is rather than through the viewer's timezone.
+  const hhmm = t => {
+    if (!t) return '';
+    const m = String(t).match(/(\d{1,2}):(\d{2})/);
+    if (!m) return String(t);
+    let h = parseInt(m[1], 10);
+    const ap = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    return `${h}:${m[2]} ${ap}`;
+  };
+  const partialNote = p.partial
+    ? ` <span style="color: var(--warning, #c89b32);" title="Today is still trading. Cova's intraday reports land through the day, so these numbers are today so far — not a closed day.">(partial — today so far${p.partial_through ? `, through ${hhmm(p.partial_through)}` : ''})</span>`
+    : '';
+  let info = `<div style="font-size: 12px;"><strong>Current:</strong> ${p.start} → ${p.end}${p.days ? ` <span style="color: var(--text-dim);">(${p.days} day${p.days === 1 ? '' : 's'})</span>` : ''}${clampNote}${partialNote}`;
   if (pp) {
     const alignLabel = pp.align === 'weekday' ? 'same day of the week, 52 wks back' : 'same calendar date';
     // Show the weekday of the current vs prior single-day period to make the
@@ -3919,9 +3934,18 @@ function renderAnalyticsResult(data) {
     const wd = iso => new Date(iso + 'T00:00:00Z').toLocaleDateString(undefined, { weekday: 'short', timeZone: 'UTC' });
     const dayNote = (p.start === p.end && pp.start === pp.end)
       ? ` <span style="color: var(--text-dim);">(${wd(p.start)} vs ${wd(pp.start)})</span>` : '';
-    info += ` &nbsp;·&nbsp; <strong>Prior year:</strong> ${pp.start} → ${pp.end}${dayNote} <span style="color: var(--text-dim);">(${alignLabel})</span>`;
+    const truncNote = pp.time_truncated_to
+      ? ` <span style="color: var(--text-dim);" title="The prior-year day is cut off at the same clock time today has reached, so a part-traded day isn't compared against a full one.">· cut off at ${hhmm(pp.time_truncated_to)}</span>` : '';
+    info += ` &nbsp;·&nbsp; <strong>Prior year:</strong> ${pp.start} → ${pp.end}${dayNote} <span style="color: var(--text-dim);">(${alignLabel})</span>${truncNote}`;
   }
-  if (p.data_through) info += ` &nbsp;·&nbsp; <span style="color: var(--text-dim);">Sales data through <strong>${p.data_through}</strong></span>`;
+  if (p.preset === 'today' && !p.has_today) {
+    info += ` &nbsp;·&nbsp; <span style="color: var(--warning, #c89b32);">No sales imported yet for today (${p.business_today})</span>`;
+  }
+  if (p.last_sale_at) {
+    info += ` &nbsp;·&nbsp; <span style="color: var(--text-dim);">Last sale in data <strong>${String(p.last_sale_at).slice(0,10)} ${hhmm(p.last_sale_at)}</strong></span>`;
+  } else if (p.data_through) {
+    info += ` &nbsp;·&nbsp; <span style="color: var(--text-dim);">Sales data through <strong>${p.data_through}</strong></span>`;
+  }
   info += `</div>`;
   // Compute coverage from chain total
   const total = data.rows.find(r => r.is_total);
