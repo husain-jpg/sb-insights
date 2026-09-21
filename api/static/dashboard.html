@@ -88,6 +88,11 @@
   .nav-group-items button {
     padding-left: 30px;  /* indent nested items */
   }
+  /* Some entries ("LP Data Partners - SKU Coverage") exceed the ~170px of
+     usable width in the rail. Let them wrap onto a second line tidily rather
+     than overflow, and keep the badge pinned to the first line. */
+  nav button { align-items: flex-start; line-height: 1.35; }
+  nav button .badge { margin-top: 1px; }
   nav button {
     display: flex; align-items: center; gap: 12px;
     width: 100%; padding: 11px 20px;
@@ -513,10 +518,10 @@
       </button>
       <div class="nav-group-items">
         <button data-page="analytics">▸ Historical Financials</button>
-        <button data-page="partner-coverage">▸ LP Data Partners</button>
+        <button data-page="partner-coverage">▸ LP Data Partners - SKU Coverage</button>
+        <button data-page="data-lp-partners">▸ LP Data Partners - Agreements</button>
         <button data-page="partners">▸ Data Collectives</button>
         <button data-page="ltos">▸ LTOs</button>
-        <button data-page="data-lp-partners">▸ Data LP Partners</button>
         <button data-page="monthly-reports">▸ Monthly Reports</button>
       </div>
     </div>
@@ -3844,7 +3849,7 @@ async function renderPartnerCoverage() {
     <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
       <div>
         <div class="kicker">Analytics · Data Revenue</div>
-        <h2 style="white-space:nowrap;">LP Data Partners</h2>
+        <h2>LP Data Partners <span style="color: var(--text-dim); font-weight: 400;">— SKU Coverage</span></h2>
       </div>
       <div class="controls-row" style="flex-wrap: wrap;">
         <select id="pc-store">
@@ -6220,7 +6225,7 @@ async function renderDataLpPartners() {
       <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
         <div>
           <div class="kicker">Ongoing Rebate Agreements</div>
-          <h2 style="white-space: nowrap;">Data LP Partners</h2>
+          <h2>LP Data Partners <span style="color: var(--text-dim); font-weight: 400;">— Agreements</span></h2>
         </div>
         <div class="controls-row">
           <input type="search" id="dlp-search" placeholder="Search partner name…" style="min-width: 180px;">
