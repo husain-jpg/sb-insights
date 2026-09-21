@@ -3368,12 +3368,25 @@ def _name_tokens(title: str, brand: str) -> frozenset:
 
 
 @app.get("/api/competitor-comparison")
-def competitor_comparison(sb_store: str, request: Request = None) -> dict:
+def competitor_comparison(sb_store: str, stock: str = "in_stock",
+                          request: Request = None) -> dict:
     """One row per competitor menu product for this store, annotated with OUR
     price where we carry the same thing (matched by brand + size + token-subset on
     the distinctive name). `overlap`=we both carry it; `delta`=our price minus
     theirs (positive = we're higher = discount opportunity). Overlap rows sort
-    first (biggest overprice first), then the rest of the competitor menu."""
+    first (biggest overprice first), then the rest of the competitor menu.
+
+    stock='in_stock' (default) only matches OUR products that are actually on
+    the shelf right now. The price list is far larger than the live menu — at
+    Bradford 3,710 SKUs carry a price but only 682 have stock — so matching on
+    price alone claimed an overlap for products we can't sell. It roughly
+    tripled the apparent overlap (761 rows vs 257) and with it the "we're
+    more expensive" count, which is the number this screen exists to drive.
+    stock='all' restores the old price-list behaviour.
+
+    The competitor side needs no equivalent switch: both scrapers only publish
+    live menu items, so every stored row has available=1.
+    """
     require_user(request)
     with db() as conn:
         conn.row_factory = sqlite3.Row
@@ -3395,19 +3408,25 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
             if cur is None or pct > cur[0]:
                 rebate_by_ocs[sf] = (pct, coll_name.get(r["brand_id"]))
         # our products indexed by (brand, size) -> [(name-tokens, price, rebate%)]
+        in_stock_only = (stock or "in_stock") != "all"
+        stock_cond = "AND COALESCE(ci.on_hand, 0) > 0" if in_stock_only else ""
         ours_idx: dict = {}
         for r in conn.execute(
-            """SELECT pr.brand, pr.name, pr.size, pr.ocs_variant_number,
-                      p.regular_price, p.sale_price
-               FROM prices p JOIN products pr ON pr.sku = p.sku
+            f"""SELECT pr.brand, pr.name, pr.size, pr.ocs_variant_number,
+                      p.regular_price, p.sale_price,
+                      COALESCE(ci.on_hand, 0) AS on_hand
+               FROM prices p
+               JOIN products pr ON pr.sku = p.sku
+               LEFT JOIN current_inventory ci
+                      ON ci.sku = p.sku AND ci.location_id = p.location_id
                WHERE p.location_id = ? AND p.regular_price IS NOT NULL
-                     AND p.regular_price < 900""", (sb_store,)):
+                     AND p.regular_price < 900 {stock_cond}""", (sb_store,)):
             toks = _name_tokens(r["name"], r["brand"])
             bkey = (_norm_brand(r["brand"]), _norm_size(r["size"], r["name"]))
             if toks and bkey[1]:
                 ours_idx.setdefault(bkey, []).append(
                     (toks, r["sale_price"] or r["regular_price"],
-                     rebate_by_ocs.get(r["ocs_variant_number"])))
+                     rebate_by_ocs.get(r["ocs_variant_number"]), int(r["on_hand"] or 0)))
         # every latest competitor product, annotated with our matching price
         items = []
         competitors = set()
@@ -3425,29 +3444,26 @@ def competitor_comparison(sb_store: str, request: Request = None) -> dict:
             bkey = (_norm_brand(r["vendor"]), _norm_size(r["variant_size"]))
             our_price = None
             rebate = None  # (pct, collective)
+            our_on_hand = 0
             if ctoks and bkey[1]:
-                for otoks, oprice, orebate in ours_idx.get(bkey, []):
+                for otoks, oprice, orebate, ooh in ours_idx.get(bkey, []):
                     if (otoks <= ctoks or ctoks <= otoks) and (otoks & ctoks):
                         if our_price is None or oprice < our_price:
                             our_price = oprice
+                        our_on_hand = max(our_on_hand, ooh)
                         if orebate is not None and (rebate is None or orebate[0] > rebate[0]):
                             rebate = orebate
             overlap = our_price is not None
             rebate_pct = rebate[0] if rebate else None
-            # BudClub members get 5% off our retail; show that effective price and
-            # whether it still sits above the competitor.
-            budclub = round(our_price * 0.95, 2) if overlap else None
             items.append({
                 "competitor": r["competitor_name"], "brand": r["vendor"],
                 "product": r["product_title"], "category": r["product_type"],
                 "size": r["variant_size"], "their_price": r["price"],
                 "our_price": our_price,
                 "delta": round(our_price - r["price"], 2) if overlap else None,
-                "budclub_price": budclub,
-                "budclub_delta": round(budclub - r["price"], 2) if overlap else None,
+                "our_on_hand": our_on_hand,
                 "overlap": overlap,
                 "we_are_higher": bool(overlap and our_price > r["price"]),
-                "budclub_higher": bool(overlap and budclub > r["price"]),
                 "rebate_pct": rebate_pct,
                 "rebate_collective": rebate[1] if rebate else None,
                 "rebate_room": (round(our_price * rebate_pct / 100, 2)
@@ -3928,11 +3944,12 @@ def export_competitor_comparison(
     sb_store: str,
     competitor: str | None = None,
     overlap_only: bool = True,
+    stock: str = "in_stock",
     request: Request = None,
 ) -> Response:
     """Excel of the price-comparison view for a store, mirroring the on-screen
-    competitor filter + 'overlap only' toggle."""
-    data = competitor_comparison(sb_store=sb_store, request=request)
+    competitor filter, 'overlap only' toggle, and stock filter."""
+    data = competitor_comparison(sb_store=sb_store, stock=stock, request=request)
     items = data["items"]
     if competitor:
         items = [r for r in items if r["competitor"] == competitor]
@@ -3951,8 +3968,7 @@ def export_competitor_comparison(
         {"key": "their_price", "label": "Their Price", "format": "currency"},
         {"key": "our_price", "label": "Our Price", "format": "currency"},
         {"key": "delta", "label": "Over by (vs them)", "format": "currency"},
-        {"key": "budclub_price", "label": "BudClub (-5%)", "format": "currency"},
-        {"key": "budclub_delta", "label": "BudClub over by", "format": "currency"},
+        {"key": "our_on_hand", "label": "Our on hand"},
         {"key": "rebate_collective", "label": "Collective"},
         {"key": "rebate_pct", "label": "Rebate %"},
         {"key": "rebate_room", "label": "Rebate room ($)", "format": "currency"},
@@ -3962,6 +3978,7 @@ def export_competitor_comparison(
     if competitor:
         sub.append(competitor)
     sub.append("overlap only" if overlap_only else "full menu")
+    sub.append("our in-stock only" if (stock or "in_stock") != "all" else "all priced SKUs")
     subtitle = "  ·  ".join(sub) + f"  ·  {len(items)} rows"
     xlsx = build_workbook(
         sheet_name="Price Comparison",
