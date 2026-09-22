@@ -226,7 +226,7 @@ def _backup_loop():
     from jobs.backup import create_backup, prune_backups
     while True:
         try:
-            now = _dt.now()
+            now = business_now()          # store-local, not the host's UTC clock
             today_iso = now.date().isoformat()
             # Trigger if we haven't backed up today AND it's past 3am
             # (or the server just started and we're past 3am)
@@ -343,12 +343,14 @@ def _start_scraper_thread():
 # clobber). Gated by ocs_account.is_active (sync_ocs(force=False) self-skips when
 # inactive). Mirrors the backup thread.
 #
-# Timezone note: uses the host's LOCAL clock (like _backup_loop). The on-prem box
-# is in Eastern, so "after 8pm local" == after 8pm ET, DST-correct via the OS. On
-# a UTC cloud host, switch this to zoneinfo("America/Toronto").
+# Timezone: business_now() (America/Toronto), NOT the host clock. The droplet
+# runs UTC, so the original _dt.now() made "after 8pm" fire at 20:00 UTC =
+# 4pm Toronto — four hours BEFORE the order forms exist, which is the whole
+# reason the run is scheduled in the evening. Any schedule expressed in
+# store-local hours must use business_now().
 _ocs_thread_started = False
 _ocs_last_run_date: str | None = None
-OCS_RUN_AFTER_HOUR = 20  # 8pm local
+OCS_RUN_AFTER_HOUR = 20  # 8pm America/Toronto (see business_now)
 
 
 def _ocs_connector_loop():
@@ -356,7 +358,7 @@ def _ocs_connector_loop():
     from jobs.ocs_connector import sync_ocs
     while True:
         try:
-            now = _dt.now()
+            now = business_now()          # store-local, not the host's UTC clock
             today = now.date().isoformat()
             if _ocs_last_run_date != today and now.hour >= OCS_RUN_AFTER_HOUR:
                 try:
