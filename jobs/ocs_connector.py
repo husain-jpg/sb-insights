@@ -46,17 +46,24 @@ class OcsAccount:
     catalogue_format: Optional[str]
     order_fill_format: Optional[str]
     is_active: bool
+    last_status: Optional[str] = None   # 'ok' | 'error' | AUTH_FAILED_STATUS
+    last_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
+# last_status value that pauses automatic retries (see the lockout guard in
+# sync_ocs). Kept as a constant so the API layer can clear it on config save.
+AUTH_FAILED_STATUS = "auth_error"
+
+
 def load_account(conn) -> Optional[OcsAccount]:
     """Load + decrypt the single OCS account row (most recent). None if unset."""
     from jobs.auth import decrypt_secret
     row = conn.execute(
         """SELECT id, base_url, username, password_enc, catalogue_format,
-                  order_fill_format, is_active
+                  order_fill_format, is_active, last_status, last_error
            FROM ocs_account ORDER BY id DESC LIMIT 1"""
     ).fetchone()
     if not row:
@@ -66,6 +73,7 @@ def load_account(conn) -> Optional[OcsAccount]:
         password=decrypt_secret(row[3]),
         catalogue_format=row[4], order_fill_format=row[5],
         is_active=bool(row[6]),
+        last_status=row[7], last_error=row[8],
     )
 
 
@@ -120,6 +128,54 @@ def _looks_like_maintenance(text: str) -> bool:
     return "maintenance" in (text or "").lower()
 
 
+class OcsAuthError(RuntimeError):
+    """Login was rejected by the portal.
+
+    Distinct from a transport/parse failure because the portal enforces a
+    5-attempt lockout: the scheduler must STOP retrying on this, not back off
+    and try again tomorrow. `attempts_remaining` is parsed from the portal's
+    own message when it offers one.
+    """
+
+    def __init__(self, message: str, attempts_remaining: int | None = None):
+        super().__init__(message)
+        self.attempts_remaining = attempts_remaining
+
+
+_ATTEMPTS_RE = _re.compile(r"(\d+)\s*/\s*(\d+)\s*attempts?\s*remaining", _re.I)
+
+
+def _login_rejection(resp) -> tuple[str, int | None] | None:
+    """Return (message, attempts_remaining) if the portal rejected this login.
+
+    /Admin/Login answers with HTTP 200 + JSON in every case, e.g.
+        {"enable_Warning_Message":"Incorrect E-mail/Password. Please try
+          again. 3/5 Attempts remaining.","redirect":9}
+    so status codes and generic substring sniffing are both useless. Trust the
+    portal's own warning field — it names the failure and counts down to
+    lockout. Anything unparseable is treated as NOT a rejection; the
+    authenticated-page probe is the backstop.
+    """
+    body = resp.text or ""
+    warning = None
+    try:
+        import json as _json
+        data = _json.loads(body)
+        if isinstance(data, dict):
+            warning = (data.get("enable_Warning_Message")
+                       or data.get("Enable_Warning_Message") or "").strip()
+    except (ValueError, TypeError):
+        # Not JSON — fall back to the legacy HTML-ish checks so a portal
+        # change back to form posts still surfaces a failure.
+        low = body.lower()
+        if '"success":false' in low or ("incorrect" in low and "password" in low)                 or ("invalid" in low and "password" in low):
+            warning = "login rejected (non-JSON response)"
+    if not warning:
+        return None
+    m = _ATTEMPTS_RE.search(warning)
+    return warning, (int(m.group(1)) if m else None)
+
+
 def _assert_authenticated(session, account: OcsAccount) -> None:
     """Definitive post-login probe. GET the SelectStore page and require the
     per-store blocks that _parse_store_blocks needs — only an authenticated
@@ -133,10 +189,18 @@ def _assert_authenticated(session, account: OcsAccount) -> None:
     body = (resp.text or "").lower()
     if _looks_like_maintenance(body):
         raise RuntimeError("OCS portal is in maintenance mode — try again later")
-    if "storediv" not in body and "hdnstorenumber" not in body:
-        raise RuntimeError(
-            "OCS login did not reach the store picker — wrong credentials, "
-            "or the portal layout changed")
+    # Probe on PARSED store blocks, not on the words "storediv"/"hdnstorenumber".
+    # The portal now serves the store-picker shell to anonymous sessions too —
+    # those strings appear in its markup/JS whether or not you are logged in, so
+    # the old substring test passed for an unauthenticated session and handed
+    # back "ok" while the catalogue fetch was really downloading the login page.
+    # Verified 2026-09-21: anonymous GET returns 200/28KB containing "storediv"
+    # but zero parseable store blocks. Real store blocks require a session.
+    stores = _parse_store_blocks(resp.text or "")
+    if not stores:
+        raise OcsAuthError(
+            "OCS login did not reach the store picker (no store blocks parsed) — "
+            "wrong credentials, MFA now required, or the portal layout changed")
 
 
 def login(session, account: OcsAccount) -> None:
@@ -156,9 +220,12 @@ def login(session, account: OcsAccount) -> None:
     })
     resp = session.post(f"{base}/Admin/Login", data=form, timeout=30,
                         headers={"Referer": f"{base}/Admin/Signin"})
-    body = (resp.text or "").lower()
-    if not resp.ok or '"success":false' in body or ("invalid" in body and "password" in body):
-        raise RuntimeError(f"OCS login failed (status {resp.status_code}) — check credentials")
+    if not resp.ok:
+        raise RuntimeError(f"OCS login failed (status {resp.status_code})")
+    rejected = _login_rejection(resp)
+    if rejected:
+        msg, remaining = rejected
+        raise OcsAuthError(f"OCS rejected the login: {msg}", attempts_remaining=remaining)
     _assert_authenticated(session, account)
 
 
@@ -317,6 +384,19 @@ def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
         return {"status": "skipped", "reason": "no OCS account configured"}
     if not force and not account.is_active:
         return {"status": "skipped", "reason": "OCS account inactive"}
+    # Lockout guard. The portal locks the account after 5 consecutive failed
+    # logins and counts them across days, so a nightly retry on a bad password
+    # walks straight into a lockout — which would take the connector down for
+    # everyone, not just the catalogue. Once a login is REJECTED (as opposed to
+    # a network/parse error) we stop attempting until someone re-enters the
+    # credentials; saving the config clears this. A manual "Run now"
+    # (force=True) is the deliberate retry after fixing the password.
+    if not force and account.last_status == AUTH_FAILED_STATUS:
+        return {"status": "skipped",
+                "reason": ("OCS login was rejected on the last attempt and the portal "
+                           "locks the account after 5 failures — not retrying. "
+                           "Re-enter the OCS password in Settings, then use Run now. "
+                           f"Last error: {account.last_error or 'n/a'}")}
 
     from jobs.import_order_fill import import_order_fill_file
 
@@ -356,6 +436,16 @@ def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
         _record_status(conn, account.id, "ok", None)
         log.info("OCS sync imported %d file(s): %s", len(imported), imported)
         return {"status": "ok", "imported": imported}
+    except OcsAuthError as e:
+        # Distinct status so the scheduler stops instead of burning attempts.
+        remaining = getattr(e, "attempts_remaining", None)
+        detail = str(e)
+        if remaining is not None:
+            detail += (f"  [{remaining} login attempt(s) left before OCS locks "
+                       f"the account — automatic retries are now paused]")
+        _record_status(conn, account.id, AUTH_FAILED_STATUS, detail)
+        log.error("OCS sync failed authentication: %s", detail)
+        return {"status": "auth_error", "error": detail, "imported": imported}
     except Exception as e:  # noqa: BLE001 — record then re-raise to caller's log
         _record_status(conn, account.id, "error", str(e))
         log.warning("OCS sync failed: %s", e)

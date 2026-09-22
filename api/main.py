@@ -4596,9 +4596,15 @@ def ocs_save_config(payload: dict = Body(...), _admin: dict = Depends(require_ad
         if pw_enc is None:
             raise HTTPException(status_code=400, detail="password required for first setup")
         if existing:
+            # Clear a paused auth failure: sync_ocs refuses to retry after the
+            # portal rejects a login (5 failures locks the account), and saving
+            # new credentials is the signal that it's worth trying again.
+            new_password = bool(password)
             conn.execute(
-                """UPDATE ocs_account SET base_url=?, username=?, password_enc=?,
-                          order_fill_format=?, is_active=? WHERE id=?""",
+                f"""UPDATE ocs_account SET base_url=?, username=?, password_enc=?,
+                          order_fill_format=?, is_active=?
+                          {", last_status=NULL, last_error=NULL" if new_password else ""}
+                    WHERE id=?""",
                 (base_url, username, pw_enc, order_fill_format, is_active, existing[0]))
         else:
             conn.execute(
