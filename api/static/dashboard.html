@@ -7686,10 +7686,19 @@ async function renderOcsConnector() {
     });
 
     document.getElementById("ocs-run").addEventListener("click", async () => {
-      setStatus("ocs-action-status", "Running sync (this can take a minute)...");
+      setStatus("ocs-action-status", "Running sync (takes 2\u20133 minutes)...");
       try {
         const res = await fetch("/api/ocs/run-now", { method: "POST", credentials: "include" });
-        const d = await res.json();
+        if (!res.ok) throw new Error(res.statusText);
+        // The sync runs server-side in the background; poll until it finishes.
+        let st;
+        for (let i = 0; i < 120; i++) {
+          await new Promise(r => setTimeout(r, 5000));
+          st = await api("/api/ocs/run-status");
+          if (!st.running) break;
+        }
+        if (st.running) { setStatus("ocs-action-status", "Still running \u2014 check back in a few minutes.", null); return; }
+        const d = st.result || {};
         if (d.status === "ok") setStatus("ocs-action-status", `Done. Imported: ${(d.imported || []).join(', ') || 'nothing'}`, true);
         else if (d.status === "skipped") setStatus("ocs-action-status", "Skipped: " + (d.reason || "inactive"), null);
         else setStatus("ocs-action-status", "Error: " + (d.error || d.detail || "?"), false);

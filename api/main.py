@@ -4767,11 +4767,41 @@ def ocs_mfa_verify(payload: dict = Body(...), admin: dict = Depends(require_admi
 
 @app.post("/api/ocs/run-now")
 def ocs_run_now(_admin: dict = Depends(require_admin)) -> dict:
-    """Trigger a one-off connector sync (catalogue + per-store OrderExports).
-    Manual run — forces a sync even if the account isn't marked active yet."""
+    """Start a one-off connector sync (catalogue + per-store OrderExports) in
+    the background; poll /api/ocs/run-status for the result. Forces a sync even
+    if the account isn't marked active yet.
+
+    Runs off the request because a full sync takes ~2.5 min and nginx's
+    proxy_read_timeout is 120s. Done inline, the browser got a 504 page while
+    the sync carried on and succeeded unseen."""
+    with _ocs_run_lock:
+        if _ocs_run_state["running"]:
+            return {"status": "running"}
+        _ocs_run_state.update(running=True, result=None, started=_time.time())
+    threading.Thread(target=_ocs_run_bg, daemon=True, name="ocs-run-now").start()
+    return {"status": "started"}
+
+
+_ocs_run_lock = threading.Lock()
+_ocs_run_state: dict = {"running": False, "result": None, "started": None}
+
+
+def _ocs_run_bg() -> None:
     from jobs.ocs_connector import sync_ocs
-    with db() as conn:
-        return sync_ocs(conn, DB_PATH, force=True)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            result = sync_ocs(conn, DB_PATH, force=True)
+    except Exception as e:  # noqa: BLE001 — report to the polling page
+        result = {"status": "error", "error": str(e)}
+    with _ocs_run_lock:
+        _ocs_run_state.update(running=False, result=result)
+
+
+@app.get("/api/ocs/run-status")
+def ocs_run_status(_admin: dict = Depends(require_admin)) -> dict:
+    with _ocs_run_lock:
+        return dict(_ocs_run_state)
 
 
 # ---------------------------------------------------------------------------
