@@ -879,6 +879,13 @@ def init_schema(conn) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS ix_ofr_loc ON order_fill_runs (location_id, generated_at DESC)")
     conn.commit()
 
+    # OCS made SMS MFA mandatory (Sept 2026). The connector replays the portal's
+    # "remember this device" cookie (encrypted jar) and records when that trust
+    # lapses so the UI can prompt an admin to re-verify. See jobs/ocs_connector.py.
+    _ensure_column(conn, "ocs_account", "session_cookies_enc", "TEXT")
+    _ensure_column(conn, "ocs_account", "trusted_until", "TEXT")  # UTC 'YYYY-MM-DD HH:MM:SS'
+    conn.commit()
+
     # LTOs can be tied to an LP (licensed_producers) instead of a brand_partner.
     # This is how the Data Partners tab creates LTOs for OCS catalog products.
     _ensure_column(conn, "ltos", "lp_id", "INTEGER")

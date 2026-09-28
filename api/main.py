@@ -4559,10 +4559,12 @@ def export_ocs_template(store: str | None = None):
 
 @app.get("/api/ocs/config")
 def ocs_get_config(_admin: dict = Depends(require_admin)) -> dict:
+    from jobs.ocs_connector import ensure_columns
     with db() as conn:
+        ensure_columns(conn)
         row = conn.execute(
             """SELECT base_url, username, order_fill_format, is_active,
-                      last_run_at, last_status, last_error
+                      last_run_at, last_status, last_error, trusted_until
                FROM ocs_account ORDER BY id DESC LIMIT 1"""
         ).fetchone()
         maps = conn.execute(
@@ -4576,6 +4578,7 @@ def ocs_get_config(_admin: dict = Depends(require_admin)) -> dict:
         "configured": True, "base_url": row[0], "username": row[1],
         "order_fill_format": row[2], "is_active": bool(row[3]),
         "last_run_at": row[4], "last_status": row[5], "last_error": row[6],
+        "trusted_until": row[7],
         "store_map": store_map,
     }
 
@@ -4619,13 +4622,16 @@ def ocs_save_config(payload: dict = Body(...), _admin: dict = Depends(require_ad
 
 @app.post("/api/ocs/test-login")
 def ocs_test_login(_admin: dict = Depends(require_admin)) -> dict:
-    from jobs.ocs_connector import load_account, _make_session, login
+    from jobs.ocs_connector import load_account, _make_session, login, save_session_cookies
     with db() as conn:
         acct = load_account(conn)
     if not acct:
         raise HTTPException(status_code=400, detail="Configure OCS credentials first")
     try:
-        login(_make_session(), acct)
+        s = _make_session(acct)
+        login(s, acct)
+        with db() as conn:
+            save_session_cookies(conn, acct.id, s)
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -4641,7 +4647,7 @@ def ocs_list_retailers(_admin: dict = Depends(require_admin)) -> dict:
     if not acct:
         raise HTTPException(status_code=400, detail="Configure OCS credentials first")
     try:
-        s = _make_session()
+        s = _make_session(acct)
         login(s, acct)
         return {"ok": True, "retailers": list_retailers(s, acct)}
     except Exception as e:
@@ -4667,6 +4673,96 @@ def ocs_save_store_map(payload: dict = Body(...), _admin: dict = Depends(require
             n += 1
         conn.commit()
     return {"ok": True, "count": n}
+
+
+# --- MFA verification ------------------------------------------------------
+# OCS demands an SMS code (sent to the account holder's phone) unless the
+# server presents its "remember this device" cookie, which lasts 30 days. These
+# three calls walk an admin through one sign-in: /mfa/start logs in and texts
+# the code, /mfa/verify submits it and has OCS remember this server.
+# The half-finished OCS session has to survive between those requests, so it
+# is held in memory per admin. That is fine with the single uvicorn worker (see
+# deploy/terroir-ops.service); a restart simply means pressing Send code again.
+_OCS_MFA_TTL_S = 600  # OCS codes expire after 5 min; allow for a resend
+_ocs_mfa_pending: dict = {}
+_ocs_mfa_lock = threading.Lock()
+
+
+def _ocs_mfa_get(user_id) -> dict:
+    with _ocs_mfa_lock:
+        p = _ocs_mfa_pending.get(user_id)
+        if p and _time.time() - p["started"] > _OCS_MFA_TTL_S:
+            _ocs_mfa_pending.pop(user_id, None)
+            p = None
+    if not p:
+        raise HTTPException(status_code=409,
+                            detail="The verification session expired — press Send code again")
+    return p
+
+
+def _ocs_mfa_error(e) -> dict:
+    return {"ok": False, "error": str(e), "locked": bool(getattr(e, "locked", False))}
+
+
+@app.post("/api/ocs/mfa/start")
+def ocs_mfa_start(admin: dict = Depends(require_admin)) -> dict:
+    """Log in and text a verification code to the OCS account's phone. Uses one
+    password attempt if the stored password is wrong, like Test login."""
+    from jobs.ocs_connector import (load_account, _make_session, mfa_start,
+                                    save_session_cookies, _record_status)
+    with db() as conn:
+        acct = load_account(conn)
+    if not acct:
+        raise HTTPException(status_code=400, detail="Configure OCS credentials first")
+    s = _make_session(acct)
+    try:
+        res = mfa_start(s, acct)
+    except Exception as e:  # noqa: BLE001 — surface OCS's reason to the admin
+        return _ocs_mfa_error(e)
+    if not res["needed"]:
+        # The saved remembered-device cookie still works; nothing to verify.
+        with db() as conn:
+            save_session_cookies(conn, acct.id, s)
+            _record_status(conn, acct.id, "ok", None)
+        return {"ok": True, "needed": False}
+    with _ocs_mfa_lock:
+        _ocs_mfa_pending[admin["id"]] = {"session": s, "account": acct,
+                                         "req_id": res["req_id"], "started": _time.time()}
+    return {"ok": True, "needed": True, "phone": res["phone"]}
+
+
+@app.post("/api/ocs/mfa/resend")
+def ocs_mfa_resend(admin: dict = Depends(require_admin)) -> dict:
+    from jobs.ocs_connector import mfa_resend
+    p = _ocs_mfa_get(admin["id"])
+    try:
+        res = mfa_resend(p["session"], p["account"], p["req_id"])
+    except Exception as e:  # noqa: BLE001
+        return _ocs_mfa_error(e)
+    p["req_id"] = res["req_id"]
+    p["started"] = _time.time()
+    return {"ok": True}
+
+
+@app.post("/api/ocs/mfa/verify")
+def ocs_mfa_verify(payload: dict = Body(...), admin: dict = Depends(require_admin)) -> dict:
+    """Submit the SMS code; on success OCS remembers this server for 30 days and
+    the paused connector is cleared to run again."""
+    from jobs.ocs_connector import mfa_verify, save_session_cookies, _record_status
+    code = "".join(ch for ch in str(payload.get("code") or "") if ch.isdigit())
+    if len(code) != 6:
+        raise HTTPException(status_code=400, detail="Enter the 6-digit code from the text message")
+    p = _ocs_mfa_get(admin["id"])
+    try:
+        trusted_until = mfa_verify(p["session"], p["account"], p["req_id"], code)
+    except Exception as e:  # noqa: BLE001
+        return _ocs_mfa_error(e)
+    with _ocs_mfa_lock:
+        _ocs_mfa_pending.pop(admin["id"], None)
+    with db() as conn:
+        save_session_cookies(conn, p["account"].id, p["session"], trusted_until=trusted_until)
+        _record_status(conn, p["account"].id, "ok", None)
+    return {"ok": True, "trusted_until": trusted_until}
 
 
 @app.post("/api/ocs/run-now")

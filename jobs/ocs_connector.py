@@ -9,7 +9,8 @@ download), since OCS has no API. Until those are implemented and an ocs_account
 row is marked is_active=1, nothing here runs (no scheduler is wired yet).
 
 Design (see also the email scraper, jobs/email_scraper.py, which this mirrors):
-  - Plain-password login (no MFA today); hold the session cookie.
+  - Password login plus a saved MFA trusted-device cookie (OCS made SMS MFA
+    mandatory in Sept 2026; see "Cookie persistence" below).
   - Each report is an "Export" action that takes a product-format parameter
     (e.g. the OrderExport filename encodes "Packs"). Likely either a single
     request that returns the .xlsx, or a generate-then-poll flow — the HAR
@@ -46,8 +47,9 @@ class OcsAccount:
     catalogue_format: Optional[str]
     order_fill_format: Optional[str]
     is_active: bool
-    last_status: Optional[str] = None   # 'ok' | 'error' | AUTH_FAILED_STATUS
+    last_status: Optional[str] = None   # 'ok' | 'error' | AUTH_FAILED_STATUS | MFA_REQUIRED_STATUS
     last_error: Optional[str] = None
+    cookies: Optional[str] = None       # decrypted JSON cookie jar (holds the MFA trusted-device cookie)
 
 
 # ---------------------------------------------------------------------------
@@ -56,14 +58,29 @@ class OcsAccount:
 # last_status value that pauses automatic retries (see the lockout guard in
 # sync_ocs). Kept as a constant so the API layer can clear it on config save.
 AUTH_FAILED_STATUS = "auth_error"
+# last_status when the password was accepted but OCS wants an SMS code, i.e. the
+# trusted-device cookie is missing or expired. Also pauses automatic runs: only
+# a person with the phone can clear it, via Verify in Settings.
+MFA_REQUIRED_STATUS = "mfa_required"
+
+
+def ensure_columns(conn) -> None:
+    """Add the MFA cookie columns if missing. init_schema also adds them, but it
+    only runs during imports, and the connector can be used before the next one."""
+    from db.sqlite_schema import _ensure_column
+    _ensure_column(conn, "ocs_account", "session_cookies_enc", "TEXT")
+    _ensure_column(conn, "ocs_account", "trusted_until", "TEXT")
+    conn.commit()
 
 
 def load_account(conn) -> Optional[OcsAccount]:
     """Load + decrypt the single OCS account row (most recent). None if unset."""
     from jobs.auth import decrypt_secret
+    ensure_columns(conn)
     row = conn.execute(
         """SELECT id, base_url, username, password_enc, catalogue_format,
-                  order_fill_format, is_active, last_status, last_error
+                  order_fill_format, is_active, last_status, last_error,
+                  session_cookies_enc
            FROM ocs_account ORDER BY id DESC LIMIT 1"""
     ).fetchone()
     if not row:
@@ -74,19 +91,82 @@ def load_account(conn) -> Optional[OcsAccount]:
         catalogue_format=row[4], order_fill_format=row[5],
         is_active=bool(row[6]),
         last_status=row[7], last_error=row[8],
+        cookies=(decrypt_secret(row[9]) if row[9] else None),
     )
 
 
-def _make_session():
-    """A requests session with a browser-ish User-Agent. Imported lazily so the
-    module stays importable even where requests isn't installed."""
+def _make_session(account: Optional[OcsAccount] = None):
+    """A requests session with a browser-ish User-Agent, preloaded with the
+    account's saved cookies (the MFA trusted-device cookie lives there).
+    Imported lazily so the module stays importable without requests.
+
+    Keep the User-Agent constant: OCS remembers a trusted device per browser,
+    so changing it may void the trust and force a new SMS code."""
     import requests
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     })
+    if account is not None and account.cookies:
+        _import_cookies(s, account.cookies)
     return s
+
+
+# ---------------------------------------------------------------------------
+# Cookie persistence: how the connector survives OCS's SMS-only MFA.
+# ---------------------------------------------------------------------------
+# OCS made MFA mandatory in Sept 2026 with SMS / voice codes only (no
+# authenticator app), so the connector cannot answer it alone. What OCS offers
+# instead is "remember this device for 30 days": after one verified sign-in,
+# /Admin/RegisterTrustedDevice sets a persistent cookie that lets later
+# password logins skip MFA. We keep that cookie jar encrypted on the account
+# row and replay it on every run; an admin re-verifies about once a month.
+#
+# Only persistent (expiring) cookies are kept. Session cookies belong to one
+# sign-in, and replaying a stale ASP.NET session could confuse the login.
+def _export_cookies(session) -> str:
+    import json as _json
+    import time as _t
+    now = _t.time()
+    jar = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
+            "expires": c.expires, "secure": bool(c.secure)}
+           for c in session.cookies
+           if c.expires is not None and c.expires > now]
+    return _json.dumps(jar)
+
+
+def _import_cookies(session, blob: str) -> None:
+    import json as _json
+    import time as _t
+    try:
+        jar = _json.loads(blob)
+    except (ValueError, TypeError):
+        return
+    now = _t.time()
+    for c in jar or []:
+        if c.get("expires") and c["expires"] <= now:
+            continue
+        session.cookies.set(c["name"], c["value"], domain=c.get("domain"),
+                            path=c.get("path") or "/", expires=c.get("expires"),
+                            secure=bool(c.get("secure")))
+
+
+def save_session_cookies(conn, account_id: int, session,
+                         trusted_until: Optional[str] = None) -> None:
+    """Persist the session's cookie jar, encrypted. Called after every
+    successful login so rotated cookies are kept; trusted_until is set only by
+    the MFA verify flow."""
+    from jobs.auth import encrypt_secret
+    enc = encrypt_secret(_export_cookies(session))
+    if trusted_until:
+        conn.execute(
+            "UPDATE ocs_account SET session_cookies_enc = ?, trusted_until = ? WHERE id = ?",
+            (enc, trusted_until, account_id))
+    else:
+        conn.execute("UPDATE ocs_account SET session_cookies_enc = ? WHERE id = ?",
+                     (enc, account_id))
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +220,21 @@ class OcsAuthError(RuntimeError):
     def __init__(self, message: str, attempts_remaining: int | None = None):
         super().__init__(message)
         self.attempts_remaining = attempts_remaining
+
+
+class OcsMfaRequired(OcsAuthError):
+    """The password was accepted but OCS wants an SMS code (no trusted-device
+    cookie, or it expired). Retrying can't help; only someone with the phone
+    can clear it."""
+
+
+class OcsMfaError(RuntimeError):
+    """A step of the interactive MFA flow failed (wrong or expired code, MFA
+    locked). `locked` means an OCS admin must reset MFA on the account."""
+
+    def __init__(self, message: str, locked: bool = False):
+        super().__init__(message)
+        self.locked = locked
 
 
 _ATTEMPTS_RE = _re.compile(r"(\d+)\s*/\s*(\d+)\s*attempts?\s*remaining", _re.I)
@@ -203,10 +298,10 @@ def _assert_authenticated(session, account: OcsAccount) -> None:
             "wrong credentials, MFA now required, or the portal layout changed")
 
 
-def login(session, account: OcsAccount) -> None:
-    """Authenticate the session. GET the sign-in page to pick up hidden form
-    fields, then POST /Admin/Login. Success is verified by probing an
-    authenticated-only page (see _assert_authenticated). Raises on failure."""
+def _post_login(session, account: OcsAccount) -> dict:
+    """GET the sign-in page for its hidden fields, POST /Admin/Login, and
+    return the portal's JSON verdict. Raises OcsAuthError if the password was
+    rejected. Does NOT handle MFA or probe for a real session; callers do."""
     base = account.base_url.rstrip("/")
     session.get(f"{base}/Admin/LoginPreReq", timeout=30)  # mirror the browser precheck
     signin = session.get(f"{base}/Admin/Signin", timeout=30)
@@ -226,7 +321,125 @@ def login(session, account: OcsAccount) -> None:
     if rejected:
         msg, remaining = rejected
         raise OcsAuthError(f"OCS rejected the login: {msg}", attempts_remaining=remaining)
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if data.get("mfaLocked"):
+        raise OcsAuthError("OCS has locked MFA on this account — an OCS admin must reset it")
+    return data
+
+
+def _mfa_pending(data: dict) -> bool:
+    """Mirrors the portal's own sign-in script: a code is demanded when the
+    verdict has mfaEnabled and isn't an error (redirect 9). A trusted device
+    comes back with mfaEnabled false and goes straight through."""
+    return bool(data.get("mfaEnabled")) and data.get("redirect") != 9
+
+
+def login(session, account: OcsAccount) -> None:
+    """Authenticate the session for an unattended run. Relies on the saved
+    trusted-device cookie (see _make_session) to get past MFA; if OCS asks for
+    a code anyway, raises OcsMfaRequired instead of sending one, since no one
+    is there to type it. Success is verified by probing an authenticated-only
+    page (see _assert_authenticated)."""
+    data = _post_login(session, account)
+    if _mfa_pending(data):
+        raise OcsMfaRequired(
+            "OCS is asking for an SMS verification code — the remembered-device "
+            "sign-in has expired or was never set up. An admin needs to use "
+            "Verify in Settings → OCS Connector.")
     _assert_authenticated(session, account)
+
+
+# ---------------------------------------------------------------------------
+# Interactive MFA (Settings → OCS Connector → Verify). Endpoints and statusId
+# codes come from the portal's /js/mfaverify.js; each is a jQuery-style AJAX
+# POST answering JSON.
+# ---------------------------------------------------------------------------
+TRUSTED_DEVICE_DAYS = 30  # window.mfaConfig.trustedDeviceDurationDays on the sign-in page
+_MFA_LOCKED_MSG = "OCS has locked MFA on this account — an OCS admin must reset it"
+
+
+def _ajax(session, account: OcsAccount, path: str, data: Optional[dict] = None):
+    base = account.base_url.rstrip("/")
+    resp = session.post(f"{base}{path}", data=data or {}, timeout=30,
+                        headers={"X-Requested-With": "XMLHttpRequest",
+                                 "Referer": f"{base}/Admin/Signin"})
+    if not resp.ok:
+        raise OcsMfaError(f"OCS {path} failed (status {resp.status_code})")
+    try:
+        return resp.json()
+    except ValueError:
+        raise OcsMfaError(f"OCS {path} did not return JSON")
+
+
+def mfa_start(session, account: OcsAccount) -> dict:
+    """Log in with the password and, if OCS wants a code, text one to the
+    account's default enrolled phone. Returns {"needed": False} when the saved
+    trusted-device cookie already gets us in, else
+    {"needed": True, "req_id", "phone"}."""
+    data = _post_login(session, account)
+    if not _mfa_pending(data):
+        _assert_authenticated(session, account)
+        return {"needed": False}
+    if not data.get("mfaRegistered"):
+        raise OcsMfaError("This OCS account has no phone enrolled for MFA — "
+                          "sign in once on the OCS website to enrol one")
+    phones = _ajax(session, account, "/Admin/GetEnrolledPhones")
+    if not phones:
+        raise OcsMfaError("OCS returned no enrolled phone numbers")
+    phone = next((p for p in phones if p.get("isDefault")), phones[0])
+    res = _ajax(session, account, "/Admin/SendLoginMFACode",
+                {"enrolledPhoneId": phone.get("id"), "method": "SMS"})
+    if res.get("statusId") == -1:
+        raise OcsMfaError(_MFA_LOCKED_MSG, locked=True)
+    if res.get("statusId") != 1:
+        raise OcsMfaError(res.get("message") or "OCS could not send a verification code")
+    masked = f"{phone.get('areaCode') or ''} {phone.get('maskedPhoneNumber') or ''}".strip()
+    return {"needed": True, "req_id": res.get("value"),
+            "phone": res.get("phoneNumber") or masked}
+
+
+def mfa_resend(session, account: OcsAccount, req_id) -> dict:
+    """Text a fresh code (the previous one stops working). Returns the new req_id."""
+    res = _ajax(session, account, "/Admin/ResendLoginVerifyMFACode", {"reqId": req_id})
+    if res.get("statusId") == -1:
+        raise OcsMfaError(_MFA_LOCKED_MSG, locked=True)
+    if res.get("statusId") != 1:
+        raise OcsMfaError(res.get("message") or "OCS could not resend the code")
+    return {"req_id": res.get("value")}
+
+
+def mfa_verify(session, account: OcsAccount, req_id, code: str) -> str:
+    """Submit the SMS code, then register this server as a trusted device so
+    unattended logins skip MFA. Returns trusted_until (UTC 'YYYY-MM-DD HH:MM:SS')."""
+    from datetime import timedelta
+    res = _ajax(session, account, "/Admin/VerifyLoginMFACode", {"reqId": req_id, "otp": code})
+    sid = res.get("statusId")
+    if sid == -3:
+        raise OcsMfaError("Too many wrong codes. " + _MFA_LOCKED_MSG, locked=True)
+    if sid == -2:
+        raise OcsMfaError("That code was replaced by a newer one — use Resend code")
+    if sid == -4:
+        raise OcsMfaError("Incorrect code, and OCS has cancelled it — use Resend code for a new one")
+    if sid != 1:
+        raise OcsMfaError("Incorrect code — check the text message and try again")
+    base = account.base_url.rstrip("/")
+    trust = session.post(
+        f"{base}/Admin/RegisterTrustedDevice",
+        data={"deviceType": "Desktop", "operatingSystem": "Linux - SB Insights server",
+              "browserType": "Chrome", "browserVersion": "124.0"},
+        timeout=30,
+        headers={"X-Requested-With": "XMLHttpRequest", "Referer": f"{base}/Admin/Signin"})
+    if not trust.ok:
+        raise OcsMfaError(f"Code accepted, but OCS refused to remember this device "
+                          f"(status {trust.status_code})")
+    _assert_authenticated(session, account)
+    until = datetime.now(timezone.utc) + timedelta(days=TRUSTED_DEVICE_DAYS)
+    return until.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def select_store(session, account: OcsAccount, retailer_id: str) -> None:
@@ -391,6 +604,10 @@ def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
     # a network/parse error) we stop attempting until someone re-enters the
     # credentials; saving the config clears this. A manual "Run now"
     # (force=True) is the deliberate retry after fixing the password.
+    if not force and account.last_status == MFA_REQUIRED_STATUS:
+        return {"status": "skipped",
+                "reason": ("OCS needs an SMS verification code — use Verify in "
+                           "Settings → OCS Connector.")}
     if not force and account.last_status == AUTH_FAILED_STATUS:
         return {"status": "skipped",
                 "reason": ("OCS login was rejected on the last attempt and the portal "
@@ -402,8 +619,9 @@ def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
 
     imported: list[str] = []
     try:
-        session = _make_session()
+        session = _make_session(account)
         login(session, account)
+        save_session_cookies(conn, account.id, session)  # keep rotated cookies
 
         # 1) Catalogue — chain-wide (identical for all stores), one fetch.
         content, filename = fetch_catalogue(session, account)
@@ -438,14 +656,15 @@ def sync_ocs(conn, db_path: str, force: bool = False) -> dict:
         return {"status": "ok", "imported": imported}
     except OcsAuthError as e:
         # Distinct status so the scheduler stops instead of burning attempts.
+        status = MFA_REQUIRED_STATUS if isinstance(e, OcsMfaRequired) else AUTH_FAILED_STATUS
         remaining = getattr(e, "attempts_remaining", None)
         detail = str(e)
         if remaining is not None:
             detail += (f"  [{remaining} login attempt(s) left before OCS locks "
                        f"the account — automatic retries are now paused]")
-        _record_status(conn, account.id, AUTH_FAILED_STATUS, detail)
+        _record_status(conn, account.id, status, detail)
         log.error("OCS sync failed authentication: %s", detail)
-        return {"status": "auth_error", "error": detail, "imported": imported}
+        return {"status": status, "error": detail, "imported": imported}
     except Exception as e:  # noqa: BLE001 — record then re-raise to caller's log
         _record_status(conn, account.id, "error", str(e))
         log.warning("OCS sync failed: %s", e)

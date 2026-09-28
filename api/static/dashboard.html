@@ -7560,6 +7560,7 @@ async function renderOcsConnector() {
     const last = cfg.configured
       ? `Last run: ${cfg.last_run_at || 'never'} · ${cfg.last_status || '—'}${cfg.last_error ? ' · ' + escapeHtml(cfg.last_error) : ''}`
       : 'Not configured yet.';
+    const mfaState = ocsTrustState(cfg);
 
     main.innerHTML = `
       <div class="section-header" style="flex-direction: column; align-items: stretch; gap: 12px;">
@@ -7591,6 +7592,25 @@ async function renderOcsConnector() {
         <div style="padding: 0 16px 14px; display: flex; gap: 10px; align-items: center;">
           <button class="btn btn-primary" id="ocs-save">Save</button>
           <span id="ocs-save-status" style="font-size: 11px; color: var(--text-dim);">${escapeHtml(last)}</span>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--bg-elev-2);"><strong>Phone verification (MFA)</strong></div>
+        <div style="padding: 14px 16px;">
+          <div id="ocs-mfa-state" style="font-size: 12px; margin-bottom: 8px; color: ${mfaState.color};">${escapeHtml(mfaState.text)}</div>
+          <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 12px; max-width: 640px;">
+            OCS texts a 6-digit code to the account holder's phone. After one verified sign-in, OCS remembers this server for 30 days and the nightly pull runs unattended. Verify again when it's close to expiring. If the password was changed, save the new one above first.
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <button class="btn btn-primary" id="ocs-mfa-start">Send code to phone</button>
+            <span id="ocs-mfa-code-row" style="display: none; gap: 8px; align-items: center;">
+              <input id="ocs-mfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6-digit code" style="font-size: 13px; width: 110px; letter-spacing: 0.1em;">
+              <button class="btn btn-primary" id="ocs-mfa-verify">Verify</button>
+              <button class="btn" id="ocs-mfa-resend">Resend code</button>
+            </span>
+            <span id="ocs-mfa-status" style="font-size: 11px; color: var(--text-dim);"></span>
+          </div>
         </div>
       </div>
 
@@ -7676,6 +7696,64 @@ async function renderOcsConnector() {
       } catch (e) { setStatus("ocs-action-status", "Error: " + e.message, false); }
     });
 
+    const mfaPost = async (path, body) => {
+      const res = await fetch(path, { method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+      const d = await res.json().catch(() => ({ detail: res.statusText }));
+      if (!res.ok) throw new Error(d.detail || res.statusText);
+      return d;
+    };
+    const codeRow = document.getElementById("ocs-mfa-code-row");
+    const startBtn = document.getElementById("ocs-mfa-start");
+    const mfaFail = (d) => setStatus("ocs-mfa-status",
+      (d.locked ? "Locked: " : "") + (d.error || "failed"), false);
+
+    startBtn.addEventListener("click", async () => {
+      startBtn.disabled = true;
+      setStatus("ocs-mfa-status", "Signing in to OCS\u2026");
+      try {
+        const d = await mfaPost("/api/ocs/mfa/start");
+        if (!d.ok) { mfaFail(d); return; }
+        if (!d.needed) {
+          setStatus("ocs-mfa-status", "Signed in without a code \u2014 this server is still remembered.", true);
+          return;
+        }
+        codeRow.style.display = "inline-flex";
+        document.getElementById("ocs-mfa-code").value = "";
+        document.getElementById("ocs-mfa-code").focus();
+        setStatus("ocs-mfa-status", `Code sent to ${d.phone || "your phone"}. It expires in 5 minutes.`, null);
+      } catch (e) { setStatus("ocs-mfa-status", "Error: " + e.message, false); }
+      finally { startBtn.disabled = false; }
+    });
+
+    const verify = async () => {
+      const code = document.getElementById("ocs-mfa-code").value.replace(/\D/g, "");
+      if (code.length !== 6) { setStatus("ocs-mfa-status", "Enter the 6-digit code.", false); return; }
+      setStatus("ocs-mfa-status", "Verifying\u2026");
+      try {
+        const d = await mfaPost("/api/ocs/mfa/verify", { code });
+        if (!d.ok) { mfaFail(d); return; }
+        codeRow.style.display = "none";
+        const st = ocsTrustState({ trusted_until: d.trusted_until, last_status: "ok" });
+        const stateEl = document.getElementById("ocs-mfa-state");
+        stateEl.textContent = st.text;
+        stateEl.style.color = st.color;
+        setStatus("ocs-mfa-status", "Verified. Use Run now to pull the catalogue.", true);
+      } catch (e) { setStatus("ocs-mfa-status", "Error: " + e.message, false); }
+    };
+    document.getElementById("ocs-mfa-verify").addEventListener("click", verify);
+    document.getElementById("ocs-mfa-code").addEventListener("keydown", (e) => { if (e.key === "Enter") verify(); });
+
+    document.getElementById("ocs-mfa-resend").addEventListener("click", async () => {
+      setStatus("ocs-mfa-status", "Sending a new code\u2026");
+      try {
+        const d = await mfaPost("/api/ocs/mfa/resend");
+        if (!d.ok) { mfaFail(d); return; }
+        document.getElementById("ocs-mfa-code").value = "";
+        setStatus("ocs-mfa-status", "New code sent. The previous one no longer works.", null);
+      } catch (e) { setStatus("ocs-mfa-status", "Error: " + e.message, false); }
+    });
+
     document.getElementById("ocs-fetch-retailers").addEventListener("click", async () => {
       setStatus("ocs-action-status", "Fetching retailer list...");
       try {
@@ -7711,6 +7789,24 @@ async function renderOcsConnector() {
       }
     });
   } catch (e) { showError(e); }
+}
+
+// OCS remembers this server for 30 days after an SMS-verified sign-in.
+// trusted_until is UTC "YYYY-MM-DD HH:MM:SS" (see jobs/ocs_connector.py).
+function ocsTrustState(cfg) {
+  const good = "#6dab84", warn = "#d9a441", bad = "var(--critical)";
+  if (cfg.last_status === "mfa_required")
+    return { color: bad, text: "OCS is asking for a verification code \u2014 automatic pulls are paused until you verify." };
+  if (cfg.last_status === "auth_error")
+    return { color: bad, text: "OCS rejected the password \u2014 save the correct password above, then verify." };
+  if (!cfg.trusted_until)
+    return { color: "var(--text-dim)", text: "Not verified yet." };
+  const until = new Date(cfg.trusted_until.replace(" ", "T") + "Z");
+  const days = Math.ceil((until - Date.now()) / 86400000);
+  const when = until.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (days <= 0) return { color: bad, text: `Remembered sign-in expired ${when} \u2014 verify again.` };
+  if (days <= 5) return { color: warn, text: `Remembered until ${when} (${days} day${days === 1 ? "" : "s"} left) \u2014 verify again soon.` };
+  return { color: good, text: `Remembered until ${when} (${days} days left).` };
 }
 
 function renderOcsRetailerMap(retailers, existing) {
