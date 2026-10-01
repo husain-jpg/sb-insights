@@ -272,6 +272,14 @@
   }
   details.hint-box[open] > summary::before { content: "▾"; }
   details.hint-box > summary::-webkit-details-marker { display: none; }
+  /* Term / definition list inside an explainer (Historical Financials). */
+  .an-defs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 10px 0 0; }
+  .an-defs dt { color: var(--text); font-weight: 600; white-space: nowrap; }
+  .an-defs dd { margin: 0; }
+  @media (max-width: 600px) {
+    .an-defs { grid-template-columns: 1fr; gap: 2px; }
+    .an-defs dd { margin-bottom: 6px; }
+  }
   tbody tr:hover td { background: var(--bg-elev-2); }
 
   /* Sticky-column support: wrap a table in <div class="sticky-cols-1"> etc.
@@ -3797,12 +3805,21 @@ async function renderAnalytics() {
       <div style="font-size: 11px; color: var(--text-dim);">Loading...</div>
     </div>
     <div class="card"><div id="an-table"></div></div>
-    <div class="hint-box">
-      <strong>Discount %</strong> = total discounts ÷ total regular price (standard retail metric).
-      <strong>Margin %</strong> is computed only on SKUs with wholesale cost data — coverage shown above.
-      <strong>YoY comparison</strong> — pick how the prior-year period is chosen: <em>same day of the week</em> (52 weeks / 364 days back, so a Saturday compares to a Saturday — best for day-of-week-sensitive sales) or <em>same date</em> (exact calendar date a year ago). New stores not active in the prior period show $0 prior with the current value as the difference.
-      <strong>Today (live)</strong> really means today, in store time (America/Toronto) — not the last day we have a report for. Cova's scheduled exports are cumulative day-to-date, so each intraday run replaces today's figures with a larger running total and the tab picks it up within ~5 minutes. Today is therefore <em>partial</em> until the final overnight run: the header shows how far into the day the data goes, and the prior-year day is cut off at that same clock time so you're never comparing a half-traded day against a full one. <em>Yesterday</em> and the month/quarter/year presets are also anchored to the real calendar; only the trailing windows (Last 7 / 30 days, Last 12 months) end on the newest day with data, so they always contain a full N days.
-    </div>
+    <details class="hint-box" style="display: block;">
+      <summary style="cursor: pointer; color: var(--text); font-size: 11px; list-style: none;">
+        How these numbers are calculated
+      </summary>
+      <dl class="an-defs">
+        <dt>Net Sales</dt><dd>After discounts, before tax. Matches <em>Subtotal</em> on Cova's Sales by Location.</dd>
+        <dt>Gross Sales</dt><dd>Before discounts (units &times; regular price).</dd>
+        <dt>Discount %</dt><dd>Discounts &divide; gross sales.</dd>
+        <dt>Transactions</dt><dd>Includes refund receipts, which Cova lists separately.</dd>
+        <dt>Margin % / GP $</dt><dd>Cost comes from OCS wholesale prices, not Cova's average cost, so it can differ slightly from Cova. Margin % uses only SKUs with a cost (coverage shown above); GP $ = net sales &times; margin %.</dd>
+        <dt>Prior year</dt><dd><em>Same day of the week</em> compares Saturday to Saturday (364 days back). <em>Same date</em> uses the exact date a year ago. Stores not open then show $0.</dd>
+        <dt>Today</dt><dd>Store time, updated with each intraday Cova report. Partial until the overnight report, so the prior-year day is cut off at the same time of day.</dd>
+        <dt>Last 7 / 30 days, 12 months</dt><dd>End on the latest day with data, so they always cover full days.</dd>
+      </dl>
+    </details>
   `;
 
   const preset = document.getElementById("an-preset");
