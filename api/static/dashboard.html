@@ -272,12 +272,29 @@
   }
   details.hint-box[open] > summary::before { content: "▾"; }
   details.hint-box > summary::-webkit-details-marker { display: none; }
-  /* Term / definition list inside an explainer (Historical Financials). */
-  .an-defs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 10px 0 0; }
+  /* Historical Financials notes: closed, it is just a button under the table;
+     open, a compact term/definition panel. */
+  details.an-notes { margin-top: 12px; }
+  details.an-notes > summary {
+    display: inline-flex; align-items: center; gap: 8px; list-style: none;
+    padding: 8px 14px; font-size: 13px; font-weight: 600; color: var(--text);
+    background: var(--bg-elev-2); border: 1px solid var(--border);
+    border-radius: 4px; cursor: pointer; user-select: none;
+  }
+  details.an-notes > summary:hover { border-color: var(--info); }
+  details.an-notes > summary::-webkit-details-marker { display: none; }
+  details.an-notes > summary::before { content: "\25B8"; font-size: 13px; color: var(--text-dim); }
+  details.an-notes[open] > summary::before { content: "\25BE"; }
+  .an-defs {
+    display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px;
+    margin: 8px 0 0; padding: 10px 14px; max-width: 900px;
+    border: 1px solid var(--border); border-radius: 4px;
+    font-size: 12px; line-height: 1.4; color: var(--text-dim);
+  }
   .an-defs dt { color: var(--text); font-weight: 600; white-space: nowrap; }
   .an-defs dd { margin: 0; }
   @media (max-width: 600px) {
-    .an-defs { grid-template-columns: 1fr; gap: 2px; }
+    .an-defs { grid-template-columns: 1fr; gap: 0; }
     .an-defs dd { margin-bottom: 6px; }
   }
   tbody tr:hover td { background: var(--bg-elev-2); }
@@ -3805,10 +3822,8 @@ async function renderAnalytics() {
       <div style="font-size: 11px; color: var(--text-dim);">Loading...</div>
     </div>
     <div class="card"><div id="an-table"></div></div>
-    <details class="hint-box" style="display: block;">
-      <summary style="cursor: pointer; color: var(--text); font-size: 11px; list-style: none;">
-        How these numbers are calculated
-      </summary>
+    <details class="an-notes">
+      <summary>How these numbers are calculated</summary>
       <dl class="an-defs">
         <dt>Net Sales</dt><dd>After discounts, before tax. Matches <em>Subtotal</em> on Cova's Sales by Location.</dd>
         <dt>Gross Sales</dt><dd>Before discounts (units &times; regular price).</dd>
