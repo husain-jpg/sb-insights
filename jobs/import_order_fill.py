@@ -125,6 +125,49 @@ def _safe_float(val) -> Optional[float]:
         return None
 
 
+def _carry_forward_delivery_dates(cur, df, location_id: str | None,
+                                  generated_at: Optional[str], source_file: str) -> int:
+    """Fill a dateless pull's delivery dates from the store's previous run.
+
+    OCS only puts committed delivery dates in a store's order form while that
+    store's order window is open (~7pm the night before its order day until
+    the deadline). The connector pulls every store every night, so the pull
+    after a window comes back with no dates and, being newer, replaced the
+    dated run: the Reorder Report's delivery badges went blank for every store
+    (all 8 had zero dates on 2026-10-01 even though each window's pull had a
+    date on every SKU).
+
+    So when a store-tagged file has NO dates at all, copy each SKU's date
+    from the store's previous run, but only dates that haven't passed (the
+    committed delivery for the order just placed). A file with any dates is
+    an in-window form and is taken as-is. Mutates df["_delivery_date_iso"]
+    before the run-level modal dates and lead days are derived, so those are
+    carried too. Returns how many SKU dates were carried.
+    """
+    if location_id is None or df["_delivery_date_iso"].notna().any():
+        return 0
+    prev = cur.execute(
+        """SELECT id FROM order_fill_runs
+           WHERE location_id = ? AND source_file <> ?
+           ORDER BY generated_at DESC, id DESC LIMIT 1""",
+        (location_id, source_file)).fetchone()
+    if not prev:
+        return 0
+    not_before = generated_at or pd.Timestamp.today().strftime("%Y-%m-%d")
+    prev_dates = dict(cur.execute(
+        """SELECT LOWER(ocs_variant_number), estimated_delivery_date FROM order_fill_skus
+           WHERE run_id = ? AND estimated_delivery_date >= ?""",
+        (prev[0], not_before)).fetchall())
+    if not prev_dates:
+        return 0
+    df["_delivery_date_iso"] = df["SKU"].map(
+        lambda v: prev_dates.get(v.strip().lower()) if isinstance(v, str) else None)
+    carried = int(df["_delivery_date_iso"].notna().sum())
+    log.info("  out-of-window pull: carried %d delivery date(s) forward from run %d",
+             carried, prev[0])
+    return carried
+
+
 def import_order_fill_file(conn, file_path: Path, location_id: str | None = None) -> dict:
     """Parse and persist an OCS Order Fill xlsx.
 
@@ -164,6 +207,9 @@ def import_order_fill_file(conn, file_path: Path, location_id: str | None = None
     )
     df["_delivery_date_iso"] = df["Estimated Delivery Date"].apply(_parse_delivery_date)
 
+    cur = conn.cursor()
+    carried = _carry_forward_delivery_dates(cur, df, location_id, generated_at, file_path.name)
+
     def _modal_delivery(filter_mask) -> Optional[str]:
         subset = df.loc[filter_mask, "_delivery_date_iso"].dropna()
         if subset.empty:
@@ -184,8 +230,6 @@ def import_order_fill_file(conn, file_path: Path, location_id: str | None = None
 
     log.info("  Lead times: CTB=%s days, FT-Exp=%s days, FT-Std=%s days",
              ctb_lead, ft_exp_lead, ft_std_lead)
-
-    cur = conn.cursor()
 
     # Idempotent insert by source_file
     cur.execute("""
@@ -288,6 +332,7 @@ def import_order_fill_file(conn, file_path: Path, location_id: str | None = None
             "flow_thru_expedited": ft_exp_lead,
             "flow_thru_standard": ft_std_lead,
         },
+        "delivery_dates_carried": carried,
         "delivery_dates": {
             "click_to_buy": ctb_delivery,
             "flow_thru_expedited": ft_exp_delivery,
