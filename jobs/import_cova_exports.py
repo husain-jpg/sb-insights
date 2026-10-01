@@ -372,7 +372,8 @@ def import_sales(conn, file_path: Path) -> dict:
       - sale_lines     (line-level detail, used for cashier/discount/basket analytics)
 
     Both sales tables are populated in the same pass for efficiency.
-    All upserts are idempotent — re-importing the same file replaces existing rows.
+    Each (store, day) in the file REPLACES what was stored for it, so the
+    newest export of a day wins and re-importing is idempotent.
     """
     log.info("Reading sales file: %s", file_path.name)
     df = _read_any(file_path)
@@ -419,6 +420,24 @@ def import_sales(conn, file_path: Path) -> dict:
     )
 
     cur = conn.cursor()
+
+    # Replace, don't merge, every (store, day) this file covers. Cova exports
+    # are complete for each day they include (an intraday run is cumulative
+    # day-to-date), so the newest file is the truth for that day. Upserting
+    # isn't enough for sale_lines: Cova gives no line number, so line_no is
+    # the row's position within its invoice IN THIS FILE, and the intraday and
+    # nightly exports order an invoice's lines differently. The same line came
+    # back under a new line_no and was inserted again, inflating
+    # sales/units in Historical Financials by 20-40% a day from 2026-09-21
+    # (when the 12/4/8pm reports started) while invoice counts still matched.
+    # sales_daily gets the same treatment so a SKU dropped from a later
+    # export (e.g. voided) doesn't linger from an earlier one.
+    day_pairs = list(df[["location_id", "sale_date"]].drop_duplicates()
+                     .itertuples(index=False, name=None))
+    cur.executemany("DELETE FROM sale_lines WHERE location_id = ? AND sale_date = ?", day_pairs)
+    cur.executemany("DELETE FROM sales_daily WHERE location_id = ? AND sale_date = ?", day_pairs)
+    log.info("  replacing %d store-day(s)", len(day_pairs))
+
     cur.executemany(
         """
         INSERT INTO sales_daily (sku, location_id, sale_date, units_sold, gross_revenue)
