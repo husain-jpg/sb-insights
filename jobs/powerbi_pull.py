@@ -150,7 +150,8 @@ def _wait_logged_in(page, timeout: int = 120) -> bool:
 
 
 def cmd_login() -> None:
-    """Open a real window; you sign in + complete MFA, then press Enter."""
+    """Open a real window; you sign in + complete MFA. Finishes on its own once
+    the report renders."""
     pw, ctx = _ctx(headless=False)
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto(REPORT_URL, wait_until="load", timeout=120_000)
@@ -158,9 +159,23 @@ def cmd_login() -> None:
     print(">>> A browser window opened. Sign in to Power BI + complete MFA.")
     print(">>> CRITICAL: when it asks 'Stay signed in?' click YES — that's what")
     print(">>>           keeps the session alive for automation (days, not 1 hour).")
-    print(">>> When the REPORT is fully visible, come back here and press Enter.")
-    print("=" * 70)
-    input()
+    print(">>> This window closes by itself once the report has loaded (up to 15 min).")
+    print("=" * 70, flush=True)
+    # Poll for the rendered report instead of waiting for Enter, so login can
+    # be launched from a scheduler or background shell with no terminal to type in.
+    deadline = time.time() + 900
+    while time.time() < deadline:
+        try:
+            if page.locator("visual-container-modern, visual-container, .visualContainer").count() > 0:
+                break
+        except Exception:
+            pass  # mid-navigation during the Microsoft sign-in redirects
+        time.sleep(3)
+    else:
+        print("\n>>> Timed out waiting for the report — sign-in not completed.", flush=True)
+        ctx.close(); pw.stop()
+        return
+    time.sleep(5)  # let the post-login cookies settle before re-checking
     # Verify we're actually logged in (re-navigate in this same session).
     page.goto(REPORT_URL, wait_until="load", timeout=120_000)
     time.sleep(8)
