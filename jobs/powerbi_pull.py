@@ -688,6 +688,12 @@ def cmd_pull(store: str | None, windows: list, headless: bool = True) -> None:
                 for page_name, filename in PAGES:
                     tag = f"{crsa}_{win}d_{page_name.split()[0]}"  # CRSA…_30d_2.2
                     _go_to_page(page, page_name)
+                    if not _category_is_all(page):
+                        _reset_report_filters(page)
+                        if not _category_is_all(page):
+                            raise RuntimeError(
+                                f"Category slicer on '{page_name}' is filtered and "
+                                f"reset didn't clear it — not exporting")
                     # CRSA + date are page-level on-canvas slicers — set + verify
                     # both on THIS page before exporting (the data table is the
                     # only thing that changes, so read-backs are the guard).
@@ -777,13 +783,16 @@ def _reset_report_filters(page) -> None:
     Power BI persists slicer/filter state per user. On 2026-10-02 the report
     reopened with Category narrowed to one category, so every export held
     only ~60-275 Edibles rows instead of ~4-6k across 12 categories, and the
-    uploads REPLACED good data. "Reset to default" in the report toolbar
-    clears that persisted state. Best effort: _check_export_unfiltered is the
-    real guard."""
+    uploads REPLACED good data. The toolbar's reset button (aria-label "Reset
+    filters, slicers, and other data view changes you've made.", then a
+    "Reset" confirm) clears that persisted state; verified 2026-10-02 to put
+    the Category slicer back to "All" on both pages. Best effort:
+    _category_is_all and _check_export_unfiltered are the real guards."""
     try:
-        btn = page.locator('button[aria-label="Reset to default"]:visible').first
+        btn = page.locator('button[aria-label^="Reset filters"]:visible, '
+                           'button[aria-label="Reset to default"]:visible').first
         if btn.count() == 0:
-            print("   (no 'Reset to default' button; report already at defaults)")
+            print("   (no reset button found; relying on the per-page category check)")
             return
         if btn.is_disabled():
             print("   filters already at report defaults")
@@ -798,6 +807,18 @@ def _reset_report_filters(page) -> None:
     except Exception as e:  # noqa: BLE001 — never block the pull on this
         print(f"   ! could not reset report filters: {e}")
         _shot(page, "reset_filters_fail")
+
+
+CATEGORY_SLICER = 'div.slicer-dropdown-menu[aria-label="CATEGORY, SUBCATEGORY, SUBSUBCATEGORY"]:visible'
+
+
+def _category_is_all(page) -> bool:
+    """True when the page's category hierarchy slicer is unfiltered ("All").
+    A missing slicer counts as fine (layout change); the export check still runs."""
+    el = page.locator(CATEGORY_SLICER).first
+    if el.count() == 0:
+        return True
+    return (el.inner_text() or "").strip().lower() == "all"
 
 
 # An unfiltered municipality export has thousands of SKUs across ~11-12
