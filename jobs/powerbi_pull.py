@@ -670,6 +670,7 @@ def cmd_pull(store: str | None, windows: list, headless: bool = True) -> None:
         return 2  # exit code 2 = Power BI session expired, needs `login`
     print("Report loaded.")
     time.sleep(5)
+    _reset_report_filters(page)
     _dump_date_slicer(page)  # one-time: capture the date control's DOM
 
     succeeded, failed = [], []
@@ -701,6 +702,8 @@ def cmd_pull(store: str | None, windows: list, headless: bool = True) -> None:
                     files.append(_export_table(page, out, tag=tag))
                 if len(files) != 2:
                     raise RuntimeError(f"only {len(files)}/2 files exported")
+                for f in files:
+                    _check_export_unfiltered(f)
                 if loc_id:
                     _upload(files, loc_id, win, end_date)
                 elif locations:
@@ -766,6 +769,63 @@ def _match_location(locations: list[dict], name: str) -> str | None:
     if len(hits) == 1:
         return hits[0]["id"]
     return None
+
+
+def _reset_report_filters(page) -> None:
+    """Undo any filters Power BI remembered for this user before exporting.
+
+    Power BI persists slicer/filter state per user. On 2026-10-02 the report
+    reopened with Category narrowed to one category, so every export held
+    only ~60-275 Edibles rows instead of ~4-6k across 12 categories, and the
+    uploads REPLACED good data. "Reset to default" in the report toolbar
+    clears that persisted state. Best effort: _check_export_unfiltered is the
+    real guard."""
+    try:
+        btn = page.locator('button[aria-label="Reset to default"]:visible').first
+        if btn.count() == 0:
+            print("   (no 'Reset to default' button; report already at defaults)")
+            return
+        if btn.is_disabled():
+            print("   filters already at report defaults")
+            return
+        btn.click()
+        time.sleep(1.5)
+        confirm = page.locator('button:has-text("Reset"):visible').last
+        if confirm.count():
+            confirm.click()
+        time.sleep(6)  # visuals re-query after the reset
+        print("   reset report filters to default")
+    except Exception as e:  # noqa: BLE001 — never block the pull on this
+        print(f"   ! could not reset report filters: {e}")
+        _shot(page, "reset_filters_fail")
+
+
+# An unfiltered municipality export has thousands of SKUs across ~11-12
+# subcategories (July 2026: 3.2k-6.2k rows). Far fewer means a filter leaked in.
+_MIN_EXPORT_SUBCATEGORIES = 5
+_MIN_EXPORT_ROWS = 500
+
+
+def _check_export_unfiltered(path: Path) -> None:
+    """Refuse to upload an export that looks filtered. Uploads REPLACE the
+    store's data for that window, so a filtered export would silently wipe
+    good data (as happened 2026-10-02 with a Category filter stuck on one
+    category)."""
+    import pandas as pd
+    df = None
+    for skip in range(0, 6):  # Power BI exports may carry a few title rows
+        d = pd.read_excel(path, skiprows=skip)
+        if any(str(c).strip().lower() == "subcategory" for c in d.columns):
+            df = d
+            break
+    if df is None:
+        raise RuntimeError(f"{path.name}: no Subcategory column — unexpected export layout")
+    col = next(c for c in df.columns if str(c).strip().lower() == "subcategory")
+    n_sub, n_rows = df[col].dropna().nunique(), len(df)
+    if n_sub < _MIN_EXPORT_SUBCATEGORIES or n_rows < _MIN_EXPORT_ROWS:
+        raise RuntimeError(
+            f"{path.name} looks filtered ({n_rows} rows, {n_sub} subcategories) — "
+            f"NOT uploading. Check the report's Category/Brand/LP slicers.")
 
 
 def _upload(files: list[Path], location_id: str, window: int, end_date) -> None:
