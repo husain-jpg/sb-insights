@@ -6205,6 +6205,293 @@ def _build_pin_rows(conn, store: str | None, recs, tl: str, gap_deal_map: dict) 
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Market Intelligence: swap suggestions
+# ---------------------------------------------------------------------------
+# For each SKU a store has on the shelf, look for a like-for-like product the
+# municipality buys more of (same OCS category + subcategory + size, wholesale
+# within a price band, orderable now) and estimate the weekly gross-profit
+# gain of swapping, INCLUDING data revenue (collective / LP partner / LTO
+# rebates, via the same resolver and stacking rules as the Reorder Report).
+#   - "Slow mover": the store sells <= _SWAP_SLOW_PER_WEEK of it; any better
+#     alternative qualifies.
+#   - "Rebate swap": a healthy SKU with no deal, where an equivalent the market
+#     buys at least as much of carries one. The gain is mostly the rebate.
+# A swapped-in SKU is NEW stock received during the deal, so it earns the
+# rebate in full even under IRCC's receive-date rule.
+_SWAP_SLOW_PER_WEEK = 1.0     # units/week at this store
+_SWAP_PRICE_BAND = 0.30       # candidate wholesale within +/-30% of the outgoing SKU
+_SWAP_MIN_GAIN = 2.0          # $/week below which a swap isn't worth the shelf change
+_SWAP_NEW_DAYS = 14           # received this recently = too new to judge
+
+
+def _rebate_per_unit(deal: dict | None, wholesale: float | None, retail: float | None) -> float:
+    """$ of data revenue earned per unit sold, summed over the deal's stacked
+    components. Flat per-month agreements can't be attributed per unit → 0."""
+    if not deal:
+        return 0.0
+    w, r = wholesale or 0.0, retail or 0.0
+    total = 0.0
+    for c in deal.get("components") or []:
+        rate, rt = float(c.get("rate") or 0) / 100.0, c.get("rate_type")
+        if rt == "wholesale_cost":
+            total += rate * w
+        elif rt == "retail_sales":
+            total += rate * r
+        elif rt == "gross_profit":
+            total += rate * max(r - w, 0.0)
+        elif c.get("flat_rate_type") == "flat_per_unit":
+            total += float(c.get("flat_rate_value") or 0)
+    return total
+
+
+def _deal_label(deal: dict | None) -> str | None:
+    if not deal:
+        return None
+    parts = []
+    for c in deal.get("components") or []:
+        label = (c.get("label") or "").replace("Partner: ", "").replace("LTO: ", "LTO ")
+        parts.append(f"{label} {c.get('rate_value_display') or ''}".strip())
+    return " + ".join(parts) or deal.get("partner")
+
+
+def _median(vals):
+    vals = sorted(v for v in vals if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+@app.get("/api/market-intelligence/swaps")
+def get_swap_suggestions(location_id: str, import_id: int | None = None,
+                         deal_filter: str | None = None, limit: int = 150) -> dict:
+    """Like-for-like swap suggestions for one store (see the block comment above).
+    deal_filter='deal' keeps only swaps whose replacement carries a rebate."""
+    from jobs.data_revenue_resolver import get_active_deals_for_skus
+    from jobs.import_order_fill import get_latest_order_fill_skus
+
+    with db() as conn:
+        cur = conn.cursor()
+        if import_id is None:
+            row = cur.execute(
+                """SELECT id FROM market_intelligence_imports WHERE location_id = ?
+                   ORDER BY (period_days = 30) DESC, imported_at DESC LIMIT 1""",
+                (location_id,)).fetchone()
+            if not row:
+                return {"count": 0, "items": [], "warning": "No market data for this store yet"}
+            import_id = row[0]
+        meta = cur.execute(
+            """SELECT period_start, period_end, period_days, imported_at
+               FROM market_intelligence_imports WHERE id = ?""", (import_id,)).fetchone()
+        window_days = int((meta[2] if meta and meta[2] else 30))
+
+        # Market rows for this import, keyed by lower-cased OCS variant.
+        # Velocities are cumulative units / window days. OCS's own "average
+        # daily" columns divide by the days the SKU SOLD, not calendar days
+        # (e.g. 54 units over 15 selling days in a 30-day window reads 3.6/day
+        # instead of 1.8), which inflates slow and patchy sellers the most.
+        market = {}
+        for r in cur.execute(
+                """SELECT LOWER(sku), sku, item_name, brand, supplier, your_units,
+                          municipality_units
+                   FROM market_intelligence_data WHERE import_id = ?""", (import_id,)):
+            market[r[0]] = {"sku": r[1], "item_name": r[2], "brand": r[3], "supplier": r[4],
+                            "your_vel": (r[5] or 0) / window_days,
+                            "muni_vel": (r[6] or 0) / window_days}
+        if not any((m["muni_vel"] or 0) > 0 for m in market.values()):
+            return {"count": 0, "items": [], "import_id": import_id,
+                    "warning": ("OCS shows no municipality averages for this store "
+                                "(municipalities with fewer than 5 stores are hidden), "
+                                "so there is nothing to compare against.")}
+
+        # Our shelf: in-stock SKUs at this store that map to the OCS catalogue.
+        latest = get_latest_sale_date(conn) or business_today()
+        since = (latest - timedelta(days=window_days - 1)).isoformat()
+        shelf = []
+        for r in cur.execute(
+                """SELECT p.sku, LOWER(p.ocs_variant_number), p.name, p.brand,
+                          ci.on_hand, ci.avg_unit_cost, ci.last_received_date,
+                          pr.regular_price, oc.unit_price, oc.category, oc.subcategory,
+                          oc.size, oc.supplier,
+                          (SELECT COALESCE(SUM(sd.units_sold), 0) FROM sales_daily sd
+                            WHERE sd.sku = p.sku AND sd.location_id = ci.location_id
+                              AND sd.sale_date >= ?) AS units
+                   FROM current_inventory ci
+                   JOIN products p ON p.sku = ci.sku
+                   JOIN ocs_catalog oc ON oc.ocs_variant_number = LOWER(p.ocs_variant_number)
+                   LEFT JOIN prices pr ON pr.sku = p.sku AND pr.location_id = ci.location_id
+                   WHERE ci.location_id = ? AND ci.on_hand > 0
+                     AND p.ocs_variant_number IS NOT NULL""", (since, location_id)):
+            shelf.append({
+                "sku": r[0], "variant": r[1], "name": r[2], "brand": r[3], "on_hand": r[4],
+                "cost": (r[5] if r[5] and r[5] > 0 else r[8]), "last_received": r[6],
+                "retail": r[7], "wholesale": r[8], "category": r[9], "subcategory": r[10],
+                "size": r[11], "supplier": r[12],
+                "units_wk": (r[13] or 0) / window_days * 7,
+            })
+        carried = {s["variant"] for s in shelf}
+
+        # This store's share of municipality demand: our units / municipality
+        # units, summed over SKUs both sell. Scales a candidate's municipality
+        # velocity into an expected velocity HERE. It is well below 1 (0.2-0.3
+        # in May 2026): OCS's municipality figure behaves more like a municipal
+        # total than one store's average, so it must not be used unscaled.
+        both = [m for m in market.values() if m["your_vel"] > 0 and m["muni_vel"] > 0]
+        muni_sum = sum(m["muni_vel"] for m in both)
+        store_factor = (sum(m["your_vel"] for m in both) / muni_sum) if muni_sum else 0.25
+        store_factor = min(3.0, max(0.02, store_factor))
+
+        # Our typical retail markup by subcategory, to price a candidate we don't sell yet.
+        markups_by_sub: dict = {}
+        for s in shelf:
+            if s["retail"] and s["wholesale"]:
+                markups_by_sub.setdefault((s["category"], s["subcategory"]), []).append(
+                    s["retail"] / s["wholesale"])
+        overall_markup = _median([m for v in markups_by_sub.values() for m in v]) or 1.45
+
+        # Candidates: market SKUs we don't stock, orderable now.
+        of_map = get_latest_order_fill_skus(conn)
+        cand_by_key: dict = {}
+        cand_rows = []
+        for r in cur.execute(
+                """SELECT LOWER(mi.sku), mi.sku, mi.item_name, mi.brand, mi.supplier,
+                          mi.municipality_units * 1.0 / ?, oc.unit_price, oc.category,
+                          oc.subcategory, oc.size, oc.stock_status
+                   FROM market_intelligence_data mi
+                   JOIN ocs_catalog oc ON oc.ocs_variant_number = mi.sku
+                   WHERE mi.import_id = ? AND mi.municipality_units > 0
+                     AND oc.unit_price > 0""", (window_days, import_id)):
+            if r[0] in carried:
+                continue
+            of = of_map.get((location_id, r[0])) or of_map.get((None, r[0]))
+            orderable = r[10] == "YES" or bool(of and (of.get("flow_thru") or (of.get("available_quantity") or 0) > 0))
+            if not orderable:
+                continue
+            key = (r[7], r[8], (r[9] or "").replace(" ", "").lower())
+            c = {"variant": r[0], "sku": r[1], "name": r[2], "brand": r[3], "supplier": r[4],
+                 "muni_vel": r[5], "wholesale": r[6], "category": r[7], "subcategory": r[8],
+                 "size": r[9], "flow_thru": bool(of and of.get("flow_thru")),
+                 "delivery": (of or {}).get("estimated_delivery_date")}
+            markup = _median(markups_by_sub.get((r[7], r[8]), [])) or overall_markup
+            c["retail_est"] = round(c["wholesale"] * markup, 2)
+            c["units_wk"] = c["muni_vel"] * 7 * store_factor
+            cand_by_key.setdefault(key, []).append(c)
+            cand_rows.append(c)
+
+        # Deals for both sides through the shared resolver (same stacking rules
+        # as the Reorder Report). Candidates aren't in products, so pass meta.
+        today = business_today()
+        extra_meta = {c["sku"]: {"brand": c["brand"], "lp": c["supplier"],
+                                 "category": c["category"], "subcategory": c["subcategory"]}
+                      for c in cand_rows}
+        deal_map = get_active_deals_for_skus(
+            conn, set(extra_meta) | {s["sku"] for s in shelf}, today=today,
+            extra_meta=extra_meta)
+
+    recent_cut = (today - timedelta(days=_SWAP_NEW_DAYS)).isoformat()
+    items = []
+    for s in shelf:
+        if s["last_received"] and str(s["last_received"])[:10] >= recent_cut \
+                and s["units_wk"] <= _SWAP_SLOW_PER_WEEK:
+            continue  # just arrived; too new to call slow
+        key = (s["category"], s["subcategory"], (s["size"] or "").replace(" ", "").lower())
+        pool = cand_by_key.get(key)
+        if not pool or not s["wholesale"]:
+            continue
+        s_deal = deal_map.get(s["sku"])
+        s_gp = (s["retail"] or 0) - (s["cost"] or 0)
+        s_reb = _rebate_per_unit(s_deal, s["wholesale"], s["retail"])
+        s_week = s["units_wk"] * (s_gp + s_reb)
+        slow = s["units_wk"] <= _SWAP_SLOW_PER_WEEK
+        s_muni = (market.get(s["variant"]) or {}).get("muni_vel")
+        if not slow and s_deal:
+            continue  # healthy and already earning data revenue: leave it
+        options = []
+        for c in pool:
+            if abs(c["wholesale"] - s["wholesale"]) > _SWAP_PRICE_BAND * s["wholesale"]:
+                continue
+            c_deal = deal_map.get(c["sku"])
+            if not slow:
+                # Rebate swap: the replacement must carry a deal and sell at
+                # least as well in the market as what we already have.
+                if not c_deal or (s_muni and c["muni_vel"] < 0.9 * s_muni):
+                    continue
+            c_gp = c["retail_est"] - c["wholesale"]
+            c_reb = _rebate_per_unit(c_deal, c["wholesale"], c["retail_est"])
+            c_week = c["units_wk"] * (c_gp + c_reb)
+            gain = c_week - s_week
+            if gain < _SWAP_MIN_GAIN:
+                continue
+            options.append({
+                "sku": c["sku"], "name": c["name"], "brand": c["brand"],
+                "supplier": c["supplier"], "size": c["size"],
+                "wholesale": round(c["wholesale"], 2), "retail_est": c["retail_est"],
+                "market_units_wk": round(c["muni_vel"] * 7, 1),
+                "est_units_wk": round(c["units_wk"], 1),
+                "deal": _deal_label(c_deal),
+                "rebate_wk": round(c["units_wk"] * c_reb, 2),
+                "flow_thru": c["flow_thru"], "delivery": c["delivery"],
+                "gain_wk": round(gain, 2),
+            })
+        if not options:
+            continue
+        options.sort(key=lambda o: o["gain_wk"], reverse=True)
+        best = options[0]
+        if deal_filter == "deal" and not best["deal"]:
+            with_deal = [o for o in options if o["deal"]]
+            if not with_deal:
+                continue
+            best = with_deal[0]
+        items.append({
+            "reason": "Slow mover" if slow else "Rebate swap",
+            "out": {
+                "sku": s["sku"], "variant": s["variant"], "name": s["name"],
+                "brand": s["brand"], "category": s["category"],
+                "subcategory": s["subcategory"], "size": s["size"],
+                "on_hand": s["on_hand"], "units_wk": round(s["units_wk"], 1),
+                "market_units_wk": round(s_muni * 7, 1) if s_muni else None,
+                "retail": s["retail"], "wholesale": s["wholesale"],
+                "deal": _deal_label(s_deal),
+                "rebate_wk": round(s["units_wk"] * s_reb, 2),
+            },
+            "best": best,
+            "_all": [o for o in options if (o["deal"] or deal_filter != "deal")],
+        })
+
+    # Each replacement can fill one shelf gap: assign greedily, biggest gain
+    # first, falling back to a row's next-best option when its best is taken.
+    items.sort(key=lambda it: it["best"]["gain_wk"], reverse=True)
+    used, assigned = set(), []
+    for it in items:
+        pick = next((o for o in [it["best"]] + it["_all"] if o["sku"] not in used), None)
+        if not pick:
+            continue
+        used.add(pick["sku"])
+        it["best"] = pick
+        it["alternatives"] = [o for o in it["_all"] if o is not pick and o["sku"] not in used][:2]
+        assigned.append(it)
+    for it in assigned:
+        it.pop("_all", None)
+    items = sorted(assigned, key=lambda it: it["best"]["gain_wk"], reverse=True)
+    items = items[:max(1, min(int(limit), 500))]
+    return {
+        "count": len(items),
+        "items": items,
+        "import_id": import_id,
+        "period_start": meta[0] if meta else None,
+        "period_end": meta[1] if meta else None,
+        "period_days": window_days,
+        "imported_at": meta[3] if meta else None,
+        "store_factor": round(store_factor, 3),
+        "total_gain_wk": round(sum(it["best"]["gain_wk"] for it in items), 2),
+        "slow_count": sum(1 for it in items if it["reason"] == "Slow mover"),
+        "rebate_count": sum(1 for it in items if it["reason"] == "Rebate swap"),
+        "rules": {"slow_per_week": _SWAP_SLOW_PER_WEEK, "price_band": _SWAP_PRICE_BAND,
+                  "min_gain_wk": _SWAP_MIN_GAIN},
+    }
+
+
 @app.post("/api/reorder/pin")
 def add_reorder_pin(payload: dict = Body(...), request: Request = None) -> dict:
     """Pin a SKU to the top of the Reorder Report (Add to Reorder from the OCS

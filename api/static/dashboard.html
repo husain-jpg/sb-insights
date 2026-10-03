@@ -6793,12 +6793,13 @@ async function renderMonthlyReports() {
 // for your customers" hint, period mismatch if comparing across imports.
 
 let _miCurrentStore = null;
-let _miCurrentView = "gap";  // 'gap' | 'comparison' | 'imports'
+let _miCurrentView = "gap";  // 'gap' | 'comparison' | 'swaps' | 'imports'
 let _miWindow = 30;          // selected lookback window in days (30 = recommended)
 let _miCategory = "";        // selected subcategory filter ('' = all)
 let _miIncludeCarried = false; // gap view: also show SKUs we already carry
 let _miDealFilter = "";      // '' | 'any' | 'collective' | 'lp' | 'lto'
 let _miImportId = null;      // import_id resolved from the selected store + window
+let _miSwapFilter = "";      // swaps view: '' | 'deal' | 'slow' | 'rebate'
 
 // Resolve the selected store+window to a concrete import. The Power BI connector
 // pulls several rolling windows (14/30/90/180) each run, each landing as its own
@@ -6895,7 +6896,12 @@ async function renderMarketIntel() {
             <select id="mi-window-select" title="Lookback window — the connector pulls several each run">
               ${miAvail.map(d => `<option value="${d}" ${d === _miWindow ? 'selected' : ''}>${d} days${d === 30 ? ' (recommended)' : ''}</option>`).join('')}
             </select>` : ''}
-          ${showFilters ? `
+          ${_miCurrentView === 'swaps' ? `
+            <select id="mi-swap-filter" title="Which swap suggestions to show">
+              ${[['','All swaps'],['deal','Replacement has a deal'],['slow','Slow movers only'],['rebate','Rebate swaps only']]
+                .map(([v, l]) => `<option value="${v}" ${_miSwapFilter === v ? 'selected' : ''}>${l}</option>`).join('')}
+            </select>` : ''}
+          ${showFilters && _miCurrentView !== 'swaps' ? `
             <select id="mi-category-select" title="Filter by product category">
               <option value="">All categories</option>
               ${_miCategory ? `<option value="${escapeHtml(_miCategory)}" selected>${escapeHtml(_miCategory)}</option>` : ''}
@@ -6911,6 +6917,7 @@ async function renderMarketIntel() {
           <div style="display: flex; gap: 4px; margin-left: 12px;">
             <button class="btn ${_miCurrentView === 'gap' ? 'btn-primary' : ''}" data-view="gap" id="mi-view-gap">Gap Report</button>
             <button class="btn ${_miCurrentView === 'comparison' ? 'btn-primary' : ''}" data-view="comparison" id="mi-view-comparison">Performance vs Peers</button>
+            <button class="btn ${_miCurrentView === 'swaps' ? 'btn-primary' : ''}" data-view="swaps" id="mi-view-swaps">Swaps</button>
             <button class="btn ${_miCurrentView === 'imports' ? 'btn-primary' : ''}" data-view="imports" id="mi-view-imports">Imports</button>
           </div>
         </div>
@@ -6952,6 +6959,11 @@ async function renderMarketIntel() {
     const carriedChk = document.getElementById("mi-include-carried");
     if (carriedChk) carriedChk.addEventListener("change", e => {
       _miIncludeCarried = e.target.checked;
+      loadMiContent();
+    });
+    const swapSel = document.getElementById("mi-swap-filter");
+    if (swapSel) swapSel.addEventListener("change", e => {
+      _miSwapFilter = e.target.value;
       loadMiContent();
     });
     const dealSel = document.getElementById("mi-deal-select");
@@ -7000,6 +7012,9 @@ async function loadMiContent() {
   }
   if (_miCurrentView === "comparison") {
     return loadMiComparisonView();
+  }
+  if (_miCurrentView === "swaps") {
+    return loadMiSwapsView();
   }
 }
 
@@ -7102,6 +7117,98 @@ async function loadMiGapView() {
           : (r.stock_status === 'NO' ? '<span class="tag tag-critical" style="font-size: 9px;">Out</span>' : '<span class="tag" style="font-size: 9px;">?</span>') },
     ];
     renderTable('mi-gap-table', data.items, columns, { defaultSort: null, emptyText: 'No gap SKUs.' });
+  } catch (e) {
+    container.innerHTML = `<div class="error" style="padding: 16px;">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// Swaps: like-for-like replacements for slow movers, and deal-carrying
+// equivalents for SKUs that earn no data revenue (see /api/market-intelligence/swaps).
+async function loadMiSwapsView() {
+  const container = document.getElementById("mi-content");
+  container.innerHTML = `<div class="loading"><span class="spinner"></span> Finding swaps…</div>`;
+  try {
+    const p = new URLSearchParams({ location_id: _miCurrentStore, limit: "300" });
+    if (_miImportId) p.set('import_id', _miImportId);
+    if (_miSwapFilter === 'deal') p.set('deal_filter', 'deal');
+    const data = await api(`/api/market-intelligence/swaps?${p}`);
+    let items = data.items || [];
+    if (_miSwapFilter === 'slow') items = items.filter(it => it.reason === 'Slow mover');
+    if (_miSwapFilter === 'rebate') items = items.filter(it => it.reason === 'Rebate swap');
+    if (!items.length) {
+      container.innerHTML = `<div class="card" style="padding: 24px; color: var(--text-dim); font-size: 12px;">${escapeHtml(data.warning || 'No swaps worth making for this store right now.')}</div>`;
+      return;
+    }
+    const total = items.reduce((a, it) => a + (it.best.gain_wk || 0), 0);
+    const rebateTotal = items.reduce((a, it) => a + (it.best.rebate_wk || 0), 0);
+    const share = data.store_factor != null ? Math.round(data.store_factor * 100) : null;
+    const dealTag = d => d ? `<span class="tag" style="font-size: 9px; padding: 1px 5px; background: rgba(80,180,100,0.15); color: #6fcf85; border: 1px solid rgba(90,200,110,0.4);">${escapeHtml(d)}</span>` : '';
+    const wk = v => v == null ? '—' : (v < 10 ? v.toFixed(1) : Math.round(v)) + '/wk';
+
+    container.innerHTML = `
+      <div class="card" style="padding: 12px 16px; margin-bottom: 12px; font-size: 12px;">
+        <strong>${items.length}</strong> swap${items.length === 1 ? '' : 's'} ·
+        est. <strong>+${fmt$(total)}/week</strong> gross profit
+        ${rebateTotal > 0 ? ` (incl. ${fmt$(rebateTotal)}/week data revenue)` : ''}
+        <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">
+          Same category, subcategory and size; wholesale within ±${Math.round(data.rules.price_band * 100)}%; orderable from OCS now.
+          Expected sales here = the municipality's rate × this store's share of it (${share != null ? share + '%' : '?'}).
+          <strong>Slow mover</strong> = selling ≤ ${data.rules.slow_per_week}/week here.
+          <strong>Rebate swap</strong> = a SKU earning no data revenue, with an equivalent on a deal that the market buys at least as much of.
+          Estimates — check the shelf before you swap.
+        </div>
+      </div>
+      <div class="card"><div id="mi-swaps-table"></div></div>
+    `;
+
+    const columns = [
+      { key: 'reason', label: 'Why', render: r => r.reason === 'Slow mover'
+          ? '<span class="tag tag-critical" style="font-size: 9px;">Slow mover</span>'
+          : '<span class="tag tag-accent" style="font-size: 9px;">Rebate swap</span>' },
+      { key: 'out', label: 'On the shelf', sortValue: r => r.out.name,
+        render: r => `${escapeHtml(r.out.name)} ${dealTag(r.out.deal)}
+          <div class="sku">${escapeHtml(r.out.subcategory || '')} · ${escapeHtml(r.out.size || '')} · ${fmtN(r.out.on_hand)} on hand</div>` },
+      { key: 'out_wk', label: 'Sells here', type: 'number', align: 'right',
+        sortValue: r => r.out.units_wk, render: r => wk(r.out.units_wk) },
+      { key: 'best', label: 'Swap to', sortValue: r => r.best.name,
+        render: r => `${escapeHtml(r.best.brand || '')} · ${escapeHtml(r.best.name || r.best.sku)} ${dealTag(r.best.deal)}
+          ${r.best.flow_thru ? '<span class="tag" style="font-size: 9px;">FT</span>' : ''}
+          <div class="sku">${escapeHtml(titleCaseLp(r.best.supplier) || '')} · ${fmt$2(r.best.wholesale)} wholesale · ~${fmt$2(r.best.retail_est)} retail
+          ${r.alternatives && r.alternatives.length ? ` · also: ${r.alternatives.map(a => escapeHtml(a.name)).join(', ')}` : ''}</div>` },
+      { key: 'best_wk', label: 'Expected here', type: 'number', align: 'right',
+        tooltip: "Municipality rate × this store's share of municipality demand.",
+        sortValue: r => r.best.est_units_wk,
+        render: r => `${wk(r.best.est_units_wk)}<div class="sku">market ${wk(r.best.market_units_wk)}</div>` },
+      { key: 'gain', label: 'Est. gain', type: 'number', align: 'right',
+        tooltip: 'Weekly gross profit + data revenue of the replacement, minus what the current SKU makes.',
+        sortValue: r => r.best.gain_wk,
+        render: r => `<strong style="color: var(--ok, #6a7);">+${fmt$(r.best.gain_wk)}/wk</strong>
+          ${r.best.rebate_wk > 0 ? `<div class="sku">incl. ${fmt$2(r.best.rebate_wk)} rebate</div>` : ''}` },
+      { key: 'act', label: '', sortable: false, align: 'center',
+        render: r => `<button class="btn mi-swap-pin" style="font-size: 11px; padding: 4px 10px;" data-variant="${escapeHtml(r.best.sku)}">📌 Add to Reorder</button>` },
+    ];
+    renderTable('mi-swaps-table', items, columns, { defaultSort: null, emptyText: 'No swaps.' });
+
+    // Pin the replacement for THIS store; the Reorder Report shows it on top for 7 days.
+    // onclick (not addEventListener): #mi-content persists across reloads.
+    container.onclick = async e => {
+      const btn = e.target.closest('.mi-swap-pin');
+      if (!btn || btn.disabled) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`${API}/api/reorder/pin`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+          body: JSON.stringify({ ocs_variant: btn.dataset.variant, location_id: _miCurrentStore, days: 7 }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(d.detail || res.statusText);
+        btn.textContent = '✓ Pinned';
+      } catch (err) {
+        btn.textContent = 'Failed';
+        btn.title = err.message;
+        btn.disabled = false;
+      }
+    };
   } catch (e) {
     container.innerHTML = `<div class="error" style="padding: 16px;">${escapeHtml(e.message)}</div>`;
   }
