@@ -6223,6 +6223,14 @@ _SWAP_SLOW_PER_WEEK = 1.0     # units/week at this store
 _SWAP_PRICE_BAND = 0.30       # candidate wholesale within +/-30% of the outgoing SKU
 _SWAP_MIN_GAIN = 2.0          # $/week below which a swap isn't worth the shelf change
 _SWAP_NEW_DAYS = 14           # received this recently = too new to judge
+# OCS hides municipal averages for municipalities with fewer than 5 stores, so
+# Innisfil (S5) and Wasaga Beach (S8) get none. Borrow Barrie's instead: the
+# three Barrie stores (East/Grove S4, North/Livingstone S6, South/Huronia S7)
+# carry identical municipal figures (verified on all 4,365 shared SKUs, May
+# 2026), so any of them works. The proxied store's expected sales are still
+# scaled by its OWN share of that demand, measured from its own sales.
+_MI_MUNICIPAL_PROXY = {"S5": ("Barrie", ["S4", "S6", "S7"]),
+                       "S8": ("Barrie", ["S4", "S6", "S7"])}
 
 
 def _rebate_per_unit(deal: dict | None, wholesale: float | None, retail: float | None) -> float:
@@ -6299,11 +6307,35 @@ def get_swap_suggestions(location_id: str, import_id: int | None = None,
             market[r[0]] = {"sku": r[1], "item_name": r[2], "brand": r[3], "supplier": r[4],
                             "your_vel": (r[5] or 0) / window_days,
                             "muni_vel": (r[6] or 0) / window_days}
+        proxy = None
         if not any((m["muni_vel"] or 0) > 0 for m in market.values()):
-            return {"count": 0, "items": [], "import_id": import_id,
-                    "warning": ("OCS shows no municipality averages for this store "
-                                "(municipalities with fewer than 5 stores are hidden), "
-                                "so there is nothing to compare against.")}
+            muni_name, proxy_stores = _MI_MUNICIPAL_PROXY.get(location_id, (None, []))
+            for ps in proxy_stores:
+                prow = cur.execute(
+                    """SELECT i.id, i.period_end FROM market_intelligence_imports i
+                       WHERE i.location_id = ? AND COALESCE(i.period_days, 30) = ?
+                         AND EXISTS (SELECT 1 FROM market_intelligence_data d
+                                     WHERE d.import_id = i.id AND d.municipality_units > 0)
+                       ORDER BY i.imported_at DESC LIMIT 1""", (ps, window_days)).fetchone()
+                if prow:
+                    proxy = {"municipality": muni_name, "store": ps,
+                             "import_id": prow[0], "period_end": prow[1]}
+                    break
+            if not proxy:
+                return {"count": 0, "items": [], "import_id": import_id,
+                        "warning": ("OCS shows no municipality averages for this store "
+                                    "(municipalities with fewer than 5 stores are hidden), "
+                                    "and no proxy municipality has data for this window.")}
+            # Municipal figures from the proxy; "your" figures can't come from
+            # it (they're the proxy store's), so blank them and measure this
+            # store's share from its own sales below.
+            market = {}
+            for r in cur.execute(
+                    """SELECT LOWER(sku), sku, item_name, brand, supplier, municipality_units
+                       FROM market_intelligence_data WHERE import_id = ?""", (proxy["import_id"],)):
+                market[r[0]] = {"sku": r[1], "item_name": r[2], "brand": r[3], "supplier": r[4],
+                                "your_vel": 0.0, "muni_vel": (r[5] or 0) / window_days}
+        market_import_id = proxy["import_id"] if proxy else import_id
 
         # Our shelf: in-stock SKUs at this store that map to the OCS catalogue.
         latest = get_latest_sale_date(conn) or business_today()
@@ -6337,6 +6369,16 @@ def get_swap_suggestions(location_id: str, import_id: int | None = None,
         # velocity into an expected velocity HERE. It is well below 1 (0.2-0.3
         # in May 2026): OCS's municipality figure behaves more like a municipal
         # total than one store's average, so it must not be used unscaled.
+        if proxy:
+            # Our own sales over the window, per OCS variant, against the proxy.
+            for r in cur.execute(
+                    """SELECT LOWER(p.ocs_variant_number), SUM(sd.units_sold)
+                       FROM sales_daily sd JOIN products p ON p.sku = sd.sku
+                       WHERE sd.location_id = ? AND sd.sale_date >= ?
+                         AND p.ocs_variant_number IS NOT NULL
+                       GROUP BY 1""", (location_id, since)):
+                if r[0] in market:
+                    market[r[0]]["your_vel"] = (r[1] or 0) / window_days
         both = [m for m in market.values() if m["your_vel"] > 0 and m["muni_vel"] > 0]
         muni_sum = sum(m["muni_vel"] for m in both)
         store_factor = (sum(m["your_vel"] for m in both) / muni_sum) if muni_sum else 0.25
@@ -6361,7 +6403,7 @@ def get_swap_suggestions(location_id: str, import_id: int | None = None,
                    FROM market_intelligence_data mi
                    JOIN ocs_catalog oc ON oc.ocs_variant_number = mi.sku
                    WHERE mi.import_id = ? AND mi.municipality_units > 0
-                     AND oc.unit_price > 0""", (window_days, import_id)):
+                     AND oc.unit_price > 0""", (window_days, market_import_id)):
             if r[0] in carried:
                 continue
             of = of_map.get((location_id, r[0])) or of_map.get((None, r[0]))
@@ -6484,6 +6526,7 @@ def get_swap_suggestions(location_id: str, import_id: int | None = None,
         "period_days": window_days,
         "imported_at": meta[3] if meta else None,
         "store_factor": round(store_factor, 3),
+        "proxy": proxy,
         "total_gain_wk": round(sum(it["best"]["gain_wk"] for it in items), 2),
         "slow_count": sum(1 for it in items if it["reason"] == "Slow mover"),
         "rebate_count": sum(1 for it in items if it["reason"] == "Rebate swap"),

@@ -7146,6 +7146,13 @@ async function loadMiSwapsView() {
     const wk = v => v == null ? '—' : (v < 10 ? v.toFixed(1) : Math.round(v)) + '/wk';
 
     container.innerHTML = `
+      ${data.proxy ? `
+      <div class="card" style="padding: 10px 16px; margin-bottom: 12px; font-size: 12px; border-color: rgba(214,180,70,0.5); background: rgba(214,180,70,0.08);">
+        <strong style="color: #d6b446;">Using ${escapeHtml(data.proxy.municipality)} market data as a proxy.</strong>
+        OCS doesn't publish municipal averages for this store's municipality (fewer than 5 stores), so demand comes from
+        ${escapeHtml(data.proxy.municipality)} (data through ${escapeHtml(data.proxy.period_end || '?')}), scaled to this store's own share of it.
+        Local tastes can differ, so treat these as softer suggestions.
+      </div>` : ''}
       <div class="card" style="padding: 12px 16px; margin-bottom: 12px; font-size: 12px;">
         <strong>${items.length}</strong> swap${items.length === 1 ? '' : 's'} ·
         est. <strong>+${fmt$(total)}/week</strong> gross profit
