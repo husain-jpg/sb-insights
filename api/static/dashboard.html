@@ -7030,6 +7030,19 @@ function _miFillCategories(subcats) {
   sel.value = _miCategory;
 }
 
+// Amber note shown when a view borrows another municipality's figures (OCS
+// hides municipal averages where there are fewer than 5 stores).
+function miProxyNote(proxy) {
+  if (!proxy) return '';
+  const m = escapeHtml(proxy.municipality);
+  return `<div class="card" style="padding: 10px 16px; margin-bottom: 12px; font-size: 12px; border-color: rgba(214,180,70,0.5); background: rgba(214,180,70,0.08);">
+    <strong style="color: #d6b446;">Using ${m} market data as a proxy.</strong>
+    OCS doesn't publish municipal averages for this store's municipality (fewer than 5 stores), so the municipal figures are ${m}'s
+    (data through ${escapeHtml(proxy.period_end || '?')}). This store's own sales and stock come from its own data.
+    Local tastes can differ, so treat these as softer signals.
+  </div>`;
+}
+
 // Purple tag for a SKU whose LP/brand has an active Data LP Partner agreement.
 function miLpPartnerTag(partner) {
   const name = titleCaseLp(partner);
@@ -7073,6 +7086,7 @@ async function loadMiGapView() {
     const stale = ageDays !== null && ageDays > 21;
 
     container.innerHTML = `
+      ${miProxyNote(data.proxy)}
       <div class="card" style="padding: 12px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
         <div style="font-size: 11px; color: var(--text-dim);">
           <strong>Period:</strong> ${period} &nbsp;·&nbsp;
@@ -7146,13 +7160,7 @@ async function loadMiSwapsView() {
     const wk = v => v == null ? '—' : (v < 10 ? v.toFixed(1) : Math.round(v)) + '/wk';
 
     container.innerHTML = `
-      ${data.proxy ? `
-      <div class="card" style="padding: 10px 16px; margin-bottom: 12px; font-size: 12px; border-color: rgba(214,180,70,0.5); background: rgba(214,180,70,0.08);">
-        <strong style="color: #d6b446;">Using ${escapeHtml(data.proxy.municipality)} market data as a proxy.</strong>
-        OCS doesn't publish municipal averages for this store's municipality (fewer than 5 stores), so demand comes from
-        ${escapeHtml(data.proxy.municipality)} (data through ${escapeHtml(data.proxy.period_end || '?')}), scaled to this store's own share of it.
-        Local tastes can differ, so treat these as softer suggestions.
-      </div>` : ''}
+      ${miProxyNote(data.proxy)}
       <div class="card" style="padding: 12px 16px; margin-bottom: 12px; font-size: 12px;">
         <strong>${items.length}</strong> swap${items.length === 1 ? '' : 's'} ·
         est. <strong>+${fmt$(total)}/week</strong> gross profit
@@ -7237,6 +7245,7 @@ async function loadMiComparisonView() {
     const inLine = data.items.filter(x => x.performance_flag === 'in_line').length;
 
     container.innerHTML = `
+      ${miProxyNote(data.proxy)}
       <div class="card" style="padding: 12px 16px; margin-bottom: 12px;">
         <div style="font-size: 11px; color: var(--text-dim); display: flex; gap: 24px;">
           <div><strong>${data.items.length}</strong> SKUs you carry that are also in the municipality data</div>

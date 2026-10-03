@@ -5849,6 +5849,75 @@ def _filter_by_deal(items, deal_filter, limit):
     return [it for it in items if keep(it)][:limit]
 
 
+# OCS hides municipal averages for municipalities with fewer than 5 stores, so
+# Innisfil (S5) and Wasaga Beach (S8) get none. Borrow Barrie's instead: the
+# three Barrie stores (East/Grove S4, North/Livingstone S6, South/Huronia S7)
+# carry identical municipal figures (verified on all 4,365 shared SKUs, May
+# 2026), so any of them works. Everything about the proxied store itself
+# (what it carries, what it sells) comes from its OWN data.
+_MI_MUNICIPAL_PROXY = {"S5": ("Barrie", ["S4", "S6", "S7"]),
+                       "S8": ("Barrie", ["S4", "S6", "S7"])}
+
+
+def _mi_municipal_proxy(conn, location_id: str, import_id: int) -> dict | None:
+    """If this store's import has no municipal figures, find a proxy import
+    for the same window and this store's own units per OCS variant over that
+    window. Returns None when the store's own data is usable (or no proxy).
+
+    {"municipality", "store", "import_id", "period_end",
+     "our_units": {variant_lower: units}, "carried": {variant_lower}}"""
+    cur = conn.cursor()
+    has_muni = cur.execute(
+        """SELECT 1 FROM market_intelligence_data
+           WHERE import_id = ? AND municipality_units > 0 LIMIT 1""", (import_id,)).fetchone()
+    if has_muni or location_id not in _MI_MUNICIPAL_PROXY:
+        return None
+    meta = cur.execute("SELECT period_days FROM market_intelligence_imports WHERE id = ?",
+                       (import_id,)).fetchone()
+    window_days = int(meta[0]) if meta and meta[0] else 30
+    muni_name, proxy_stores = _MI_MUNICIPAL_PROXY[location_id]
+    for ps in proxy_stores:
+        prow = cur.execute(
+            """SELECT i.id, i.period_end FROM market_intelligence_imports i
+               WHERE i.location_id = ? AND COALESCE(i.period_days, 30) = ?
+                 AND EXISTS (SELECT 1 FROM market_intelligence_data d
+                             WHERE d.import_id = i.id AND d.municipality_units > 0)
+               ORDER BY i.imported_at DESC LIMIT 1""", (ps, window_days)).fetchone()
+        if prow:
+            break
+    else:
+        return None
+    latest = get_latest_sale_date(conn) or business_today()
+    since = (latest - timedelta(days=window_days - 1)).isoformat()
+    our_units = {r[0]: r[1] for r in cur.execute(
+        """SELECT LOWER(p.ocs_variant_number), SUM(sd.units_sold)
+           FROM sales_daily sd JOIN products p ON p.sku = sd.sku
+           WHERE sd.location_id = ? AND sd.sale_date >= ?
+             AND p.ocs_variant_number IS NOT NULL
+           GROUP BY 1 HAVING SUM(sd.units_sold) > 0""", (location_id, since))}
+    on_hand = {r[0] for r in cur.execute(
+        """SELECT LOWER(p.ocs_variant_number) FROM current_inventory ci
+           JOIN products p ON p.sku = ci.sku
+           WHERE ci.location_id = ? AND ci.on_hand > 0
+             AND p.ocs_variant_number IS NOT NULL""", (location_id,))}
+    return {"municipality": muni_name, "store": ps, "import_id": prow[0],
+            "period_end": prow[1], "window_days": window_days,
+            "our_units": our_units, "carried": set(our_units) | on_hand}
+
+
+def _mi_apply_proxy_ours(items: list, proxy: dict) -> None:
+    """Overwrite the proxy store's "your" figures with this store's own."""
+    wd = proxy["window_days"]
+    for it in items:
+        u = proxy["our_units"].get((it.get("sku") or "").lower())
+        it["your_units"] = u
+        it["your_velocity"] = (u / wd) if u else None
+
+
+def _mi_proxy_public(proxy: dict | None) -> dict | None:
+    return None if not proxy else {k: proxy[k] for k in ("municipality", "store", "import_id", "period_end")}
+
+
 @app.get("/api/market-intelligence/gap-report")
 def get_gap_report(
     location_id: str,
@@ -5879,6 +5948,9 @@ def get_gap_report(
                 return {"count": 0, "items": [], "warning": "No imports found for this store"}
             import_id = row[0]
 
+        proxy = _mi_municipal_proxy(conn, location_id, import_id)
+        source_import = proxy["import_id"] if proxy else import_id
+
         # Pull SKUs you don't carry, joined with OCS catalog for orderability
         sql = """
             SELECT mi.sku, mi.item_name, mi.brand, mi.supplier, mi.subcategory, mi.size,
@@ -5892,9 +5964,11 @@ def get_gap_report(
         """
         # Default: SKUs you DON'T carry. include_carried also surfaces carried SKUs
         # (with your velocity) so the view doubles as a full top-municipality list.
-        if not include_carried:
+        # With a proxy, "carried" comes from this store's own sales/stock, so
+        # it's filtered in Python below rather than by the proxy's your_units.
+        if not include_carried and not proxy:
             sql += " AND mi.your_units IS NULL"
-        params: list = [import_id]
+        params: list = [source_import]
         if subcategory:
             sql += " AND mi.subcategory = ?"
             params.append(subcategory)
@@ -5904,15 +5978,23 @@ def get_gap_report(
         # so fetch wide and truncate after annotating; otherwise just fetch the page.
         display_limit = min(2000, max(1, int(limit)))
         sql += " ORDER BY mi.municipality_units DESC LIMIT ?"
-        params.append(5000 if deal_filter else display_limit)
+        params.append(5000 if (deal_filter or proxy) else display_limit)
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, r)) for r in cur.fetchall()]
+        if proxy:
+            _mi_apply_proxy_ours(items, proxy)
+            for it in items:
+                it["carried"] = (it.get("sku") or "").lower() in proxy["carried"]
+            if not include_carried:
+                items = [it for it in items if not it["carried"]]
+            if not deal_filter:
+                items = items[:display_limit]
 
         # Tag each row with its deal programs (collective / LP partner / LTO).
         _annotate_deals(conn, items)
         for it in items:
-            it["carried"] = it.get("your_units") is not None
+            it.setdefault("carried", it.get("your_units") is not None)
         items = _filter_by_deal(items, deal_filter, display_limit)
 
         # Get import metadata for context
@@ -5929,15 +6011,16 @@ def get_gap_report(
             WHERE import_id = ? AND municipality_units IS NOT NULL
               AND subcategory IS NOT NULL
         """
-        if not include_carried:
+        if not include_carried and not proxy:
             subcat_sql += " AND your_units IS NULL"
-        cur.execute(subcat_sql + " ORDER BY subcategory", (import_id,))
+        cur.execute(subcat_sql + " ORDER BY subcategory", (source_import,))
         subcats = [r[0] for r in cur.fetchall()]
 
     return {
         "count": len(items),
         "items": items,
         "import_id": import_id,
+        "proxy": _mi_proxy_public(proxy),
         "subcategories": subcats,
         "period_start": meta[0] if meta else None,
         "period_end": meta[1] if meta else None,
@@ -5972,6 +6055,8 @@ def get_performance_comparison(
                 return {"count": 0, "items": [], "warning": "No imports found for this store"}
             import_id = row[0]
 
+        proxy = _mi_municipal_proxy(conn, location_id, import_id)
+        source_import = proxy["import_id"] if proxy else import_id
         sql = """
             SELECT mi.sku, mi.item_name, mi.brand, mi.supplier, mi.subcategory, mi.size,
                    mi.your_units, mi.your_velocity,
@@ -5981,19 +6066,26 @@ def get_performance_comparison(
             FROM market_intelligence_data mi
             LEFT JOIN ocs_catalog oc ON oc.ocs_variant_number = mi.sku
             WHERE mi.import_id = ?
-              AND mi.your_units IS NOT NULL
               AND mi.municipality_units IS NOT NULL
         """
-        params: list = [import_id]
+        if not proxy:
+            sql += " AND mi.your_units IS NOT NULL"
+        params: list = [source_import]
         if subcategory:
             sql += " AND mi.subcategory = ?"
             params.append(subcategory)
         display_limit = min(2000, max(1, int(limit)))
         sql += " ORDER BY mi.municipality_units DESC LIMIT ?"
-        params.append(5000 if deal_filter else display_limit)
+        params.append(5000 if (deal_filter or proxy) else display_limit)
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         items = [dict(zip(cols, r)) for r in cur.fetchall()]
+        if proxy:
+            # Only SKUs this store actually sold, with its own figures.
+            _mi_apply_proxy_ours(items, proxy)
+            items = [it for it in items if it.get("your_units")]
+            if not deal_filter:
+                items = items[:display_limit]
 
         # Tag each row with its deal programs, then optionally filter to one.
         _annotate_deals(conn, items)
@@ -6023,18 +6115,19 @@ def get_performance_comparison(
         meta = cur.fetchone()
 
         # Full category list for SKUs we carry (complete dropdown regardless of limit).
-        cur.execute("""
+        cur.execute(f"""
             SELECT DISTINCT subcategory FROM market_intelligence_data
-            WHERE import_id = ? AND your_units IS NOT NULL
+            WHERE import_id = ? {"" if proxy else "AND your_units IS NOT NULL"}
               AND municipality_units IS NOT NULL AND subcategory IS NOT NULL
             ORDER BY subcategory
-        """, (import_id,))
+        """, (source_import,))
         subcats = [r[0] for r in cur.fetchall()]
 
     return {
         "count": len(items),
         "items": items,
         "import_id": import_id,
+        "proxy": _mi_proxy_public(proxy),
         "subcategories": subcats,
         "period_start": meta[0] if meta else None,
         "period_end": meta[1] if meta else None,
@@ -6223,14 +6316,6 @@ _SWAP_SLOW_PER_WEEK = 1.0     # units/week at this store
 _SWAP_PRICE_BAND = 0.30       # candidate wholesale within +/-30% of the outgoing SKU
 _SWAP_MIN_GAIN = 2.0          # $/week below which a swap isn't worth the shelf change
 _SWAP_NEW_DAYS = 14           # received this recently = too new to judge
-# OCS hides municipal averages for municipalities with fewer than 5 stores, so
-# Innisfil (S5) and Wasaga Beach (S8) get none. Borrow Barrie's instead: the
-# three Barrie stores (East/Grove S4, North/Livingstone S6, South/Huronia S7)
-# carry identical municipal figures (verified on all 4,365 shared SKUs, May
-# 2026), so any of them works. The proxied store's expected sales are still
-# scaled by its OWN share of that demand, measured from its own sales.
-_MI_MUNICIPAL_PROXY = {"S5": ("Barrie", ["S4", "S6", "S7"]),
-                       "S8": ("Barrie", ["S4", "S6", "S7"])}
 
 
 def _rebate_per_unit(deal: dict | None, wholesale: float | None, retail: float | None) -> float:
@@ -6307,34 +6392,21 @@ def get_swap_suggestions(location_id: str, import_id: int | None = None,
             market[r[0]] = {"sku": r[1], "item_name": r[2], "brand": r[3], "supplier": r[4],
                             "your_vel": (r[5] or 0) / window_days,
                             "muni_vel": (r[6] or 0) / window_days}
-        proxy = None
-        if not any((m["muni_vel"] or 0) > 0 for m in market.values()):
-            muni_name, proxy_stores = _MI_MUNICIPAL_PROXY.get(location_id, (None, []))
-            for ps in proxy_stores:
-                prow = cur.execute(
-                    """SELECT i.id, i.period_end FROM market_intelligence_imports i
-                       WHERE i.location_id = ? AND COALESCE(i.period_days, 30) = ?
-                         AND EXISTS (SELECT 1 FROM market_intelligence_data d
-                                     WHERE d.import_id = i.id AND d.municipality_units > 0)
-                       ORDER BY i.imported_at DESC LIMIT 1""", (ps, window_days)).fetchone()
-                if prow:
-                    proxy = {"municipality": muni_name, "store": ps,
-                             "import_id": prow[0], "period_end": prow[1]}
-                    break
-            if not proxy:
-                return {"count": 0, "items": [], "import_id": import_id,
-                        "warning": ("OCS shows no municipality averages for this store "
-                                    "(municipalities with fewer than 5 stores are hidden), "
-                                    "and no proxy municipality has data for this window.")}
-            # Municipal figures from the proxy; "your" figures can't come from
-            # it (they're the proxy store's), so blank them and measure this
-            # store's share from its own sales below.
+        proxy = _mi_municipal_proxy(conn, location_id, import_id)
+        if proxy:
+            # Municipal figures from the proxy; "your" figures are this store's own.
             market = {}
             for r in cur.execute(
                     """SELECT LOWER(sku), sku, item_name, brand, supplier, municipality_units
                        FROM market_intelligence_data WHERE import_id = ?""", (proxy["import_id"],)):
                 market[r[0]] = {"sku": r[1], "item_name": r[2], "brand": r[3], "supplier": r[4],
-                                "your_vel": 0.0, "muni_vel": (r[5] or 0) / window_days}
+                                "your_vel": (proxy["our_units"].get(r[0]) or 0) / window_days,
+                                "muni_vel": (r[5] or 0) / window_days}
+        elif not any((m["muni_vel"] or 0) > 0 for m in market.values()):
+            return {"count": 0, "items": [], "import_id": import_id,
+                    "warning": ("OCS shows no municipality averages for this store "
+                                "(municipalities with fewer than 5 stores are hidden), "
+                                "and no proxy municipality has data for this window.")}
         market_import_id = proxy["import_id"] if proxy else import_id
 
         # Our shelf: in-stock SKUs at this store that map to the OCS catalogue.
@@ -6369,16 +6441,6 @@ def get_swap_suggestions(location_id: str, import_id: int | None = None,
         # velocity into an expected velocity HERE. It is well below 1 (0.2-0.3
         # in May 2026): OCS's municipality figure behaves more like a municipal
         # total than one store's average, so it must not be used unscaled.
-        if proxy:
-            # Our own sales over the window, per OCS variant, against the proxy.
-            for r in cur.execute(
-                    """SELECT LOWER(p.ocs_variant_number), SUM(sd.units_sold)
-                       FROM sales_daily sd JOIN products p ON p.sku = sd.sku
-                       WHERE sd.location_id = ? AND sd.sale_date >= ?
-                         AND p.ocs_variant_number IS NOT NULL
-                       GROUP BY 1""", (location_id, since)):
-                if r[0] in market:
-                    market[r[0]]["your_vel"] = (r[1] or 0) / window_days
         both = [m for m in market.values() if m["your_vel"] > 0 and m["muni_vel"] > 0]
         muni_sum = sum(m["muni_vel"] for m in both)
         store_factor = (sum(m["your_vel"] for m in both) / muni_sum) if muni_sum else 0.25
@@ -6526,7 +6588,7 @@ def get_swap_suggestions(location_id: str, import_id: int | None = None,
         "period_days": window_days,
         "imported_at": meta[3] if meta else None,
         "store_factor": round(store_factor, 3),
-        "proxy": proxy,
+        "proxy": _mi_proxy_public(proxy),
         "total_gain_wk": round(sum(it["best"]["gain_wk"] for it in items), 2),
         "slow_count": sum(1 for it in items if it["reason"] == "Slow mover"),
         "rebate_count": sum(1 for it in items if it["reason"] == "Rebate swap"),
