@@ -821,10 +821,12 @@ def _category_is_all(page) -> bool:
     return (el.inner_text() or "").strip().lower() == "all"
 
 
-# An unfiltered municipality export has thousands of SKUs across ~11-12
-# subcategories (July 2026: 3.2k-6.2k rows). Far fewer means a filter leaked in.
+# An unfiltered municipality export spans ~9-12 subcategories. The filter
+# leak of 2026-10-02 produced ONE. Row counts vary too much to lean on: a
+# genuine 14-day window for a small town is a few hundred rows (Amherstview
+# 424, Wasaga 258 on 2026-10-03), so the row floor only catches near-empty files.
 _MIN_EXPORT_SUBCATEGORIES = 5
-_MIN_EXPORT_ROWS = 500
+_MIN_EXPORT_ROWS = 100
 
 
 def _check_export_unfiltered(path: Path) -> None:
